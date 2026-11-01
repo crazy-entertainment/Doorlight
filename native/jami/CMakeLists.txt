@@ -1,0 +1,1145 @@
+cmake_minimum_required(VERSION 3.16)
+
+project(jami-core
+    VERSION 16.0.0
+    LANGUAGES C CXX)
+set(PACKAGE_NAME "Jami Daemon")
+set (CMAKE_CXX_STANDARD 20)
+set (CMAKE_CXX_STANDARD_REQUIRED ON)
+
+set(PROJECT_LABEL "libjami")
+
+################################################################################
+# Build options
+################################################################################
+option(JAMI_PLUGIN "Build with plugin support" ON)
+option(JAMI_NODEJS "Build the NODEJS binding" OFF)
+option(JAMI_JNI "Build the JNI binding" OFF)
+option(JAMI_DBUS "Build the DBUS binding" OFF)
+option(JAMI_VIDEO "Build with video support" ON)
+option(JAMI_VIDEO_ACCEL "Build video hardware acceleration support" ON)
+option(BUILD_CONTRIB "Build contrib to CONTRIB_PATH" ON)
+option(BUILD_EXTRA_TOOLS "Build extra tools" OFF)
+option(BUILD_SHARED_LIBS "Build shared library" OFF)
+option(ENABLE_ASAN "Enable address sanitization" OFF)
+option(ENABLE_COVERAGE "Enable coverage (for tests)" OFF)
+set(CONTRIB_BUILD_JOBS "" CACHE STRING "Number of parallel jobs to use when building contrib dependencies")
+
+if(ENABLE_ASAN AND NOT MSVC)
+  message(STATUS "Address sanitization enabled for daemon")
+  # Add AddressSanitizer flags for both compiler and linker
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=address -fno-omit-frame-pointer")
+  set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fsanitize=address")
+endif()
+
+if(ENABLE_COVERAGE)
+    message(STATUS "Coverage analysis enabled for daemon")
+    include(CMake/coverage.cmake)
+endif()
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -D_FILE_OFFSET_BITS=64")
+
+include(CTest)
+
+if (BUILD_TESTING)
+    # This policy test has no daemon or CppUnit dependency, so it remains
+    # executable on MSVC where the full daemon unit-test suite is unavailable.
+    add_executable(ut_audio_transmission_gate EXCLUDE_FROM_ALL
+        src/media/audio/audio_transmission_gate.cpp
+        test/unitTest/media/audio/test_audio_transmission_gate.cpp
+    )
+    target_include_directories(ut_audio_transmission_gate PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    add_test(NAME audio_transmission_gate COMMAND ut_audio_transmission_gate)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_executable(ut_received_seed_publication EXCLUDE_FROM_ALL
+            test/unitTest/fileTransfer/received_seed_publication.cpp)
+        target_include_directories(ut_received_seed_publication PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+        target_link_options(ut_received_seed_publication PRIVATE
+            "-Wl,--wrap=linkat" "-Wl,--wrap=syscall" "-Wl,--wrap=renameat")
+        add_test(NAME received_seed_publication COMMAND ut_received_seed_publication)
+    endif()
+endif()
+
+if(JAMI_NODEJS)
+    # Required for nodejs binding
+    set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+endif()
+
+if(NOT MSVC)
+    ################################################################################
+    # Contrib
+    ################################################################################
+
+    # Android target mapping for contrib
+    if (ANDROID_ABI STREQUAL "x86")
+        set(TARGET i686-linux-android)
+    elseif (ANDROID_ABI STREQUAL "x86_64")
+        set(TARGET x86_64-linux-android)
+    elseif (ANDROID_ABI STREQUAL "arm64-v8a")
+        set(TARGET aarch64-linux-android)
+    elseif (ANDROID_ABI STREQUAL "armeabi-v7a")
+        set(TARGET armv7a-linux-androideabi)
+    else()
+        set(TARGET ${CMAKE_LIBRARY_ARCHITECTURE})
+        if (NOT TARGET)
+            execute_process(COMMAND gcc -dumpmachine  COMMAND tr -d '\n' OUTPUT_VARIABLE TARGET)
+        endif()
+    endif()
+    set(CONTRIB_PATH ${CMAKE_CURRENT_SOURCE_DIR}/contrib/${TARGET})
+
+    include(ProcessorCount)
+    ProcessorCount(NPROC)
+    if(CONTRIB_BUILD_JOBS)
+        set(CONTRIB_BUILD_FLAGS -j${CONTRIB_BUILD_JOBS})
+    elseif(NOT NPROC EQUAL 0)
+        set(CONTRIB_BUILD_FLAGS -j${NPROC})
+    endif()
+
+    if (BUILD_EXTRA_TOOLS)
+        set(ENV{PATH} "${CMAKE_CURRENT_SOURCE_DIR}/extras/tools/build/bin:$ENV{PATH}")
+        execute_process(
+            COMMAND ./bootstrap
+            WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/extras/tools)
+        execute_process(
+            COMMAND make ${CONTRIB_BUILD_FLAGS}
+            WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/extras/tools)
+        execute_process(
+            COMMAND make .pkg-config
+            WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/extras/tools)
+        execute_process(
+            COMMAND make .gas
+            WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/extras/tools)
+    endif()
+    if (JAMI_JNI)
+        # Generate swig binding
+        add_custom_command(
+            OUTPUT ${CMAKE_CURRENT_SOURCE_DIR}/bin/jni/jami_wrapper.cpp
+            COMMAND env PACKAGEDIR=${JAMI_JNI_PACKAGEDIR} "./make-swig.sh"
+            DEPENDS
+            ${CMAKE_CURRENT_SOURCE_DIR}/bin/jni/make-swig.sh
+            ${CMAKE_CURRENT_SOURCE_DIR}/bin/jni/jni_interface.i
+            ${CMAKE_CURRENT_SOURCE_DIR}/bin/jni/callmanager.i
+            ${CMAKE_CURRENT_SOURCE_DIR}/bin/jni/configurationmanager.i
+            ${CMAKE_CURRENT_SOURCE_DIR}/bin/jni/conversation.i
+            ${CMAKE_CURRENT_SOURCE_DIR}/bin/jni/datatransfer.i
+            ${CMAKE_CURRENT_SOURCE_DIR}/bin/jni/managerimpl.i
+            ${CMAKE_CURRENT_SOURCE_DIR}/bin/jni/data_view.i
+            WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/bin/jni
+        )
+    endif()
+endif()
+
+# Windows SDK selection for MSVC
+if (MSVC)
+    # Enforce minimum SDK 10.0.26100.0.
+    set(MIN_WIN_SDK "10.0.26100.0")
+
+    # Set minimum SDK version hint
+    set(CMAKE_SYSTEM_VERSION "${MIN_WIN_SDK}" CACHE STRING "" FORCE)
+
+    # After SDK selection, validate what CMake chose
+    if (DEFINED CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION)
+        if (CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION VERSION_LESS MIN_WIN_SDK)
+            message(FATAL_ERROR
+                "Windows SDK ${CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION} is too old. "
+                "Minimum required: ${MIN_WIN_SDK}")
+        endif()
+    endif()
+endif()
+
+if (BUILD_CONTRIB)
+    if (NOT MSVC)
+        set(CONTRIB_BUILD_PATH ${CMAKE_CURRENT_SOURCE_DIR}/contrib/build-${TARGET})
+        file(MAKE_DIRECTORY ${CONTRIB_BUILD_PATH})
+        file(MAKE_DIRECTORY ${CONTRIB_PATH})
+
+        if (ANDROID)
+            # See https://developer.android.com/ndk/guides/other_build_systems
+            set(ENV{ANDROID_NDK} ${ANDROID_NDK})
+            set(ENV{ANDROID_ABI} ${ANDROID_ABI})
+            set(ENV{ANDROID_API} ${ANDROID_PLATFORM})
+            set(ENV{TOOLCHAIN} ${ANDROID_TOOLCHAIN_ROOT})
+            set(ENV{TARGET} ${TARGET})
+            set(ENV{API} ${ANDROID_PLATFORM_LEVEL})
+            set(ENV{CC} $ENV{TOOLCHAIN}/bin/${TARGET}$ENV{API}-clang)
+            set(ENV{CXX} $ENV{TOOLCHAIN}/bin/${TARGET}$ENV{API}-clang++)
+            set(ENV{AS} "$ENV{CC} -c")
+            set(ENV{AR} ${CMAKE_AR})
+            set(ENV{RANLIB} ${CMAKE_RANLIB})
+            set(ENV{STRIP} ${CMAKE_STRIP})
+            set(ENV{LD} $ENV{TOOLCHAIN}/bin/ld)
+        endif()
+
+        file(LOCK ${CONTRIB_BUILD_PATH} DIRECTORY)
+        message(STATUS "Building contrib for architectures: ${CMAKE_OSX_ARCHITECTURES} ${CMAKE_SYSTEM}")
+        list(LENGTH CMAKE_OSX_ARCHITECTURES CMAKE_OSX_ARCHITECTURES_LENGTH)
+        if (APPLE AND CMAKE_OSX_ARCHITECTURES_LENGTH GREATER 1)
+            message(STATUS "Building for multiple architectures: ${CMAKE_OSX_ARCHITECTURES}")
+            foreach(ARCH ${CMAKE_OSX_ARCHITECTURES})
+                message(STATUS "Building for architecture: ${ARCH}")
+                set(CC_TARGET ${ARCH}-apple-darwin${CMAKE_SYSTEM_VERSION})
+                set(CC_CONTRIB_BUILD_PATH ${CMAKE_CURRENT_SOURCE_DIR}/contrib/build-${CC_TARGET})
+                set(CC_CONTRIB_PATH ${CMAKE_CURRENT_SOURCE_DIR}/contrib/${CC_TARGET})
+                file(MAKE_DIRECTORY ${CC_CONTRIB_BUILD_PATH})
+                file(MAKE_DIRECTORY ${CC_CONTRIB_PATH})
+                set(BOOTSTRAP_COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/contrib/bootstrap --host=${CC_TARGET})
+                if (IGNORE_SYSTEM_LIBS)
+                    list(APPEND BOOTSTRAP_COMMAND --ignore-system-libs)
+                endif()
+                execute_process(
+                    COMMAND env CMAKE_OSX_ARCHITECTURES=${ARCH} ${BOOTSTRAP_COMMAND}
+                    WORKING_DIRECTORY ${CC_CONTRIB_BUILD_PATH})
+                execute_process(COMMAND env CMAKE_OSX_ARCHITECTURES=${ARCH} make list
+                    WORKING_DIRECTORY ${CC_CONTRIB_BUILD_PATH})
+                execute_process(COMMAND env CMAKE_OSX_ARCHITECTURES=${ARCH} make ${CONTRIB_BUILD_FLAGS}
+                    WORKING_DIRECTORY ${CC_CONTRIB_BUILD_PATH})
+            endforeach()
+            # Build fat contrib: merge all .a files
+            set(FAT_CONTRIB_PATH ${CMAKE_CURRENT_SOURCE_DIR}/contrib/apple-darwin${CMAKE_SYSTEM_VERSION})
+            execute_process(COMMAND rm -rf ${FAT_CONTRIB_PATH})
+            list(GET CMAKE_OSX_ARCHITECTURES 0 ARCH_FIRST)
+            set(CONTRIB_PATH_FIRST ${CMAKE_CURRENT_SOURCE_DIR}/contrib/${ARCH_FIRST}-apple-darwin${CMAKE_SYSTEM_VERSION})
+            string(REPLACE "arm64" "aarch64" ARCH_FIRST_LIB ${ARCH_FIRST})
+            set(TARGET_FIRST_LIB ${ARCH_FIRST_LIB}-apple-darwin${CMAKE_SYSTEM_VERSION})
+            execute_process(COMMAND cp -r ${CONTRIB_PATH_FIRST} ${FAT_CONTRIB_PATH})
+            file(GLOB_RECURSE LIB_FILES ${FAT_CONTRIB_PATH}/lib/*.a)
+            foreach(LIB_FILE_PATH ${LIB_FILES})
+                get_filename_component(LIB_FILE ${LIB_FILE_PATH} NAME)
+                get_filename_component(LIB_FILE_NAME ${LIB_FILE_PATH} NAME_WLE)
+                set(LIB_FILES_TO_MERGE "-create")
+                foreach(ARCH ${CMAKE_OSX_ARCHITECTURES})
+                    string(REPLACE "arm64" "aarch64" ARCH_LIB ${ARCH})
+                    set(CC_TARGET ${ARCH}-apple-darwin${CMAKE_SYSTEM_VERSION})
+                    set(CC_CONTRIB_PATH ${CMAKE_CURRENT_SOURCE_DIR}/contrib/${CC_TARGET})
+                    string(REPLACE ${TARGET_FIRST_LIB} ${ARCH_LIB}-apple-darwin${CMAKE_SYSTEM_VERSION} CC_LIB_FILE_NAME ${LIB_FILE})
+                    set(CC_LIB_FILE_PATH "${CC_CONTRIB_PATH}/lib/${CC_LIB_FILE_NAME}")
+                    if(NOT EXISTS ${CC_LIB_FILE_PATH})
+                        message(FATAL_ERROR "Required library file not found: ${CC_LIB_FILE_PATH}")
+                    endif()
+                    list(APPEND LIB_FILES_TO_MERGE ${CC_LIB_FILE_PATH})
+                endforeach()
+                list(APPEND LIB_FILES_TO_MERGE "-output" "${FAT_CONTRIB_PATH}/lib/${LIB_FILE}")
+                execute_process(COMMAND lipo ${LIB_FILES_TO_MERGE})
+            endforeach()
+            # replace all path references in pc and cmake files
+            file(GLOB_RECURSE PC_FILES ${FAT_CONTRIB_PATH}/lib/pkgconfig/*.pc)
+            file(GLOB_RECURSE CMAKE_FILES ${FAT_CONTRIB_PATH}/lib/cmake/*.cmake)
+            list(APPEND ALL_FILES ${PC_FILES} ${CMAKE_FILES})
+            foreach(FILE_PATH ${ALL_FILES})
+                file(READ ${FILE_PATH} PC_FILE_CONTENT)
+                string(REPLACE ${CONTRIB_PATH_FIRST} ${FAT_CONTRIB_PATH} PC_FILE_CONTENT ${PC_FILE_CONTENT})
+                file(WRITE ${FILE_PATH} ${PC_FILE_CONTENT})
+            endforeach()
+            set(CONTRIB_PATH ${FAT_CONTRIB_PATH})
+        else()
+            message(STATUS "Building contrib for ${TARGET}")
+            set(BOOTSTRAP_COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/contrib/bootstrap --host=${TARGET})
+            if (IGNORE_SYSTEM_LIBS)
+                list(APPEND BOOTSTRAP_COMMAND --ignore-system-libs)
+            endif()
+            if (CMAKE_INTERPROCEDURAL_OPTIMIZATION)
+                list(APPEND BOOTSTRAP_COMMAND --enable-lto)
+            endif()
+            execute_process(
+                COMMAND ${BOOTSTRAP_COMMAND}
+                WORKING_DIRECTORY ${CONTRIB_BUILD_PATH})
+            execute_process(COMMAND make list
+                WORKING_DIRECTORY ${CONTRIB_BUILD_PATH})
+            execute_process(COMMAND make ${CONTRIB_BUILD_FLAGS}
+                WORKING_DIRECTORY ${CONTRIB_BUILD_PATH})
+        endif()
+        file(LOCK ${CONTRIB_BUILD_PATH} DIRECTORY RELEASE)
+    else()
+        set(SCRIPTS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/extras/scripts)
+        execute_process(
+            COMMAND python ${SCRIPTS_DIR}/winmake.py
+            WORKING_DIRECTORY ${SCRIPTS_DIR}
+            RESULT_VARIABLE BUILD_RESULT
+        )
+        if (BUILD_RESULT)
+            message(FATAL_ERROR "Contrib build failed.")
+        else()
+            message(STATUS "Contrib build successful.")
+        endif()
+    endif()
+endif()
+
+################################################################################
+# Check dependencies
+################################################################################
+
+if(NOT MSVC)
+    include(FindPkgConfig)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        pkg_search_module (udev REQUIRED IMPORTED_TARGET libudev)
+        pkg_search_module (pulseaudio IMPORTED_TARGET libpulse)
+        pkg_search_module (alsa IMPORTED_TARGET alsa)
+        pkg_search_module (jack IMPORTED_TARGET libjack)
+
+        # Make sure at least one audio backend is available
+        if(NOT pulseaudio_FOUND AND NOT alsa_FOUND AND NOT jack_FOUND)
+            message(FATAL_ERROR "No audio library found. Please install PulseAudio, ALSA or JACK.")
+        endif()
+    endif()
+endif()
+
+################################################################################
+# Source groups
+################################################################################
+
+# compat, src source group
+if(MSVC)
+    add_subdirectory("compat")
+endif()
+
+add_subdirectory("src")
+source_group("Source Files" FILES ${Source_Files})
+source_group("Source Files\\client" FILES ${Source_Files__client})
+source_group("Source Files\\config" FILES ${Source_Files__config})
+source_group("Source Files\\connectivity" FILES ${Source_Files__connectivity})
+source_group("Source Files\\connectivity\\security" FILES ${Source_Files__security})
+source_group("Source Files\\connectivity\\sip" FILES ${Source_Files__sip})
+source_group("Source Files\\jami" FILES ${Source_Files__jami})
+source_group("Source Files\\hooks" FILES ${Source_Files__hooks})
+source_group("Source Files\\im" FILES ${Source_Files__im})
+source_group("Source Files\\jamidht" FILES ${Source_Files__jamidht})
+source_group("Source Files\\jamidht\\eth\\libdevcore" FILES ${Source_Files__jamidht__eth__libdevcore})
+source_group("Source Files\\jamidht\\eth\\libdevcrypto" FILES ${Source_Files__jamidht__eth__libdevcrypto})
+source_group("Source Files\\jamidht\\swarm" FILES ${Source_Files__jamidht__swarm})
+source_group("Source Files\\media" FILES ${Source_Files__media})
+source_group("Source Files\\media\\audio" FILES ${Source_Files__media__audio})
+source_group("Source Files\\media\\audio\\audio-processing" FILES ${Source_Files__media__audio__audio_processing})
+source_group("Source Files\\media\\audio\\audio-processing" FILES ${Source_Files__media__audio__webrtc})
+source_group("Source Files\\media\\audio\\audio-processing" FILES ${Source_Files__media__audio__speexdsp})
+source_group("Source Files\\media\\audio\\sound" FILES ${Source_Files__media__audio__sound})
+if(JAMI_VIDEO)
+    source_group("Source Files\\media\\video" FILES ${Source_Files__media__video})
+endif()
+source_group("Source Files\\plugin" FILES ${Source_Files__plugin})
+
+if(MSVC)
+    source_group("Source Files\\media\\audio\\portaudio" FILES ${Source_Files__media__audio__portaudio})
+    if(JAMI_VIDEO)
+       source_group("Source Files\\media\\video\\winvideo" FILES ${Source_Files__media__video__winvideo})
+    endif()
+endif()
+
+list (APPEND ALL_FILES
+      ${Source_Files}
+      ${Source_Files__client}
+      ${Source_Files__config}
+      ${Source_Files__connectivity}
+      ${Source_Files__jami}
+      ${Source_Files__hooks}
+      ${Source_Files__im}
+      ${Source_Files__jamidht}
+      ${Source_Files__jamidht__eth__libdevcore}
+      ${Source_Files__jamidht__eth__libdevcrypto}
+      ${Source_Files__jamidht__swarm}
+      ${Source_Files__media}
+      ${Source_Files__media__audio}
+      ${Source_Files__media__audio__sound}
+      ${Source_Files__media__audio__audio_processing}
+      ${Source_Files__security}
+      ${Source_Files__sip}
+)
+if (JAMI_VIDEO)
+    list (APPEND ALL_FILES ${Source_Files__media__video})
+endif()
+if (JAMI_PLUGIN)
+    list (APPEND ALL_FILES ${Source_Files__plugin})
+endif()
+if (ANDROID)
+    list (APPEND ALL_FILES ${ALL_FILES}
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/media/video/androidvideo/video_device_impl.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/media/video/androidvideo/video_device_monitor_impl.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/media/audio/aaudio/aaudiolayer.cpp
+    )
+elseif (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    if (JAMI_VIDEO)
+        list (APPEND ALL_FILES ${ALL_FILES}
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/media/video/v4l2/video_device_impl.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/media/video/v4l2/video_device_monitor_impl.cpp
+        )
+    endif()
+    if (pulseaudio_FOUND)
+        list (APPEND ALL_FILES ${ALL_FILES}
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/media/audio/pulseaudio/audiostream.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/media/audio/pulseaudio/pulselayer.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/media/audio/pulseaudio/pulseloopbackcapture.cpp
+        )
+    endif()
+    if (alsa_FOUND)
+        list (APPEND ALL_FILES ${ALL_FILES}
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/media/audio/alsa/alsalayer.cpp
+        )
+    endif()
+    if (jack_FOUND)
+        list (APPEND ALL_FILES ${ALL_FILES}
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/media/audio/jack/jacklayer.cpp
+        )
+    endif()
+elseif (APPLE)
+    if (IOS)
+        list (APPEND ALL_FILES ${ALL_FILES}
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/media/video/iosvideo/video_device_impl.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/media/video/iosvideo/video_device_monitor_impl.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/media/audio/coreaudio/ios/corelayer.mm
+        )
+    else()
+        list (APPEND ALL_FILES ${ALL_FILES}
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/media/video/osxvideo/video_device_impl.mm
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/media/video/osxvideo/video_device_monitor_impl.mm
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/media/audio/coreaudio/osx/corelayer.mm
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/media/audio/coreaudio/osx/audiodevice.cpp
+        )
+    endif()
+elseif(MSVC)
+   list (APPEND ALL_FILES ${ALL_FILES}
+         "${Source_Files__media__audio__portaudio}"
+         "${Source_Files__media__audio__webrtc}"
+         "${Source_Files__media__audio__speexdsp}"
+   )
+   if(JAMI_VIDEO)
+    list (APPEND ALL_FILES ${ALL_FILES}
+            "${Source_Files__media__video__uwpvideo}"
+            "${Source_Files__media__video__winvideo}"
+    )
+   endif()
+endif()
+
+add_library(${PROJECT_NAME} ${ALL_FILES})
+
+set_target_properties(${PROJECT_NAME} PROPERTIES FOLDER "daemon")
+
+# Setup coverage for the main library target
+if(ENABLE_COVERAGE)
+    setup_target_for_coverage(${PROJECT_NAME})
+endif()
+target_compile_definitions(${PROJECT_NAME} PRIVATE
+    PACKAGE_NAME="${PACKAGE_NAME}"
+    PACKAGE_VERSION="${PROJECT_VERSION}"
+    PACKAGE="jami"
+    LIBJAMI_BUILD
+    ASIO_STANDALONE
+    MSGPACK_NO_BOOST
+)
+if (BUILD_SHARED_LIBS)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE jami_EXPORTS)
+endif()
+target_compile_definitions(${PROJECT_NAME} PUBLIC
+    ASIO_STANDALONE
+    MSGPACK_NO_BOOST
+)
+if (JAMI_VIDEO)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE ENABLE_VIDEO)
+    if (JAMI_VIDEO_ACCEL)
+        target_compile_definitions(${PROJECT_NAME} PRIVATE ENABLE_HWACCEL)
+    endif()
+endif()
+if (JAMI_PLUGIN)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE ENABLE_PLUGIN)
+endif()
+if (ANDROID)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE HAVE_AAUDIO)
+elseif (APPLE)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE HAVE_COREAUDIO)
+    target_link_libraries(${PROJECT_NAME} PRIVATE "-framework AVFoundation -framework CoreAudio -framework CoreVideo -framework VideoToolbox -framework AudioUnit -lcompression")
+elseif (MSVC)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE HAVE_PORTAUDIO)
+endif()
+target_include_directories(${PROJECT_NAME} PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/.;"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/config;"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/connectivity;"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/connectivity/security;"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/connectivity/sip;"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/client;"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/hooks;"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/im;"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/jamidht;"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/jamidht/eth;"
+    PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}/src;"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/jami;"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/media;"
+)
+
+if(MSVC)
+   ################################################################################
+   # Target
+   ################################################################################
+   include("CMake/Utils.cmake")
+   # Only generate Release configuration
+   set(CMAKE_CONFIGURATION_TYPES "Release" CACHE STRING "Limited configurations" FORCE)
+   use_props(${PROJECT_NAME} "${CMAKE_CONFIGURATION_TYPES}" "${DEFAULT_CXX_PROPS}")
+
+   ################################################################################
+   # Include necessary .cmake file (need to init use_props first)
+   ################################################################################
+   include("CMake/Default.cmake")
+   include("CMake/DefaultCXX.cmake")
+
+   # Supress generation of ZERO_CHECK
+   set(CMAKE_SUPPRESS_REGENERATION true)
+
+   ################################################################################
+   # Output directory
+   ################################################################################
+   if("${CMAKE_VS_PLATFORM_NAME}" STREQUAL "x64")
+       set_target_properties(${PROJECT_NAME} PROPERTIES
+           OUTPUT_DIRECTORY_RELEASE "${CMAKE_CURRENT_SOURCE_DIR}/build/lib"
+       )
+   endif()
+   if("${CMAKE_VS_PLATFORM_NAME}" STREQUAL "x64")
+       set_target_properties(${PROJECT_NAME} PROPERTIES
+           INTERPROCEDURAL_OPTIMIZATION_RELEASE "FALSE"
+       )
+   endif()
+   ################################################################################
+   # Include directories
+   ################################################################################
+   if("${CMAKE_VS_PLATFORM_NAME}" STREQUAL "x64")
+       target_include_directories(${PROJECT_NAME} PUBLIC
+           "${CMAKE_CURRENT_SOURCE_DIR}/compat/msvc;"
+           "${CMAKE_CURRENT_SOURCE_DIR}/contrib/msvc;"
+           "${CMAKE_CURRENT_SOURCE_DIR}/contrib/msvc/include;"
+           "${CMAKE_CURRENT_SOURCE_DIR}/contrib/build/ffmpeg/Build/win32/x64/include;"
+           "${CMAKE_CURRENT_SOURCE_DIR}/contrib/build/sndfile/src;"
+           "${CMAKE_CURRENT_SOURCE_DIR}/contrib/build/openssl/include;"
+           "${CMAKE_CURRENT_SOURCE_DIR}/contrib/build/asio/asio/include;"
+           "${CMAKE_CURRENT_SOURCE_DIR}/contrib/build/restinio/dev;"
+           "${CMAKE_CURRENT_SOURCE_DIR}/contrib/build/fmt/include;"
+           "${CMAKE_CURRENT_SOURCE_DIR}/contrib/build/llhttp/include;"
+           "${CMAKE_CURRENT_SOURCE_DIR}/contrib/build/natpmp/include;"
+           "${CMAKE_CURRENT_SOURCE_DIR}/contrib/build/msgpack-c/include;"
+           "${CMAKE_CURRENT_SOURCE_DIR}/contrib/build/opendht/include;"
+           "${CMAKE_CURRENT_SOURCE_DIR}/contrib/build/libarchive/libarchive;"
+           "${CMAKE_CURRENT_SOURCE_DIR}/contrib/build/jsoncpp/include;"
+           "${CMAKE_CURRENT_SOURCE_DIR}/contrib/build/yaml-cpp/include;"
+           "${CMAKE_CURRENT_SOURCE_DIR}/contrib/build/pjproject/pjlib/include;"
+           "${CMAKE_CURRENT_SOURCE_DIR}/contrib/build/pjproject/pjnath/include;"
+           "${CMAKE_CURRENT_SOURCE_DIR}/contrib/build/pjproject/pjlib-util/include;"
+           "${CMAKE_CURRENT_SOURCE_DIR}/contrib/build/pjproject/pjsip/include;"
+           "${CMAKE_CURRENT_SOURCE_DIR}/contrib/build/pjproject/third_party;"
+           "${CMAKE_CURRENT_SOURCE_DIR}/contrib/build/speexdsp/include;"
+           "${CMAKE_CURRENT_SOURCE_DIR}/contrib/build/webrtc-audio-processing;"
+           "${CMAKE_CURRENT_SOURCE_DIR}/contrib/build/portaudio/include;"
+           "${CMAKE_CURRENT_SOURCE_DIR}/contrib/build/pjproject/pjmedia/include;"
+           "${CMAKE_CURRENT_SOURCE_DIR}/contrib/build/libgit2/include;"
+           "${CMAKE_CURRENT_SOURCE_DIR}/contrib/build/dhtnet/include;"
+           "${CMAKE_CURRENT_SOURCE_DIR}/contrib/build/simdutf/include;"
+       )
+   endif()
+
+   ################################################################################
+   # Compile definitions
+   ################################################################################
+   if("${CMAKE_VS_PLATFORM_NAME}" STREQUAL "x64")
+       target_compile_definitions(${PROJECT_NAME} PRIVATE
+           "_WIN32_WINNT=0x0A00;"
+           "STATIC_GETOPT;"
+           "LIBARCHIVE_STATIC;"
+           "OPENDHT_PROXY_CLIENT;"
+           "OPENDHT_PROXY_SERVER;"
+           "OPENDHT_PUSH_NOTIFICATIONS;"
+           "NATPMP_STATICLIB;"
+           "YAML_CPP_STATIC_DEFINE;"
+           "NDEBUG;"
+           "_USE_MATH_DEFINES;"
+           "_SCL_SECURE_NO_WARNINGS;"
+           "_CRT_SECURE_NO_WARNINGS;"
+           "NOMINMAX;"
+           "HAVE_CONFIG_H;"
+           "WIN32_LEAN_AND_MEAN;"
+           "WEBRTC_WIN;"
+           "WEBRTC_AUDIO_PROCESSING_ONLY_BUILD;"
+           "WEBRTC_NS_FLOAT;"
+       )
+   endif()
+
+   ################################################################################
+   # Compile and link options
+   ################################################################################
+   if("${CMAKE_VS_PLATFORM_NAME}" STREQUAL "x64")
+       target_compile_options(${PROJECT_NAME} PRIVATE
+           /O2;
+           /Oi;
+           ${DEFAULT_CXX_RUNTIME_LIBRARY};
+           /Gy;
+           /MP;
+           /Oy-;
+           /sdl-;
+           /W0;
+           /FC;
+           /FS
+           /nologo;
+           /Zi;
+           /wd4996;
+           /wd4503;
+           /wd4180;
+           /wd4244;
+           /wd4267;
+           /Zc:__cplusplus;
+           /utf-8;
+           ${DEFAULT_CXX_EXCEPTION_HANDLING}
+       )
+   endif()
+   if("${CMAKE_VS_PLATFORM_NAME}" STREQUAL "x64")
+       target_link_options(${PROJECT_NAME} PRIVATE
+           /MACHINE:X64;
+           /OPT:REF;
+           /OPT:ICF
+           /VERBOSE:LIB;
+           /NODEFAULTLIB:libcmtd;
+           /NODEFAULTLIB:libcmt;
+           /OPT:NOLBR;
+           /OPT:NOICF;
+           /LTCG
+       )
+   endif()
+
+   ################################################################################
+   # Dependencies
+   ################################################################################
+
+   set(libAdditionalDependencies "${CMAKE_STATIC_LINKER_FLAGS} /LTCG
+        ws2_32.lib
+        advapi32.lib
+        Secur32.lib
+        ${CMAKE_CURRENT_SOURCE_DIR}/contrib/build/ffmpeg/Build/win32/x64/lib/libavcodec.lib
+        ${CMAKE_CURRENT_SOURCE_DIR}/contrib/build/ffmpeg/Build/win32/x64/lib/libavdevice.lib
+        ${CMAKE_CURRENT_SOURCE_DIR}/contrib/build/ffmpeg/Build/win32/x64/lib/libavfilter.lib
+        ${CMAKE_CURRENT_SOURCE_DIR}/contrib/build/ffmpeg/Build/win32/x64/lib/libavformat.lib
+        ${CMAKE_CURRENT_SOURCE_DIR}/contrib/build/ffmpeg/Build/win32/x64/lib/libavutil.lib
+        ${CMAKE_CURRENT_SOURCE_DIR}/contrib/build/ffmpeg/Build/win32/x64/lib/libswresample.lib
+        ${CMAKE_CURRENT_SOURCE_DIR}/contrib/build/ffmpeg/Build/win32/x64/lib/libswscale.lib
+        ${CMAKE_CURRENT_SOURCE_DIR}/contrib/msvc/lib/x64/libvpx.lib
+        ${CMAKE_CURRENT_SOURCE_DIR}/contrib/msvc/lib/x64/libopus.lib
+        ${CMAKE_CURRENT_SOURCE_DIR}/contrib/msvc/lib/x64/libmfx.lib
+        ${CMAKE_CURRENT_SOURCE_DIR}/contrib/msvc/lib/x64/libgnutls.lib
+        ${CMAKE_CURRENT_SOURCE_DIR}/contrib/msvc/lib/x64/lib_json.lib
+        ${CMAKE_CURRENT_SOURCE_DIR}/contrib/build/opendht/build/Release/opendht.lib
+        ${CMAKE_CURRENT_SOURCE_DIR}/contrib/build/argon2/vs2015/Argon2Ref/vs2015/build/Argon2Ref.lib
+        ${CMAKE_CURRENT_SOURCE_DIR}/contrib/msvc/lib/x64/secp256k1.lib
+        ${CMAKE_CURRENT_SOURCE_DIR}/contrib/build/yaml-cpp/build/Release/yaml-cpp.lib
+        ${CMAKE_CURRENT_SOURCE_DIR}/contrib/msvc/lib/x64/libupnp.lib
+        ${CMAKE_CURRENT_SOURCE_DIR}/contrib/build/natpmp/build/Release/natpmp.lib
+        ${CMAKE_CURRENT_SOURCE_DIR}/contrib/msvc/lib/x64/archive_static.lib
+        ${CMAKE_CURRENT_SOURCE_DIR}/contrib/build/pjproject/pjsip/lib/pjsip-core-x86_64-x64-vc15-Release.lib
+        ${CMAKE_CURRENT_SOURCE_DIR}/contrib/build/pjproject/pjsip/lib/pjsip-simple-x86_64-x64-vc15-Release.lib
+        ${CMAKE_CURRENT_SOURCE_DIR}/contrib/build/pjproject/pjsip/lib/pjsua2-lib-x86_64-x64-vc15-Release.lib
+        ${CMAKE_CURRENT_SOURCE_DIR}/contrib/build/pjproject/pjsip/lib/pjsua-lib-x86_64-x64-vc15-Release.lib
+        ${CMAKE_CURRENT_SOURCE_DIR}/contrib/build/pjproject/pjsip/lib/pjsip-ua-x86_64-x64-vc15-Release.lib
+        ${CMAKE_CURRENT_SOURCE_DIR}/contrib/build/pjproject/pjmedia/lib/pjmedia-x86_64-x64-vc15-Release.lib
+        ${CMAKE_CURRENT_SOURCE_DIR}/contrib/build/pjproject/pjlib-util/lib/pjlib-util-x86_64-x64-vc15-Release.lib
+        ${CMAKE_CURRENT_SOURCE_DIR}/contrib/build/pjproject/pjlib/lib/pjlib-x86_64-x64-vc15-Release.lib
+        ${CMAKE_CURRENT_SOURCE_DIR}/contrib/build/pjproject/pjnath/lib/pjnath-x86_64-x64-vc15-Release.lib
+        ${CMAKE_CURRENT_SOURCE_DIR}/contrib/build/fmt/msvc/Release/fmt.lib
+        ${CMAKE_CURRENT_SOURCE_DIR}/contrib/build/llhttp/build/Release/llhttp.lib
+        ${CMAKE_CURRENT_SOURCE_DIR}/contrib/build/openssl/libcrypto.lib
+        ${CMAKE_CURRENT_SOURCE_DIR}/contrib/build/openssl/libssl.lib
+        ${CMAKE_CURRENT_SOURCE_DIR}/contrib/build/speexdsp/lib/libspeexdsp.lib
+        ${CMAKE_CURRENT_SOURCE_DIR}/contrib/build/webrtc-audio-processing/build/Release/webrtc-audio-processing.lib
+        ${CMAKE_CURRENT_SOURCE_DIR}/contrib/build/portaudio/build/Release/portaudio.lib
+        ${CMAKE_CURRENT_SOURCE_DIR}/contrib/build/libgit2/build/Release/git2.lib
+        ${CMAKE_CURRENT_SOURCE_DIR}/contrib/build/dhtnet/build/Release/dhtnet.lib
+        ${CMAKE_CURRENT_SOURCE_DIR}/contrib/build/simdutf/build/src/Release/simdutf.lib
+        /ignore:4006"
+   )
+
+   set ( CMAKE_STATIC_LINKER_FLAGS ${libAdditionalDependencies} )
+else()
+    include (GNUInstallDirs)
+    message("Contrib path: ${CONTRIB_PATH}")
+    list(APPEND CMAKE_FIND_ROOT_PATH ${CONTRIB_PATH})
+    set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE BOTH)
+    list(APPEND CMAKE_PREFIX_PATH ${CONTRIB_PATH})
+    if (NOT JAMI_DATADIR)
+        set(JAMI_DATADIR "${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_DATADIR}/jami")
+    endif()
+    message("Data directory: ${JAMI_DATADIR}")
+
+    find_package (yaml-cpp CONFIG REQUIRED)
+    pkg_search_module (jsoncpp REQUIRED IMPORTED_TARGET jsoncpp)
+    pkg_search_module (fmt REQUIRED IMPORTED_TARGET fmt)
+    pkg_search_module (webrtcap IMPORTED_TARGET webrtc-audio-processing)
+    pkg_search_module (gnutls REQUIRED IMPORTED_TARGET gnutls)
+    pkg_search_module (nettle REQUIRED IMPORTED_TARGET nettle)
+    pkg_search_module (opendht REQUIRED IMPORTED_TARGET opendht)
+    pkg_search_module (dhtnet REQUIRED IMPORTED_TARGET dhtnet)
+    pkg_search_module (git2 REQUIRED IMPORTED_TARGET libgit2)
+    pkg_search_module (secp256k1 REQUIRED IMPORTED_TARGET libsecp256k1)
+    pkg_search_module (pjproject REQUIRED IMPORTED_TARGET libpjproject)
+    pkg_search_module (avformat REQUIRED IMPORTED_TARGET libavformat)
+    pkg_search_module (avdevice REQUIRED IMPORTED_TARGET libavdevice)
+    pkg_search_module (avfilter REQUIRED IMPORTED_TARGET libavfilter)
+    pkg_search_module (avcodec REQUIRED IMPORTED_TARGET libavcodec)
+    pkg_search_module (swresample REQUIRED IMPORTED_TARGET libswresample)
+    pkg_search_module (swscale REQUIRED IMPORTED_TARGET libswscale)
+    pkg_search_module (avutil REQUIRED IMPORTED_TARGET libavutil)
+    pkg_search_module (speexdsp REQUIRED IMPORTED_TARGET speexdsp)
+    pkg_search_module (simdutf REQUIRED IMPORTED_TARGET simdutf)
+    if (JAMI_PLUGIN)
+        if (APPLE)
+            pkg_search_module (archive REQUIRED IMPORTED_TARGET minizip)
+        else()
+            pkg_search_module (archive REQUIRED IMPORTED_TARGET libarchive)
+        endif()
+    endif()
+
+    target_link_libraries(${PROJECT_NAME} PRIVATE
+        PkgConfig::dhtnet
+        PkgConfig::opendht
+        PkgConfig::pjproject
+        PkgConfig::git2
+        PkgConfig::gnutls
+        PkgConfig::nettle
+        PkgConfig::avformat
+        PkgConfig::avdevice
+        PkgConfig::avfilter
+        PkgConfig::avcodec
+        PkgConfig::swresample
+        PkgConfig::swscale
+        PkgConfig::jsoncpp
+        PkgConfig::secp256k1
+        PkgConfig::simdutf
+        PUBLIC
+        PkgConfig::fmt
+        PkgConfig::avutil
+    )
+    target_link_libraries(${PROJECT_NAME} PRIVATE yaml-cpp::yaml-cpp)
+    target_compile_options(${PROJECT_NAME} PRIVATE
+        -fvisibility=hidden
+        -Wall -Wextra
+        -Wno-deprecated
+        -Wno-deprecated-declarations
+        -Wno-unknown-pragmas
+        $<$<COMPILE_LANGUAGE:CXX>:-Wnon-virtual-dtor>
+    )
+    target_compile_definitions(${PROJECT_NAME} PRIVATE
+        JAMI_DATADIR="${JAMI_DATADIR}"
+        PJ_AUTOCONF=1
+    )
+    if (BUILD_TESTING)
+        target_compile_definitions(${PROJECT_NAME} PRIVATE LIBJAMI_TEST)
+    endif()
+    if (ANDROID)
+        target_link_libraries(${PROJECT_NAME} PRIVATE aaudio log)
+    elseif (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        target_link_libraries(${PROJECT_NAME} PRIVATE PkgConfig::udev)
+        if (pulseaudio_FOUND)
+            target_compile_definitions(${PROJECT_NAME} PRIVATE HAVE_PULSE)
+            target_link_libraries(${PROJECT_NAME} PRIVATE PkgConfig::pulseaudio)
+        endif()
+        if (alsa_FOUND)
+            target_compile_definitions(${PROJECT_NAME} PRIVATE HAVE_ALSA)
+            target_link_libraries(${PROJECT_NAME} PRIVATE PkgConfig::alsa)
+        endif()
+        if (jack_FOUND)
+            target_compile_definitions(${PROJECT_NAME} PRIVATE HAVE_JACK)
+            target_link_libraries(${PROJECT_NAME} PRIVATE PkgConfig::jack)
+        endif()
+    elseif (APPLE)
+        target_link_libraries(${PROJECT_NAME} PRIVATE resolv)
+    endif()
+    if (JAMI_PLUGIN)
+        target_link_libraries(${PROJECT_NAME} PRIVATE PkgConfig::archive)
+        if (APPLE)
+            # minizip's pkg-config metadata can miss zstd when built statically.
+            # Link it explicitly to avoid unresolved ZSTD_* symbols at final app link.
+            if (EXISTS "${CONTRIB_PATH}/lib/libzstd.a")
+                target_link_libraries(${PROJECT_NAME} PUBLIC "${CONTRIB_PATH}/lib/libzstd.a")
+            endif()
+        endif()
+    endif()
+    if (webrtcap_FOUND)
+        target_sources(${PROJECT_NAME} PRIVATE ${Source_Files__media__audio__webrtc} )
+        target_link_libraries(${PROJECT_NAME} PRIVATE PkgConfig::webrtcap)
+        target_compile_definitions(${PROJECT_NAME} PRIVATE HAVE_WEBRTC_AP)
+    endif()
+    if (speexdsp_FOUND)
+        target_sources(${PROJECT_NAME} PRIVATE ${Source_Files__media__audio__speexdsp} )
+        target_link_libraries(${PROJECT_NAME} PRIVATE PkgConfig::speexdsp)
+        target_compile_definitions(${PROJECT_NAME} PRIVATE HAVE_SPEEXDSP)
+    endif()
+
+    install (TARGETS ${PROJECT_NAME})
+    install(
+        DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/src/jami
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+        FILES_MATCHING PATTERN "*.h"
+    )
+
+    # Install ringtones
+    file(GLOB RINGTONES ${CMAKE_CURRENT_SOURCE_DIR}/ringtones/*.opus)
+    install(FILES ${RINGTONES} DESTINATION ${JAMI_DATADIR}/ringtones)
+
+    # Generate and install jami.pc file
+    set(prefix "${CMAKE_INSTALL_PREFIX}")
+    set(exec_prefix "${prefix}")
+    set(libdir "${prefix}/${CMAKE_INSTALL_LIBDIR}")
+    set(includedir "${prefix}/${CMAKE_INSTALL_INCLUDEDIR}/jami")
+    set(PACKAGE_VERSION "${PROJECT_VERSION}")
+    configure_file(
+        ${CMAKE_CURRENT_SOURCE_DIR}/jami.pc.in
+        ${CMAKE_CURRENT_SOURCE_DIR}/jami.pc
+        @ONLY
+    )
+    install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/jami.pc DESTINATION "${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_LIBDIR}/pkgconfig")
+
+    if (JAMI_NODEJS)
+        # Build nodejs binding (N-API via SWIG)
+        include (UseSWIG)
+        find_package(SWIG 4.3 COMPONENTS javascript REQUIRED)
+        file(GLOB NODEJS_INTERFACE_FILES ${CMAKE_CURRENT_SOURCE_DIR}/bin/nodejs/*.i)
+        add_custom_command(
+            OUTPUT ${CMAKE_CURRENT_SOURCE_DIR}/bin/nodejs/jami_wrapper.cpp
+            COMMAND ${SWIG_EXECUTABLE} -v -c++ -javascript -napi -o jami_wrapper.cpp nodejs_interface.i
+            DEPENDS
+            ${NODEJS_INTERFACE_FILES}
+            WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/bin/nodejs
+        )
+
+        # Generate binding.gyp
+        # We need to pass the link flags to node-gyp
+        set(_gyp_flags "")
+        get_target_property(_linked_libs ${PROJECT_NAME} LINK_LIBRARIES)
+        foreach(LIB IN LISTS _linked_libs)
+            if ("${LIB}" MATCHES "^PkgConfig::")
+                string(REPLACE "PkgConfig::" "" PKG_NAME ${LIB})
+                set (PKG_FLAGS ${${PKG_NAME}_LDFLAGS})
+                string(REPLACE "-framework;" "-framework " PKG_FLAGS "${PKG_FLAGS}")
+                list(APPEND _gyp_flags " ${PKG_FLAGS}")
+            elseif ("${LIB}" MATCHES ".so$")
+                get_filename_component(LIB_DIRECTORY ${LIB} DIRECTORY)
+                get_filename_component(LIB_NAME_WE ${LIB} NAME_WE)
+                string(REPLACE "lib" "" LIB_NAME_WE ${LIB_NAME_WE})
+                list(APPEND _gyp_flags " -L${LIB_DIRECTORY} -l${LIB_NAME_WE}")
+            elseif (TARGET ${LIB})
+                get_target_property(LIB_PATH ${LIB} LOCATION)
+                list(APPEND _gyp_flags " ${LIB_PATH}")
+            elseif (IS_ABSOLUTE "${LIB}")
+                list(APPEND _gyp_flags " ${LIB}")
+            elseif ("${LIB}" MATCHES "^-")
+                list(APPEND _gyp_flags " ${LIB}")
+            else()
+                list(APPEND _gyp_flags " -l${LIB}")
+            endif()
+        endforeach()
+
+        list(REVERSE _gyp_flags)
+        list(REMOVE_DUPLICATES _gyp_flags)
+        list(REVERSE _gyp_flags)
+
+        foreach(item ${_gyp_flags})
+            if (NOT "${QUOTED_JSON_LIST}" STREQUAL "")
+                set(QUOTED_JSON_LIST "${QUOTED_JSON_LIST},")
+            endif()
+            set(QUOTED_JSON_LIST "${QUOTED_JSON_LIST}\"${item}\"")
+        endforeach()
+        string(REPLACE ";" "," _gyp_flags_str ${QUOTED_JSON_LIST})
+
+        set(JAMI_LINK_LIBRARIES ${_gyp_flags_str})
+        set(JAMI_LINK_DIRECTORIES "\"-L${CMAKE_CURRENT_BINARY_DIR}\", \"-L${CONTRIB_PATH}/lib\"")
+        configure_file(
+            ${CMAKE_SOURCE_DIR}/bin/nodejs/binding.gyp.in
+            ${CMAKE_SOURCE_DIR}/bin/nodejs/binding.gyp
+        )
+
+        # Build nodejs binding
+        execute_process(
+            COMMAND node --version
+            OUTPUT_VARIABLE NODE_VERSION
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+        )
+        # Detect the host architecture for node-gyp
+        execute_process(
+            COMMAND node -p "process.arch"
+            OUTPUT_VARIABLE NODE_ARCH
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+        )
+
+        set(JAMI_NODEJS_STRIP_COMMAND)
+        if (CMAKE_STRIP)
+            if (APPLE)
+                set(JAMI_NODEJS_STRIP_COMMAND
+                    COMMAND ${CMAKE_STRIP} -x ${CMAKE_CURRENT_SOURCE_DIR}/bin/nodejs/build/Release/jamid.node
+                )
+            elseif (UNIX)
+                set(JAMI_NODEJS_STRIP_COMMAND
+                    COMMAND ${CMAKE_STRIP} --strip-unneeded ${CMAKE_CURRENT_SOURCE_DIR}/bin/nodejs/build/Release/jamid.node
+                )
+            endif()
+        endif()
+
+        add_custom_target(jamid
+            ALL
+            COMMAND npx node-gyp@latest rebuild --target=${NODE_VERSION} --arch=${NODE_ARCH}
+            ${JAMI_NODEJS_STRIP_COMMAND}
+            DEPENDS
+            ${CMAKE_CURRENT_SOURCE_DIR}/bin/nodejs/binding.gyp
+            ${CMAKE_CURRENT_SOURCE_DIR}/bin/nodejs/callback.h
+            ${CMAKE_CURRENT_SOURCE_DIR}/bin/nodejs/jami_wrapper.cpp
+            WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/bin/nodejs
+        )
+        add_dependencies(jamid ${PROJECT_NAME})
+    endif()
+
+    if (JAMI_JNI)
+        # Build jni binding
+        add_library(${PROJECT_NAME}-jni SHARED ${CMAKE_CURRENT_SOURCE_DIR}/bin/jni/jami_wrapper.cpp)
+        target_link_directories(${PROJECT_NAME}-jni PRIVATE ${CONTRIB_PATH}/lib)
+        target_link_libraries(${PROJECT_NAME}-jni ${PROJECT_NAME} android log)
+        target_compile_options(${PROJECT_NAME}-jni PRIVATE
+            -fvisibility=hidden
+            -Wall -Wextra
+            -Wno-deprecated
+            -Wno-deprecated-declarations
+            -Wno-unknown-pragmas
+            -Wno-unused-function
+            -Wno-unused-parameter
+            $<$<COMPILE_LANGUAGE:CXX>:-Wnon-virtual-dtor>
+        )
+        target_link_options(${PROJECT_NAME}-jni PRIVATE
+            -Wl,-Bsymbolic
+            -Wall -Wextra
+        )
+    endif()
+
+    if (JAMI_DBUS)
+        find_program(DBusXml2Cpp sdbus-c++-xml2cpp REQUIRED)
+        pkg_search_module (DBusCpp REQUIRED IMPORTED_TARGET sdbus-c++)
+        configure_file(
+            ${CMAKE_CURRENT_SOURCE_DIR}/bin/dbus/net.jami.daemon.service.in
+            ${CMAKE_CURRENT_SOURCE_DIR}/bin/dbus/cx.ring.Ring.service
+            @ONLY)
+        set(DBUS_XML_FILES
+            ${CMAKE_CURRENT_SOURCE_DIR}/bin/dbus/cx.ring.Ring.CallManager.xml
+            ${CMAKE_CURRENT_SOURCE_DIR}/bin/dbus/cx.ring.Ring.ConfigurationManager.xml
+            ${CMAKE_CURRENT_SOURCE_DIR}/bin/dbus/cx.ring.Ring.Instance.xml
+            ${CMAKE_CURRENT_SOURCE_DIR}/bin/dbus/cx.ring.Ring.NetworkServiceManager.xml
+            ${CMAKE_CURRENT_SOURCE_DIR}/bin/dbus/cx.ring.Ring.PresenceManager.xml
+            ${CMAKE_CURRENT_SOURCE_DIR}/bin/dbus/cx.ring.Ring.VideoManager.xml
+            ${CMAKE_CURRENT_SOURCE_DIR}/bin/dbus/cx.ring.Ring.PluginManagerInterface.xml
+        )
+        set(DBUS_ADAPTOR_FILES
+            ${CMAKE_CURRENT_SOURCE_DIR}/bin/dbus/dbuscallmanager.adaptor.h
+            ${CMAKE_CURRENT_SOURCE_DIR}/bin/dbus/dbusconfigurationmanager.adaptor.h
+            ${CMAKE_CURRENT_SOURCE_DIR}/bin/dbus/dbusinstance.adaptor.h
+            ${CMAKE_CURRENT_SOURCE_DIR}/bin/dbus/dbusnetworkservicemanager.adaptor.h
+            ${CMAKE_CURRENT_SOURCE_DIR}/bin/dbus/dbuspresencemanager.adaptor.h
+            ${CMAKE_CURRENT_SOURCE_DIR}/bin/dbus/dbusvideomanager.adaptor.h
+            ${CMAKE_CURRENT_SOURCE_DIR}/bin/dbus/dbuspluginmanagerinterface.adaptor.h
+        )
+        set(DBUS_FILES
+            ${CMAKE_CURRENT_SOURCE_DIR}/bin/dbus/main.cpp
+        )
+
+        # XML adaptors
+        foreach(DBUS_XML_FILE ${DBUS_XML_FILES})
+            list(FIND DBUS_XML_FILES ${DBUS_XML_FILE} DBUS_XML_FILE_INDEX)
+            list(GET DBUS_ADAPTOR_FILES ${DBUS_XML_FILE_INDEX} DBUS_ADAPTOR_FILE)
+            add_custom_command(
+                OUTPUT ${DBUS_ADAPTOR_FILE}
+                COMMAND ${DBusXml2Cpp} ${DBUS_XML_FILE} --adaptor=${DBUS_ADAPTOR_FILE}
+                DEPENDS ${DBUS_XML_FILE}
+            )
+        endforeach()
+
+        # Jamid
+        add_executable(jamid
+            ${DBUS_FILES}
+            ${DBUS_ADAPTOR_FILES}
+        )
+        target_link_libraries(jamid ${PROJECT_NAME} PkgConfig::DBusCpp)
+        install (TARGETS jamid DESTINATION ${CMAKE_INSTALL_LIBEXECDIR})
+
+        # Install service file
+        install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/bin/dbus/cx.ring.Ring.service DESTINATION "${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_DATADIR}/dbus-1/services")
+
+        # Install interface XML files
+        install(FILES ${DBUS_XML_FILES} DESTINATION "${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_DATADIR}/dbus-1/interfaces")
+    endif()
+
+    if (BUILD_TESTING)
+        pkg_search_module(Cppunit REQUIRED IMPORTED_TARGET cppunit)
+        find_package(Restinio REQUIRED) # for namedirectory tests
+
+        # Deterministic simulation testing library
+        add_library(dst_library STATIC
+            test/dst/dst.cpp
+            test/dst/simclient.cpp
+        )
+        target_link_libraries(dst_library
+            PUBLIC
+            ${PROJECT_NAME}
+            ${CMAKE_THREAD_LIBS_INIT}
+            PkgConfig::Cppunit
+            PkgConfig::git2
+            PkgConfig::jsoncpp
+            PkgConfig::fmt
+        )
+        target_link_directories(dst_library PUBLIC ${CONTRIB_PATH}/lib)
+        target_include_directories(dst_library PUBLIC
+            "${CMAKE_CURRENT_SOURCE_DIR}/test/;"
+        )
+        target_compile_definitions(dst_library PUBLIC
+            JAMI_DATADIR="${JAMI_DATADIR}"
+            PJ_AUTOCONF=1
+            ASIO_STANDALONE
+            MSGPACK_NO_BOOST
+            LIBJAMI_TEST
+        )
+        if (JAMI_PLUGIN)
+            target_compile_definitions(dst_library PUBLIC ENABLE_PLUGIN)
+        endif()
+        if (JAMI_VIDEO)
+            target_compile_definitions(dst_library PUBLIC ENABLE_VIDEO)
+        endif()
+        # Deterministic simulation testing CLI tool
+        add_executable(jamidst test/dst/main.cpp)
+        target_link_libraries(jamidst PRIVATE dst_library)
+
+        file(COPY test/unitTest/actors DESTINATION ${CMAKE_BINARY_DIR})
+        file(COPY test/unitTest/conversation/rsc DESTINATION ${CMAKE_BINARY_DIR}/conversation)
+        file(COPY test/unitTest/simulation/data DESTINATION ${CMAKE_BINARY_DIR}/simulation)
+        file(COPY test/unitTest/media/data DESTINATION ${CMAKE_BINARY_DIR}/media)
+        file(COPY test/unitTest/plugins/plugin.yml DESTINATION ${CMAKE_BINARY_DIR}/plugins)
+        file(COPY test/unitTest/plugins/data DESTINATION ${CMAKE_BINARY_DIR}/plugins)
+
+        add_library(ut_library STATIC test/unitTest/common.cpp)
+        target_link_libraries(ut_library
+            PUBLIC
+            ${PROJECT_NAME}
+            ${CMAKE_THREAD_LIBS_INIT}
+            dst_library
+            PkgConfig::Cppunit
+            PkgConfig::opendht
+            PkgConfig::pjproject
+            PkgConfig::git2
+            PkgConfig::archive
+            PkgConfig::gnutls
+            PkgConfig::avformat
+            PkgConfig::avdevice
+            PkgConfig::avfilter
+            PkgConfig::avcodec
+            PkgConfig::swresample
+            PkgConfig::swscale
+            PkgConfig::jsoncpp
+            PkgConfig::fmt
+            PkgConfig::secp256k1
+        )
+        target_link_libraries(ut_library PRIVATE yaml-cpp::yaml-cpp)
+        target_link_directories(ut_library PUBLIC ${CONTRIB_PATH}/lib)
+        target_include_directories(ut_library PUBLIC
+            "${CMAKE_CURRENT_SOURCE_DIR}/test;"
+            "${CMAKE_CURRENT_SOURCE_DIR}/test/unitTest;"
+        )
+        target_compile_options(ut_library PUBLIC
+            -fvisibility=hidden
+            -Wall -Wextra
+            -Wno-deprecated
+            -Wno-deprecated-declarations
+            -Wno-unknown-pragmas
+            $<$<COMPILE_LANGUAGE:CXX>:-Wnon-virtual-dtor>
+        )
+        target_compile_definitions(ut_library PUBLIC
+            JAMI_DATADIR="${JAMI_DATADIR}"
+            PJ_AUTOCONF=1
+            ASIO_STANDALONE
+            MSGPACK_NO_BOOST
+            LIBJAMI_TEST
+        )
+        if (JAMI_PLUGIN)
+            target_compile_definitions(ut_library PUBLIC ENABLE_PLUGIN)
+        endif()
+        if (JAMI_VIDEO)
+            target_compile_definitions(ut_library PUBLIC ENABLE_VIDEO)
+            if (JAMI_VIDEO_ACCEL)
+                target_compile_definitions(${PROJECT_NAME} PUBLIC ENABLE_HWACCEL)
+            endif()
+        endif()
+
+        # Setup coverage for test library
+        if(ENABLE_COVERAGE)
+            setup_target_for_coverage(ut_library)
+        endif()
+
+        # Macro to create test executables with coverage
+        macro(add_test_executable test_name)
+            add_executable(ut_${test_name} ${ARGN})
+            target_link_libraries(ut_${test_name} PRIVATE ut_library)
+            if(ENABLE_COVERAGE)
+                setup_target_for_coverage(ut_${test_name})
+            endif()
+            add_test(NAME ${test_name} COMMAND ut_${test_name})
+        endmacro()
+
+        add_test_executable(bootstrap test/unitTest/swarm/bootstrap.cpp)
+        add_test_executable(conversationRepository test/unitTest/conversationRepository/conversationRepository.cpp)
+        add_test_executable(simulation test/unitTest/simulation/simulation.cpp)
+        add_test_executable(revoke test/unitTest/revoke/revoke.cpp)
+        add_test_executable(syncHistory test/unitTest/syncHistory/syncHistory.cpp)
+        add_test_executable(base64 test/unitTest/base64/base64.cpp)
+        add_test_executable(linkdevice test/unitTest/linkdevice/linkdevice.cpp)
+
+        if (JAMI_VIDEO)
+            add_test_executable(ice_sdp_parser test/unitTest/ice/ice_sdp_parser.cpp)
+            add_test_executable(conference test/unitTest/call/conference.cpp)
+            add_test_executable(media_frame test/unitTest/media/test_media_frame.cpp)
+            add_test_executable(video_scaler test/unitTest/media/video/test_video_scaler.cpp)
+            add_test_executable(video_input test/unitTest/media/video/testVideo_input.cpp)
+            add_test_executable(media_filter test/unitTest/media/test_media_filter.cpp)
+            add_test_executable(media_player test/unitTest/media/test_media_player.cpp)
+        endif()
+
+        add_test_executable(namedirectory test/unitTest/namedirectory/namedirectory.cpp)
+        target_link_libraries(ut_namedirectory PRIVATE restinio::restinio)
+
+        add_test_executable(account_factory test/unitTest/account_factory/testAccount_factory.cpp)
+        add_test_executable(call test/unitTest/call/call.cpp)
+        add_test_executable(recorder test/unitTest/call/recorder.cpp)
+        add_test_executable(migration test/unitTest/account_archive/migration.cpp)
+        add_test_executable(account_archive test/unitTest/account_archive/account_archive.cpp)
+        add_test_executable(sip_basic_calls test/unitTest/sip_account/sip_basic_calls.cpp)
+        add_test_executable(sip_srtp test/unitTest/sip_account/sip_srtp.cpp)
+        add_test_executable(fileTransfer test/unitTest/fileTransfer/fileTransfer.cpp)
+        add_test_executable(fileutils test/unitTest/fileutils/testFileutils.cpp)
+        add_test_executable(hold_resume test/unitTest/media_negotiation/hold_resume.cpp)
+        add_test_executable(auto_answer test/unitTest/media_negotiation/auto_answer.cpp)
+        add_test_executable(media_negotiation test/unitTest/media_negotiation/media_negotiation.cpp)
+        add_test_executable(commit_message test/unitTest/conversation/commit_message.cpp)
+        add_test_executable(conv_info_serialization test/unitTest/conversation/conv_info_serialization.cpp)
+        add_test_executable(devicePairingWire test/unitTest/devicePairing/wire.cpp)
+        add_test_executable(identityAnnouncement test/unitTest/accountIdentity/identityAnnouncement.cpp)
+        add_test_executable(fixtureOwnership test/unitTest/accountIdentity/fixtureOwnership.cpp)
+        add_test_executable(contact_serialization test/unitTest/conversation/contact_serialization.cpp)
+        add_test_executable(string_utils test/unitTest/string_utils/testString_utils.cpp)
+        add_test_executable(service_manager test/unitTest/service/test_service_manager.cpp)
+        add_test_executable(service_integration test/unitTest/service/test_service_integration.cpp)
+        add_test_executable(service_update test/unitTest/service/test_service_update.cpp)
+        add_test_executable(service_update_integration test/unitTest/service/test_service_update_integration.cpp)
+        add_test_executable(utf8_utils test/unitTest/utf8_utils/testUtf8_utils.cpp)
+        add_test_executable(presence test/unitTest/presence/presence.cpp)
+        add_test_executable(typers test/unitTest/conversation/typers.cpp test/unitTest/conversation/conversationcommon.cpp)
+        add_test_executable(conversation_call test/unitTest/conversation/call.cpp test/unitTest/conversation/conversationcommon.cpp)
+        add_test_executable(conversationBanStatus test/unitTest/conversation/conversationBanStatus.cpp)
+        add_test_executable(conversation test/unitTest/conversation/conversation.cpp test/unitTest/conversation/conversationcommon.cpp)
+        add_test_executable(conversationRequest test/unitTest/conversation/conversationRequest.cpp test/unitTest/conversation/conversationcommon.cpp)
+        add_test_executable(conversationMembersEvent test/unitTest/conversation/conversationMembersEvent.cpp test/unitTest/conversation/conversationcommon.cpp)
+        add_test_executable(conversation_fetch_sent test/unitTest/conversation/conversationFetchSent.cpp test/unitTest/conversation/conversationcommon.cpp)
+        add_test_executable(media_encoder test/unitTest/media/test_media_encoder.cpp)
+        add_test_executable(media_decoder test/unitTest/media/test_media_decoder.cpp)
+        add_test_executable(resampler test/unitTest/media/audio/test_resampler.cpp)
+        add_test_executable(audio_frame_resizer test/unitTest/media/audio/test_audio_frame_resizer.cpp)
+        add_test_executable(routing_table test/unitTest/swarm/routing_table.cpp)
+        add_test_executable(sipcall test/unitTest/call/sipcall.cpp)
+        add_test_executable(swarm_conversation test/unitTest/swarm/swarm_conversation.cpp)
+        add_test_executable(swarm_spread test/unitTest/swarm/swarm_spread.cpp)
+        add_test_executable(sip test/sip/sip.cpp test/sip/test_SIP.cpp)
+        if (JAMI_PLUGIN)
+            add_test_executable(plugins test/unitTest/plugins/plugins.cpp)
+        endif()
+    endif()
+
+endif()

@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="remote_control_accessibility_label">Doorlight remote help</string>
+    <string name="remote_control_accessibility_description">Allows a person in your current Doorlight call to attempt taps, swipes, text entry, and Back, Home or Recents after you share your full display and approve control. This includes apps, Settings, permission requests, and password fields. Android decides which actions it permits. Use Stop in Doorlight to end control.</string>
+    <string name="remote_control_consent_title">Allow control of your phone?</string>
+    <string name="remote_control_consent_identity">Authenticated account\n%1$s\nDevice\n%2$s</string>
+    <string name="remote_control_consent_body">They can tap, scroll, type, and use Back, Home and Recents across this phone—including apps, Settings, permission prompts and password fields. This is for this session, and you can stop control at any time.</string>
+    <string name="remote_control_consent_secondary">Android decides which actions are available. Locking the phone is not a substitute for Stop control.</string>
+    <string name="remote_control_active">%1$s is helping — control is on</string>
+    <string name="remote_control_stop">Stop control</string>
+    <string name="remote_control_deny">Not now</string>
+    <string name="remote_control_allow_once">Allow once</string>
+    <string name="remote_control_allow_always">Always allow</string>
+</resources>

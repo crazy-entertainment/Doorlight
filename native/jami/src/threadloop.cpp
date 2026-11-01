@@ -1,0 +1,129 @@
+/*
+ *  Copyright (C) 2004-2026 Savoir-faire Linux Inc.
+ *
+ *  This program is free software: you can redistribute it and/or modify
+ *  it under the terms of the GNU General Public License as published by
+ *  the Free Software Foundation, either version 3 of the License, or
+ *  (at your option) any later version.
+ *
+ *  This program is distributed in the hope that it will be useful,
+ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ *  GNU General Public License for more details.
+ *
+ *  You should have received a copy of the GNU General Public License
+ *  along with this program. If not, see <https://www.gnu.org/licenses/>.
+ */
+
+#include "threadloop.h"
+#include "logger.h"
+
+namespace jami {
+
+void
+ThreadLoop::mainloop(std::thread::id& tid,
+                     const std::function<bool()>& setup,
+                     const std::function<void()>& process,
+                     const std::function<void()>& cleanup)
+{
+    tid = std::this_thread::get_id();
+    try {
+        if (setup()) {
+            while (state_ == ThreadState::RUNNING)
+                process();
+            cleanup();
+        } else {
+            JAMI_ERROR("setup failed");
+        }
+    } catch (const ThreadLoopException& e) {
+        JAMI_ERROR("[threadloop:{}] ThreadLoopException: {}", fmt::ptr(this), e.what());
+    } catch (const std::exception& e) {
+        JAMI_ERROR("[threadloop:{}] Unwaited exception: {}", fmt::ptr(this), e.what());
+    }
+    stop();
+}
+
+ThreadLoop::ThreadLoop(const std::function<bool()>& setup,
+                       const std::function<void()>& process,
+                       const std::function<void()>& cleanup)
+    : setup_(setup)
+    , process_(process)
+    , cleanup_(cleanup)
+    , thread_()
+{}
+
+ThreadLoop::~ThreadLoop()
+{
+    if (isRunning()) {
+        JAMI_ERROR("join() should be explicitly called in owner's destructor");
+        join();
+    }
+}
+
+void
+ThreadLoop::start()
+{
+    const auto s = state_.load();
+
+    if (s == ThreadState::RUNNING) {
+        JAMI_ERROR("already started");
+        return;
+    }
+
+    // stop pending but not processed by thread yet?
+    if (s == ThreadState::STOPPING and thread_.joinable()) {
+        JAMI_LOG("stop pending");
+        thread_.join();
+    }
+
+    state_ = ThreadState::RUNNING;
+    thread_ = std::thread(&ThreadLoop::mainloop, this, std::ref(threadId_), setup_, process_, cleanup_);
+    threadId_ = thread_.get_id();
+}
+
+void
+ThreadLoop::stop()
+{
+    auto expected = ThreadState::RUNNING;
+    state_.compare_exchange_strong(expected, ThreadState::STOPPING);
+}
+
+void
+ThreadLoop::join()
+{
+    stop();
+    if (thread_.joinable())
+        thread_.join();
+}
+
+void
+ThreadLoop::waitForCompletion()
+{
+    if (thread_.joinable())
+        thread_.join();
+}
+
+void
+ThreadLoop::exit()
+{
+    stop();
+    throw ThreadLoopException();
+}
+
+bool
+ThreadLoop::isRunning() const noexcept
+{
+#ifdef _WIN32
+    return state_ == ThreadState::RUNNING;
+#else
+    return thread_.joinable() and state_ == ThreadState::RUNNING;
+#endif
+}
+
+void
+InterruptedThreadLoop::stop()
+{
+    ThreadLoop::stop();
+    cv_.notify_one();
+}
+} // namespace jami

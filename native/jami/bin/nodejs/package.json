@@ -1,0 +1,60 @@
+{
+  "name": "@savoirfairelinux/jami-core",
+  "version": "0.3.3",
+  "description": "Jami daemon Node.js bindings \u2014 native SWIG N-API addon with TypeScript types.",
+  "type": "module",
+  "gypfile": false,
+  "main": "dist/index.js",
+  "module": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc --build",
+    "clean": "rm -rf dist *.tsbuildinfo",
+    "lint": "eslint src --max-warnings 0",
+    "format": "prettier --write src",
+    "format:check": "prettier --check src",
+    "prepublishOnly": "npm run clean && npm run build",
+    "pack-native": "node scripts/pack-native.mjs",
+    "publish-platform": "node scripts/pack-native.mjs && npm publish --workspace npm/$(node -e \"process.stdout.write(process.platform+'-'+process.arch)\")"
+  },
+  "optionalDependencies": {
+    "@savoirfairelinux/jami-core-darwin-arm64": "0.3.3",
+    "@savoirfairelinux/jami-core-linux-x64": "0.3.3",
+    "@savoirfairelinux/jami-core-linux-arm64": "0.3.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.4.0",
+    "typescript": "~6.0.3"
+  },
+  "license": "GPL-3.0-or-later",
+  "repository": {
+    "type": "git",
+    "url": "https://git.jami.net/savoirfairelinux/jami-daemon.git",
+    "directory": "bin/nodejs"
+  },
+  "keywords": [
+    "jami",
+    "daemon",
+    "native",
+    "swig",
+    "peer-to-peer",
+    "voip"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

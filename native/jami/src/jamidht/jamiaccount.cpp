@@ -1,0 +1,5037 @@
+/*
+ * Copyright (C) 2004-2026 Savoir-faire Linux Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program. If not, see <https://www.gnu.org/licenses/>.
+ */
+
+#ifdef HAVE_CONFIG_H
+#include "config.h"
+#endif
+
+#include "jamiaccount.h"
+#include "presence_manager.h"
+
+#include "logger.h"
+
+#include "accountarchive.h"
+#include "jami_contact.h"
+#include "configkeys.h"
+#include "contact_list.h"
+#include "archive_account_manager.h"
+#include "server_account_manager.h"
+#include "jamidht/commit_message.h"
+#include "jamidht/channeled_transport.h"
+#include "conversation_channel_handler.h"
+#include "sync_channel_handler.h"
+#include "message_channel_handler.h"
+#include "auth_channel_handler.h"
+#include "transfer_channel_handler.h"
+#include "swarm/swarm_channel_handler.h"
+#include "service_manager.h"
+#include "svc_discovery_channel_handler.h"
+#include "svc_tunnel_channel_handler.h"
+#include "jami/media_const.h"
+
+#include "sip/sdp.h"
+#include "sip/sipvoiplink.h"
+#include "sip/sipcall.h"
+#include "sip/siptransport.h"
+#include "connectivity/sip_utils.h"
+
+#include "uri.h"
+
+#include "client/jami_signal.h"
+#include "jami/call_const.h"
+#include "jami/account_const.h"
+
+#include "system_codec_container.h"
+
+#include "account_schema.h"
+#include "manager.h"
+#include "connectivity/utf8_utils.h"
+#include "connectivity/ip_utils.h"
+
+#ifdef ENABLE_PLUGIN
+#include "plugin/jamipluginmanager.h"
+#include "plugin/chatservicesmanager.h"
+#endif
+
+#ifdef ENABLE_VIDEO
+#include "libav_utils.h"
+#endif
+#include "fileutils.h"
+#include "string_utils.h"
+#include "archiver.h"
+#include "data_transfer.h"
+#include "json_utils.h"
+
+#include "libdevcrypto/Common.h"
+#include "base64.h"
+#include "vcard.h"
+#include "im/instant_messaging.h"
+
+#include <dhtnet/ice_transport.h>
+#include <dhtnet/ice_transport_factory.h>
+#include <dhtnet/upnp/upnp_control.h>
+#include <dhtnet/multiplexed_socket.h>
+#include <dhtnet/certstore.h>
+
+#include <opendht/thread_pool.h>
+#include <opendht/securedht.h>
+#include <opendht/peer_discovery.h>
+#include <opendht/http.h>
+
+#include <yaml-cpp/yaml.h>
+#include <fmt/format.h>
+
+#include <unistd.h>
+
+#include <algorithm>
+#include <array>
+#include <cctype>
+#include <charconv>
+#include <cinttypes>
+#include <cstdarg>
+#include <fstream>
+#include <initializer_list>
+#include <memory>
+#include <regex>
+#include <sstream>
+#include <string>
+#include <system_error>
+#include <utility>
+
+using namespace std::placeholders;
+
+namespace jami {
+
+constexpr pj_str_t STR_MESSAGE_ID = jami::sip_utils::CONST_PJ_STR("Message-ID");
+static constexpr const char MIME_TYPE_IMDN[] {"message/imdn+xml"};
+static constexpr const char MIME_TYPE_PIDF[] {"application/pidf+xml"};
+static constexpr const char MIME_TYPE_INVITE_JSON[] {"application/invite+json"};
+static constexpr const char DEVICE_ID_PATH[] {"ring_device"};
+static constexpr auto TREATED_PATH = "treatedImMessages"sv;
+
+struct VCardMessageCtx
+{
+    std::shared_ptr<std::atomic_int> success;
+    int total;
+    std::string path;
+};
+
+namespace Migration {
+
+enum class State { // Contains all the Migration states
+    SUCCESS,
+    INVALID
+};
+
+std::string
+mapStateNumberToString(const State migrationState)
+{
+#define CASE_STATE(X) \
+    case Migration::State::X: \
+        return #X
+
+    switch (migrationState) {
+        CASE_STATE(INVALID);
+        CASE_STATE(SUCCESS);
+    }
+    return {};
+}
+
+void
+setState(const std::string& accountID, const State migrationState)
+{
+    emitSignal<libjami::ConfigurationSignal::MigrationEnded>(accountID, mapStateNumberToString(migrationState));
+}
+
+} // namespace Migration
+
+struct JamiAccount::PendingCall
+{
+    std::chrono::steady_clock::time_point start;
+    std::shared_ptr<IceTransport> ice_sp;
+    std::shared_ptr<IceTransport> ice_tcp_sp;
+    std::weak_ptr<SIPCall> call;
+    std::future<size_t> listen_key;
+    dht::InfoHash call_key;
+    dht::InfoHash from;
+    dht::InfoHash from_account;
+    std::shared_ptr<dht::crypto::Certificate> from_cert;
+};
+
+struct JamiAccount::PendingMessage
+{
+    std::set<DeviceId> to;
+};
+
+struct AccountPeerInfo
+{
+    dht::InfoHash accountId;
+    std::string displayName;
+    MSGPACK_DEFINE(accountId, displayName)
+};
+
+struct JamiAccount::DiscoveredPeer
+{
+    std::string displayName;
+    std::unique_ptr<asio::steady_timer> cleanupTimer;
+};
+
+/**
+ * Track sending state for a single message to one or more devices.
+ */
+class JamiAccount::SendMessageContext
+{
+public:
+    using OnComplete = std::function<void(bool, bool)>;
+    SendMessageContext(OnComplete onComplete)
+        : onComplete(std::move(onComplete))
+    {}
+    /** Track new pending message for device */
+    bool add(const DeviceId& device)
+    {
+        std::lock_guard lk(mtx);
+        return devices.insert(device).second;
+    }
+    /** Call after all messages are sent */
+    void start()
+    {
+        std::unique_lock lk(mtx);
+        started = true;
+        checkComplete(lk);
+    }
+    /** Complete pending message for device */
+    bool complete(const DeviceId& device, bool success)
+    {
+        std::unique_lock lk(mtx);
+        if (devices.erase(device) == 0)
+            return false;
+        ++completeCount;
+        if (success)
+            ++successCount;
+        checkComplete(lk);
+        return true;
+    }
+    bool empty() const
+    {
+        std::lock_guard lk(mtx);
+        return devices.empty();
+    }
+    bool pending(const DeviceId& device) const
+    {
+        std::lock_guard lk(mtx);
+        return devices.find(device) != devices.end();
+    }
+
+private:
+    mutable std::mutex mtx;
+    OnComplete onComplete;
+    std::set<DeviceId> devices;
+    unsigned completeCount = 0;
+    unsigned successCount = 0;
+    bool started {false};
+
+    void checkComplete(std::unique_lock<std::mutex>& lk)
+    {
+        if (started && (devices.empty() || successCount)) {
+            if (onComplete) {
+                auto cb = std::move(onComplete);
+                auto success = successCount != 0;
+                auto complete = completeCount != 0;
+                onComplete = {};
+                lk.unlock();
+                cb(success, complete);
+            }
+        }
+    }
+};
+
+static const constexpr std::string_view RING_URI_PREFIX = "ring:";
+static const constexpr std::string_view JAMI_URI_PREFIX = "jami:";
+static const auto PROXY_REGEX = std::regex("(https?://)?([\\w\\.\\-_\\~]+)(:(\\d+)|:\\[(.+)-(.+)\\])?");
+static const constexpr std::string_view PEER_DISCOVERY_JAMI_SERVICE = "jami";
+const constexpr auto PEER_DISCOVERY_EXPIRATION = std::chrono::minutes(1);
+
+using ValueIdDist = std::uniform_int_distribution<dht::Value::Id>;
+
+std::string_view
+stripPrefix(std::string_view toUrl)
+{
+    auto dhtf = toUrl.find(RING_URI_PREFIX);
+    if (dhtf != std::string_view::npos) {
+        dhtf += RING_URI_PREFIX.size();
+    } else {
+        dhtf = toUrl.find(JAMI_URI_PREFIX);
+        if (dhtf != std::string_view::npos) {
+            dhtf += JAMI_URI_PREFIX.size();
+        } else {
+            dhtf = toUrl.find("sips:");
+            dhtf = (dhtf == std::string_view::npos) ? 0 : dhtf + 5;
+        }
+    }
+    while (dhtf < toUrl.length() && toUrl[dhtf] == '/')
+        dhtf++;
+    return toUrl.substr(dhtf);
+}
+
+std::string_view
+parseJamiUri(std::string_view toUrl)
+{
+    auto sufix = stripPrefix(toUrl);
+    if (sufix.length() < 40)
+        throw std::invalid_argument("Not a valid Jami URI: " + toUrl);
+
+    const std::string_view toUri = sufix.substr(0, 40);
+    if (std::find_if_not(toUri.cbegin(), toUri.cend(), ::isxdigit) != toUri.cend())
+        throw std::invalid_argument("Not a valid Jami URI: " + toUrl);
+    return toUri;
+}
+
+static constexpr std::string_view
+dhtStatusStr(dht::NodeStatus status)
+{
+    return status == dht::NodeStatus::Connected
+               ? "connected"sv
+               : (status == dht::NodeStatus::Connecting ? "connecting"sv : "disconnected"sv);
+}
+
+JamiAccount::JamiAccount(const std::string& accountId)
+    : SIPAccountBase(accountId)
+    , cachePath_(fileutils::get_cache_dir() / accountId)
+    , dataPath_(cachePath_ / "values")
+    , logger_(Logger::dhtLogger(fmt::format("Account {}", accountId)))
+    , certStore_ {std::make_shared<dhtnet::tls::CertificateStore>(idPath_, logger_)}
+    , dht_(std::make_shared<dht::DhtRunner>())
+    , treatedMessages_(cachePath_ / TREATED_PATH)
+    , presenceManager_(std::make_unique<PresenceManager>(dht_))
+    , connectionManager_ {}
+    , nonSwarmTransferManager_()
+{
+    presenceListenerToken_ = presenceManager_->addListener([this](const std::string& uri, bool online) {
+        runOnMainThread([w = weak(), uri, online] {
+            if (auto sthis = w.lock()) {
+                if (online) {
+                    sthis->onTrackedBuddyOnline(uri);
+                    sthis->messageEngine_.onPeerOnline(uri);
+                } else {
+                    sthis->onTrackedBuddyOffline(uri);
+                }
+            }
+        });
+    });
+    // When a device of a contact that advertises services changes presence,
+    // re-publish that peer's service list with refreshed availability so an
+    // already-open services menu greys out / re-enables entries live.
+    svcPresenceListenerToken_ = presenceManager_->addDeviceListener([this](const std::string& uri,
+                                                                           const dht::PkId&,
+                                                                           bool) {
+        runOnMainThread([w = weak(), uri] {
+            auto sthis = w.lock();
+            if (!sthis)
+                return;
+            auto servicesJson = sthis->buildPeerServicesJson(uri);
+            if (servicesJson.empty())
+                return;
+            emitSignal<libjami::ServiceSignal::PeerServicesReceived>(0u,
+                                                                     sthis->getAccountID(),
+                                                                     uri,
+                                                                     static_cast<int>(
+                                                                         libjami::ServiceSignal::PeerServicesStatus::OK),
+                                                                     servicesJson);
+        });
+    });
+}
+
+JamiAccount::~JamiAccount() noexcept
+{
+    if (dht_)
+        dht_->join();
+}
+
+void
+JamiAccount::shutdownConnections()
+{
+    JAMI_LOG("[Account {}] Shutdown connections", getAccountID());
+
+    decltype(gitServers_) gservers;
+    {
+        std::lock_guard lk(gitServersMtx_);
+        gservers = std::move(gitServers_);
+    }
+    for (auto& [_id, gs] : gservers)
+        gs->stop();
+    {
+        std::lock_guard lk(connManagerMtx_);
+        // Retire account access immediately. An admission already in progress
+        // may finish its synchronous connect call; the shared deleter schedules
+        // destruction on the IO pool after the last such lease retires.
+        connectionManager_.reset();
+        channelHandlers_.clear();
+    }
+    if (convModule_) {
+        convModule_->shutdownConnections();
+    }
+
+    std::lock_guard lk(sipConnsMtx_);
+    sipConns_.clear();
+}
+
+void
+JamiAccount::flush()
+{
+    // Class base method
+    SIPAccountBase::flush();
+
+    dhtnet::fileutils::removeAll(cachePath_);
+    dhtnet::fileutils::removeAll(dataPath_);
+    dhtnet::fileutils::removeAll(idPath_, true);
+}
+
+std::shared_ptr<SIPCall>
+JamiAccount::newIncomingCall(const std::string& from,
+                             const std::vector<libjami::MediaMap>& mediaList,
+                             const std::shared_ptr<SipTransport>& sipTransp)
+{
+    JAMI_DEBUG("New incoming call from {:s} with {:d} media", from, mediaList.size());
+
+    if (sipTransp) {
+        auto call = Manager::instance().callFactory.newSipCall(shared(), Call::CallType::INCOMING, mediaList);
+        call->setPeerUri(JAMI_URI_PREFIX + from);
+        call->setPeerNumber(from);
+
+        call->setSipTransport(sipTransp, getContactHeader(sipTransp));
+
+        return call;
+    }
+
+    JAMI_ERROR("newIncomingCall: unable to find matching call for {}", from);
+    return nullptr;
+}
+
+std::shared_ptr<Call>
+JamiAccount::newOutgoingCall(std::string_view toUrl, const std::vector<libjami::MediaMap>& mediaList)
+{
+    auto uri = Uri(toUrl);
+    if (uri.scheme() == Uri::Scheme::SWARM || uri.scheme() == Uri::Scheme::RENDEZVOUS) {
+        // NOTE: In this case newOutgoingCall can act as "resumeConference" and just attach the
+        // host to the current hosted conference. So, no call will be returned in that case.
+        return newSwarmOutgoingCallHelper(uri, mediaList);
+    }
+
+    auto& manager = Manager::instance();
+    std::shared_ptr<SIPCall> call;
+
+    // SIP allows sending empty invites, this use case is not used with Jami accounts.
+    if (not mediaList.empty()) {
+        call = manager.callFactory.newSipCall(shared(), Call::CallType::OUTGOING, mediaList);
+    } else {
+        JAMI_WARNING("Media list is empty, setting a default list");
+        call = manager.callFactory.newSipCall(shared(),
+                                              Call::CallType::OUTGOING,
+                                              MediaAttribute::mediaAttributesToMediaMaps(
+                                                  createDefaultMediaList(isVideoEnabled())));
+    }
+
+    if (not call)
+        return {};
+
+    std::shared_lock lkCM(connManagerMtx_);
+    if (!connectionManager_)
+        return {};
+
+    connectionManager_->getIceOptions([call, w = weak(), uri = std::move(uri)](auto&& opts) {
+        if (call->isIceEnabled()) {
+            if (not call->createIceMediaTransport(false)
+                or not call->initIceMediaTransport(true, std::forward<dhtnet::IceTransportOptions>(opts))) {
+                return;
+            }
+        }
+        auto shared = w.lock();
+        if (!shared)
+            return;
+        JAMI_LOG("New outgoing call with {}", uri.toString());
+        call->setPeerNumber(uri.authority());
+        call->setPeerUri(uri.toString());
+
+        shared->newOutgoingCallHelper(call, uri);
+    });
+
+    return call;
+}
+
+void
+JamiAccount::newOutgoingCallHelper(const std::shared_ptr<SIPCall>& call, const Uri& uri)
+{
+    JAMI_LOG("[Account {}] Calling peer {}", getAccountID(), uri.authority());
+    try {
+        startOutgoingCall(call, uri.authority());
+    } catch (const std::invalid_argument&) {
+        auto suffix = stripPrefix(uri.toString());
+        NameDirectory::lookupUri(suffix,
+                                 config().nameServer,
+                                 [wthis_ = weak(), call](const std::string& regName,
+                                                         const std::string& address,
+                                                         NameDirectory::Response response) {
+                                     // we may run inside an unknown thread, but following code must
+                                     // be called in main thread
+                                     runOnMainThread([wthis_, regName, address, response, call]() {
+                                         if (response != NameDirectory::Response::found) {
+                                             call->onFailure(PJSIP_SC_NOT_FOUND);
+                                             return;
+                                         }
+                                         if (auto sthis = wthis_.lock()) {
+                                             try {
+                                                 sthis->startOutgoingCall(call, address);
+                                             } catch (const std::invalid_argument&) {
+                                                 call->onFailure(PJSIP_SC_NOT_FOUND);
+                                             }
+                                         } else {
+                                             call->onFailure(PJSIP_SC_SERVICE_UNAVAILABLE);
+                                         }
+                                     });
+                                 });
+    }
+}
+
+std::shared_ptr<SIPCall>
+JamiAccount::newSwarmOutgoingCallHelper(const Uri& uri, const std::vector<libjami::MediaMap>& mediaList)
+{
+    JAMI_DEBUG("[Account {}] Calling conversation {}", getAccountID(), uri.authority());
+    return convModule()
+        ->call(uri.authority(), mediaList, [this, uri](const auto& accountUri, const auto& deviceId, const auto& call) {
+            if (!call)
+                return;
+
+            std::string peerId = accountUri;
+            if (uri.scheme() == Uri::Scheme::RENDEZVOUS) {
+                auto parts = jami::split_string(accountUri, '/');
+                if (parts.size() == 4)
+                    peerId = std::string(parts[1]);
+            }
+
+            std::unique_lock lkSipConn(sipConnsMtx_);
+            for (auto& [key, value] : sipConns_) {
+                if (key.first != peerId || key.second != deviceId)
+                    continue;
+                if (value.empty())
+                    continue;
+                auto& sipConn = value.back();
+
+                if (!sipConn.channel) {
+                    JAMI_WARNING("A SIP transport exists without Channel, this is a bug. Please report");
+                    continue;
+                }
+
+                auto transport = sipConn.transport;
+                if (!transport or !sipConn.channel)
+                    continue;
+                call->setState(Call::ConnectionState::PROGRESSING);
+                call->setSipTransport(transport, getContactHeader(transport));
+
+                auto remoted_address = sipConn.channel->getRemoteAddress();
+                try {
+                    onConnectedOutgoingCall(call, uri.authority(), remoted_address);
+                    return;
+                } catch (const VoipLinkException&) {
+                    // In this case, the main scenario is that SIPStartCall failed because
+                    // the ICE is dead and the TLS session didn't send any packet on that dead
+                    // link (connectivity change, killed by the operating system, etc)
+                    // Here, we don't need to do anything, the TLS will fail and will delete
+                    // the cached transport
+                    continue;
+                }
+            }
+            lkSipConn.unlock();
+            {
+                std::lock_guard lkP(pendingCallsMutex_);
+                pendingCalls_[deviceId].emplace_back(call);
+            }
+
+            // Else, ask for a channel (for future calls/text messages)
+            auto type = call->hasVideo() ? "videoCall" : "audioCall";
+            JAMI_WARNING("[call {}] No channeled socket with this peer. Send request", call->getCallId());
+            requestSIPConnection(peerId, deviceId, type, true, call);
+        });
+}
+
+void
+JamiAccount::handleIncomingConversationCall(const std::string& callId, const std::string& destination)
+{
+    auto split = jami::split_string(destination, '/');
+    if (split.size() != 4)
+        return;
+    auto conversationId = std::string(split[0]);
+    auto accountUri = std::string(split[1]);
+    auto deviceId = std::string(split[2]);
+    auto confId = std::string(split[3]);
+
+    if (getUsername() != accountUri || currentDeviceId() != deviceId)
+        return;
+
+    // Avoid concurrent checks in this part
+    std::lock_guard lk(rdvMtx_);
+    auto isNotHosting = !convModule()->isHosting(conversationId, confId);
+    if (confId == "0") {
+        auto currentCalls = convModule()->getActiveCalls(conversationId);
+        if (!currentCalls.empty()) {
+            confId = currentCalls[0]["id"];
+            isNotHosting = false;
+        } else {
+            confId = callId;
+            JAMI_DEBUG("No active call to join, create conference");
+        }
+    }
+    auto preferences = convModule()->getConversationPreferences(conversationId);
+    auto canHost = true;
+#if defined(__ANDROID__) || defined(__APPLE__)
+    // By default, mobile devices SHOULD NOT host conferences.
+    canHost = false;
+#endif
+    auto itPref = preferences.find(ConversationPreferences::HOST_CONFERENCES);
+    if (itPref != preferences.end()) {
+        canHost = itPref->second == TRUE_STR;
+    }
+
+    auto call = getCall(callId);
+    if (!call) {
+        JAMI_ERROR("Call {} not found", callId);
+        return;
+    }
+
+    if (isNotHosting && !canHost) {
+        JAMI_DEBUG("Request for hosting a conference declined");
+        Manager::instance().hangupCall(getAccountID(), callId);
+        return;
+    }
+    // Due to the fact that in a conference, the host is not the one who
+    // provides the initial sdp offer, the following block of code is responsible
+    // for handling the medialist that the host will form his response with.
+    // We always want the hosts response to be the same length as that of the
+    // peer who is asking to join (providing the offer). A priori though the peer
+    // doesn't know what active media streams the host will have so we deal with the
+    // possible cases here.
+    std::shared_ptr<Conference> conf;
+    std::vector<libjami::MediaMap> currentMediaList;
+    if (!isNotHosting) {
+        conf = getConference(confId);
+        if (!conf) {
+            JAMI_ERROR("[conf:{}] Conference not found", confId);
+            return;
+        }
+        auto hostMedias = conf->currentMediaList();
+        auto sipCall = std::dynamic_pointer_cast<SIPCall>(call);
+        if (hostMedias.empty()) {
+            currentMediaList = MediaAttribute::mediaAttributesToMediaMaps(
+                createDefaultMediaList(call->hasVideo(), true));
+        } else if (hostMedias.size() < sipCall->getRtpSessionList().size()) {
+            // First case: host has less media streams than the other person is joining
+            // with. We need to add video media to the host before accepting the offer
+            // This can happen if we host an audio call and someone joins with video
+            currentMediaList = hostMedias;
+            currentMediaList.push_back(
+                {{libjami::Media::MediaAttributeKey::MEDIA_TYPE, libjami::Media::MediaAttributeValue::VIDEO},
+                 {libjami::Media::MediaAttributeKey::ENABLED, TRUE_STR},
+                 {libjami::Media::MediaAttributeKey::MUTED, TRUE_STR},
+                 {libjami::Media::MediaAttributeKey::SOURCE, ""},
+                 {libjami::Media::MediaAttributeKey::LABEL, "video_0"}});
+        } else {
+            bool hasVideo = false;
+            if (sipCall) {
+                const auto rtpSessions = sipCall->getRtpSessionList();
+                hasVideo = std::any_of(rtpSessions.begin(), rtpSessions.end(), [](const auto& session) {
+                    return session && session->getMediaType() == MediaType::MEDIA_VIDEO;
+                });
+            }
+            // The second case is that the host has the same or more media
+            // streams than the person joining. In this case we match all their
+            // medias to form our offer. They will then potentially join the call without seeing
+            // seeing all of our medias. For now we deal with this by calling a
+            // requestmediachange once they've joined.
+            for (const auto& m : conf->currentMediaList()) {
+                // We only expect to have 1 audio stream, add it.
+                if (m.at(libjami::Media::MediaAttributeKey::MEDIA_TYPE) == libjami::Media::MediaAttributeValue::AUDIO) {
+                    currentMediaList.emplace_back(m);
+                } else if (hasVideo
+                           && m.at(libjami::Media::MediaAttributeKey::MEDIA_TYPE)
+                                  == libjami::Media::MediaAttributeValue::VIDEO) {
+                    currentMediaList.emplace_back(m);
+                    break;
+                }
+            }
+        }
+    }
+    Manager::instance().acceptCall(*call, currentMediaList);
+
+    if (isNotHosting) {
+        JAMI_DEBUG("Creating conference for swarm {} with ID {}", conversationId, confId);
+        // Create conference and host it.
+        convModule()->hostConference(conversationId, confId, callId);
+    } else {
+        JAMI_DEBUG("Adding participant {} for swarm {} with ID {}", callId, conversationId, confId);
+        Manager::instance().addAudio(*call);
+        conf->addSubCall(callId);
+        emitSignal<libjami::CallSignal::ConferenceChanged>(getAccountID(), conf->getConfId(), conf->getStateStr());
+    }
+}
+
+std::shared_ptr<SIPCall>
+JamiAccount::createSubCall(const std::shared_ptr<SIPCall>& mainCall)
+{
+    auto mediaList = MediaAttribute::mediaAttributesToMediaMaps(mainCall->getMediaAttributeList());
+    return Manager::instance().callFactory.newSipCall(shared(), Call::CallType::OUTGOING, mediaList);
+}
+
+void
+JamiAccount::startOutgoingCall(const std::shared_ptr<SIPCall>& call, const std::string& toUri)
+{
+    if (not accountManager_ or not dht_) {
+        call->onFailure(PJSIP_SC_SERVICE_UNAVAILABLE);
+        return;
+    }
+
+    // TODO: for now, we automatically trust all explicitly called peers
+    setCertificateStatus(toUri, dhtnet::tls::TrustStore::PermissionStatus::ALLOWED);
+
+    call->setState(Call::ConnectionState::TRYING);
+    std::weak_ptr<SIPCall> wCall = call;
+
+    accountManager_->lookupAddress(toUri,
+                                   [wCall](const std::string& regName,
+                                           const std::string& /*address*/,
+                                           const NameDirectory::Response& response) {
+                                       if (response == NameDirectory::Response::found)
+                                           if (auto call = wCall.lock()) {
+                                               call->setPeerRegisteredName(regName);
+                                           }
+                                   });
+
+    dht::InfoHash peer_account(toUri);
+    if (!peer_account) {
+        throw std::invalid_argument("Invalid peer account: " + toUri);
+    }
+
+    // Call connected devices
+    std::set<DeviceId> devices;
+    std::unique_lock lkSipConn(sipConnsMtx_);
+    // NOTE: dummyCall is a call used to avoid to mark the call as failed if the
+    // cached connection is failing with ICE (close event still not detected).
+    auto dummyCall = createSubCall(call);
+
+    if (!dummyCall) {
+        call->onFailure(PJSIP_SC_SERVICE_UNAVAILABLE);
+        return;
+    }
+
+    call->addSubCall(*dummyCall);
+    dummyCall->setIceMedia(call->getIceMedia());
+    auto sendRequest = [this, wCall, toUri, dummyCall = std::move(dummyCall)](const DeviceId& deviceId,
+                                                                              bool eraseDummy) {
+        if (eraseDummy) {
+            // Mark the temp call as failed to stop the main call if necessary
+            if (dummyCall)
+                dummyCall->onFailure(PJSIP_SC_TEMPORARILY_UNAVAILABLE);
+            return;
+        }
+        auto call = wCall.lock();
+        if (not call)
+            return;
+        auto state = call->getConnectionState();
+        if (state != Call::ConnectionState::PROGRESSING and state != Call::ConnectionState::TRYING)
+            return;
+
+        auto dev_call = createSubCall(call);
+        dev_call->setPeerNumber(call->getPeerNumber());
+        dev_call->setState(Call::ConnectionState::TRYING);
+        call->addStateListener([w = weak(), deviceId](Call::CallState, Call::ConnectionState state, int) {
+            if (state != Call::ConnectionState::PROGRESSING and state != Call::ConnectionState::TRYING) {
+                if (auto shared = w.lock())
+                    shared->callConnectionClosed(deviceId, true);
+                return false;
+            }
+            return true;
+        });
+        call->addSubCall(*dev_call);
+        dev_call->setIceMedia(call->getIceMedia());
+        {
+            std::lock_guard lk(pendingCallsMutex_);
+            pendingCalls_[deviceId].emplace_back(dev_call);
+        }
+
+        JAMI_WARNING("[call {}] No channeled socket with this peer. Send request", call->getCallId());
+        // Else, ask for a channel (for future calls/text messages)
+        const auto* type = call->hasVideo() ? "videoCall" : "audioCall";
+        requestSIPConnection(toUri, deviceId, type, true, dev_call);
+    };
+
+    std::vector<std::shared_ptr<dhtnet::ChannelSocket>> channels;
+    for (auto& [key, value] : sipConns_) {
+        if (key.first != toUri)
+            continue;
+        if (value.empty())
+            continue;
+        auto& sipConn = value.back();
+
+        if (!sipConn.channel) {
+            JAMI_WARNING("A SIP transport exists without Channel, this is a bug. Please report");
+            continue;
+        }
+
+        auto transport = sipConn.transport;
+        auto remote_address = sipConn.channel->getRemoteAddress();
+        if (!transport or !remote_address)
+            continue;
+
+        channels.emplace_back(sipConn.channel);
+
+        JAMI_WARNING("[call {}] A channeled socket is detected with this peer.", call->getCallId());
+
+        auto dev_call = createSubCall(call);
+        dev_call->setPeerNumber(call->getPeerNumber());
+        dev_call->setSipTransport(transport, getContactHeader(transport));
+        call->addSubCall(*dev_call);
+        dev_call->setIceMedia(call->getIceMedia());
+
+        // Set the call in PROGRESSING State because the ICE session
+        // is already ready. Note that this line should be after
+        // addSubcall() to change the state of the main call
+        // and avoid to get an active call in a TRYING state.
+        dev_call->setState(Call::ConnectionState::PROGRESSING);
+
+        {
+            std::lock_guard lk(onConnectionClosedMtx_);
+            onConnectionClosed_[key.second] = sendRequest;
+        }
+
+        call->addStateListener([w = weak(), deviceId = key.second](Call::CallState, Call::ConnectionState state, int) {
+            if (state != Call::ConnectionState::PROGRESSING and state != Call::ConnectionState::TRYING) {
+                if (auto shared = w.lock())
+                    shared->callConnectionClosed(deviceId, true);
+                return false;
+            }
+            return true;
+        });
+
+        try {
+            onConnectedOutgoingCall(dev_call, toUri, remote_address);
+        } catch (const VoipLinkException&) {
+            // In this case, the main scenario is that SIPStartCall failed because
+            // the ICE is dead and the TLS session didn't send any packet on that dead
+            // link (connectivity change, killed by the os, etc)
+            // Here, we don't need to do anything, the TLS will fail and will delete
+            // the cached transport
+            continue;
+        }
+        devices.emplace(key.second);
+    }
+
+    lkSipConn.unlock();
+    // Note: Send beacon can destroy the socket (if storing last occurence of shared_ptr)
+    // causing sipConn to be destroyed. So, do it while sipConns_ not locked.
+    for (const auto& channel : channels)
+        channel->sendBeacon();
+
+    // Find listening devices for this account
+    accountManager_->forEachDevice(
+        peer_account,
+        [this, devices = std::move(devices), sendRequest](const std::shared_ptr<dht::crypto::PublicKey>& dev) {
+            // Test if already sent via a SIP transport
+            auto deviceId = dev->getLongId();
+            if (devices.find(deviceId) != devices.end())
+                return;
+            {
+                std::lock_guard lk(onConnectionClosedMtx_);
+                onConnectionClosed_[deviceId] = sendRequest;
+            }
+            sendRequest(deviceId, false);
+        },
+        [wCall](bool ok) {
+            if (not ok) {
+                if (auto call = wCall.lock()) {
+                    JAMI_WARNING("[call:{}] No devices found", call->getCallId());
+                    // Note: if a P2P connection exists, the call will be at least in CONNECTING
+                    if (call->getConnectionState() == Call::ConnectionState::TRYING)
+                        call->onFailure(PJSIP_SC_TEMPORARILY_UNAVAILABLE);
+                }
+            }
+        });
+}
+
+void
+JamiAccount::onConnectedOutgoingCall(const std::shared_ptr<SIPCall>& call,
+                                     const std::string& to_id,
+                                     dhtnet::IpAddr target)
+{
+    if (!call)
+        return;
+    JAMI_LOG("[call:{}] Outgoing call connected to {}", call->getCallId(), to_id);
+
+    const auto localAddress = dhtnet::ip_utils::getInterfaceAddr(getLocalInterface(), target.getFamily());
+
+    dhtnet::IpAddr addrSdp = getPublishedSameasLocal() ? localAddress
+                                                       : connectionManager_->getPublishedIpAddress(target.getFamily());
+
+    // fallback on local address
+    if (not addrSdp)
+        addrSdp = localAddress;
+
+    // Building the local SDP offer
+    auto& sdp = call->getSDP();
+
+    sdp.setPublishedIP(addrSdp);
+
+    auto mediaAttrList = call->getMediaAttributeList();
+    if (mediaAttrList.empty()) {
+        JAMI_ERROR("[call:{}] No media. Abort!", call->getCallId());
+        return;
+    }
+
+    if (not sdp.createOffer(mediaAttrList)) {
+        JAMI_ERROR("[call:{}] Unable to send outgoing INVITE request for new call", call->getCallId());
+        return;
+    }
+
+    // Note: pj_ice_strans_create can call onComplete in the same thread
+    // This means that iceMutex_ in IceTransport can be locked when onInitDone is called
+    // So, we need to run the call creation in the main thread
+    // Also, we do not directly call SIPStartCall before receiving onInitDone, because
+    // there is an inside waitForInitialization that can block the thread.
+    // Note: avoid runMainThread as SIPStartCall use transportMutex
+    dht::ThreadPool::io().run([w = weak(), call = std::move(call), target] {
+        auto account = w.lock();
+        if (not account)
+            return;
+
+        if (not account->SIPStartCall(*call, target)) {
+            JAMI_ERROR("[call:{}] Unable to send outgoing INVITE request for new call", call->getCallId());
+        }
+    });
+}
+
+bool
+JamiAccount::SIPStartCall(SIPCall& call, const dhtnet::IpAddr& target)
+{
+    JAMI_LOG("[call:{}] Start SIP call", call.getCallId());
+
+    if (call.isIceEnabled())
+        call.addLocalIceAttributes();
+
+    std::string toUri(
+        getToUri(call.getPeerNumber() + "@" + target.toString(true))); // expecting a fully well formed sip uri
+
+    pj_str_t pjTo = sip_utils::CONST_PJ_STR(toUri);
+
+    // Create the from header
+    std::string from(getFromUri());
+    pj_str_t pjFrom = sip_utils::CONST_PJ_STR(from);
+
+    std::string targetStr = getToUri(target.toString(true));
+    pj_str_t pjTarget = sip_utils::CONST_PJ_STR(targetStr);
+
+    auto contact = call.getContactHeader();
+    auto pjContact = sip_utils::CONST_PJ_STR(contact);
+
+    JAMI_LOG("[call:{}] Contact header: {} / {} -> {} / {}", call.getCallId(), contact, from, toUri, targetStr);
+
+    auto* local_sdp = call.getSDP().getLocalSdpSession();
+    pjsip_dialog* dialog {nullptr};
+    pjsip_inv_session* inv {nullptr};
+    if (!CreateClientDialogAndInvite(&pjFrom, &pjContact, &pjTo, &pjTarget, local_sdp, &dialog, &inv))
+        return false;
+
+    inv->mod_data[link_.getModId()] = &call;
+    call.setInviteSession(inv);
+
+    pjsip_tx_data* tdata;
+
+    if (pjsip_inv_invite(call.inviteSession_.get(), &tdata) != PJ_SUCCESS) {
+        JAMI_ERROR("[call:{}] Unable to initialize invite", call.getCallId());
+        return false;
+    }
+
+    pjsip_tpselector tp_sel;
+    tp_sel.type = PJSIP_TPSELECTOR_TRANSPORT;
+    if (!call.getTransport()) {
+        JAMI_ERROR("[call:{}] Unable to get transport", call.getCallId());
+        return false;
+    }
+    tp_sel.u.transport = call.getTransport()->get();
+    if (pjsip_dlg_set_transport(dialog, &tp_sel) != PJ_SUCCESS) {
+        JAMI_ERROR("[call:{}] Unable to associate transport for invite session dialog", call.getCallId());
+        return false;
+    }
+
+    JAMI_LOG("[call:{}] Sending SIP invite", call.getCallId());
+
+    // Add user-agent header
+    sip_utils::addUserAgentHeader(getUserAgentName(), tdata);
+
+    if (pjsip_inv_send_msg(call.inviteSession_.get(), tdata) != PJ_SUCCESS) {
+        JAMI_ERROR("[call:{}] Unable to send invite message", call.getCallId());
+        return false;
+    }
+
+    call.setState(Call::CallState::ACTIVE, Call::ConnectionState::PROGRESSING);
+    return true;
+}
+
+void
+JamiAccount::saveConfig() const
+{
+    try {
+        YAML::Emitter accountOut;
+        config().serialize(accountOut);
+        auto accountConfig = config().path / "config.yml";
+        std::lock_guard lock(dhtnet::fileutils::getFileLock(accountConfig));
+        std::ofstream fout(accountConfig);
+        fout.write(accountOut.c_str(), static_cast<std::streamsize>(accountOut.size()));
+        JAMI_LOG("Saved account config to {}", accountConfig);
+    } catch (const std::exception& e) {
+        JAMI_ERROR("Error saving account config: {}", e.what());
+    }
+}
+
+void
+JamiAccount::loadConfig()
+{
+    SIPAccountBase::loadConfig();
+    registeredName_ = config().registeredName;
+    if (accountManager_)
+        accountManager_->setAccountDeviceName(config().deviceName);
+    if (connectionManager_) {
+        if (auto c = connectionManager_->getConfig()) {
+            // Update connectionManager's config
+            c->upnpEnabled = config().upnpEnabled;
+            c->turnEnabled = config().turnEnabled;
+            c->turnServer = config().turnServer;
+            c->turnServerUserName = config().turnServerUserName;
+            c->turnServerPwd = config().turnServerPwd;
+            c->turnServerRealm = config().turnServerRealm;
+        }
+    }
+    if (config().proxyEnabled) {
+        try {
+            auto str = fileutils::loadCacheTextFile(cachePath_ / "dhtproxy", std::chrono::hours(24 * 14));
+            Json::Value root;
+            if (json::parse(str, root)) {
+                proxyServerCached_ = root[getProxyConfigKey()].asString();
+            }
+        } catch (const std::exception& e) {
+            JAMI_LOG("[Account {}] Unable to load proxy URL from cache: {}", getAccountID(), e.what());
+            proxyServerCached_.clear();
+        }
+    } else {
+        proxyServerCached_.clear();
+        std::error_code ec;
+        std::filesystem::remove(cachePath_ / "dhtproxy", ec);
+    }
+    if (not config().dhtProxyServerEnabled) {
+        dhtProxyServer_.reset();
+    }
+    auto credentials = consumeConfigCredentials();
+    loadAccount(credentials.archive_password_scheme, credentials.archive_password, credentials.archive_path);
+}
+
+bool
+JamiAccount::changeArchivePassword(const std::string& password_old, const std::string& password_new)
+{
+    try {
+        if (!accountManager_->changePassword(password_old, password_new)) {
+            JAMI_ERROR("[Account {}] Unable to change archive password", getAccountID());
+            return false;
+        }
+        editConfig([&](JamiAccountConfig& config) { config.archiveHasPassword = not password_new.empty(); });
+    } catch (const std::exception& ex) {
+        JAMI_ERROR("[Account {}] Unable to change archive password: {}", getAccountID(), ex.what());
+        if (password_old.empty()) {
+            editConfig([&](JamiAccountConfig& config) { config.archiveHasPassword = true; });
+            emitSignal<libjami::ConfigurationSignal::AccountDetailsChanged>(getAccountID(), getAccountDetails());
+        }
+        return false;
+    }
+    if (password_old != password_new)
+        emitSignal<libjami::ConfigurationSignal::AccountDetailsChanged>(getAccountID(), getAccountDetails());
+    return true;
+}
+
+bool
+JamiAccount::isPasswordValid(const std::string& password)
+{
+    return accountManager_ and accountManager_->isPasswordValid(password);
+}
+
+std::vector<uint8_t>
+JamiAccount::getPasswordKey(const std::string& password)
+{
+    return accountManager_ ? accountManager_->getPasswordKey(password) : std::vector<uint8_t>();
+}
+
+bool
+JamiAccount::provideAccountAuthentication(const std::string& credentialsFromUser, const std::string& scheme)
+{
+    if (auto manager = std::dynamic_pointer_cast<ArchiveAccountManager>(pairingManager())) {
+        return manager->provideAccountAuthentication(credentialsFromUser, scheme);
+    }
+    JAMI_ERROR("[LinkDevice] Invalid AccountManager instance while providing current account authentication.");
+    return false;
+}
+
+int32_t
+JamiAccount::addDevice(const std::string& uriProvided)
+{
+    JAMI_LOG("[LinkDevice] Starting device-link request.");
+    std::shared_ptr<AccountManager> manager;
+    std::string_view archiveScheme;
+    {
+        std::lock_guard lock(configurationMutex_);
+        if (!isActive() || !config().enabled)
+            return static_cast<int32_t>(AccountManager::AddDeviceError::GENERIC);
+        manager = accountManager_;
+        archiveScheme = config().archiveHasPassword ? fileutils::ARCHIVE_AUTH_SCHEME_PASSWORD
+                                                   : fileutils::ARCHIVE_AUTH_SCHEME_NONE;
+    }
+    if (!manager) {
+        JAMI_ERROR("[LinkDevice] Invalid AccountManager instance while adding a device.");
+        return static_cast<int32_t>(AccountManager::AddDeviceError::GENERIC);
+    }
+    std::shared_ptr<dhtnet::ConnectionManager> connections;
+    {
+        std::shared_lock lock(connManagerMtx_);
+        connections = connectionManager_;
+    }
+    if (!connections || !ownsPairingManager(manager.get(), false))
+        return static_cast<int32_t>(AccountManager::AddDeviceError::GENERIC);
+    // addDevice uses this handler only during its synchronous connect call.
+    // Never borrow channelHandlers_: shutdown clears them. Neither account lock
+    // may be held here because connect can invoke its callback synchronously.
+    AuthChannelHandler handler(shared(), *connections);
+    return manager->addDevice(uriProvided, archiveScheme, &handler);
+}
+
+bool
+JamiAccount::cancelAddDevice(uint32_t op_token)
+{
+    auto manager = pairingManager();
+    if (!manager)
+        return false;
+    return manager->cancelAddDevice(op_token);
+}
+
+bool
+JamiAccount::confirmAddDevice(uint32_t op_token)
+{
+    auto manager = pairingManager();
+    if (!manager)
+        return false;
+    return manager->confirmAddDevice(op_token);
+}
+
+bool
+JamiAccount::exportArchive(const std::string& destinationPath, std::string_view scheme, const std::string& password)
+{
+    if (auto* manager = dynamic_cast<ArchiveAccountManager*>(accountManager_.get())) {
+        return manager->exportArchive(destinationPath, scheme, password);
+    }
+    return false;
+}
+
+std::string
+JamiAccount::confirmAddDeviceWithCode(uint32_t token, const std::string& localArchiveSecret)
+{
+    if (auto manager = std::dynamic_pointer_cast<ArchiveAccountManager>(pairingManager()))
+        return manager->confirmAddDeviceWithCode(token, localArchiveSecret);
+    return {};
+}
+
+bool
+JamiAccount::completeDeviceLinkPreparation(uint32_t token)
+{
+    if (auto manager = std::dynamic_pointer_cast<ArchiveAccountManager>(pairingManager()))
+        return manager->completeDeviceLinkPreparation(token);
+    return false;
+}
+
+bool
+JamiAccount::exportArchive(const std::string& destinationPath,
+                           std::string_view inputScheme,
+                           const std::string& inputPassword,
+                           std::string_view outputScheme,
+                           const std::string& outputPassword)
+{
+    if (auto* manager = dynamic_cast<ArchiveAccountManager*>(accountManager_.get())) {
+        return manager->exportArchive(destinationPath, inputScheme, inputPassword, outputScheme, outputPassword);
+    }
+    return false;
+}
+
+bool
+JamiAccount::setValidity(std::string_view scheme, const std::string& pwd, const dht::InfoHash& id, int64_t validity)
+{
+    if (auto* manager = dynamic_cast<ArchiveAccountManager*>(accountManager_.get())) {
+        if (manager->setValidity(scheme, pwd, id_, id, validity)) {
+            saveIdentity(id_, idPath_, DEVICE_ID_PATH);
+            return true;
+        }
+    }
+    return false;
+}
+
+void
+JamiAccount::forceReloadAccount()
+{
+    editConfig([&](JamiAccountConfig& conf) {
+        conf.receipt.clear();
+        conf.receiptSignature.clear();
+    });
+    loadAccount();
+}
+
+void
+JamiAccount::unlinkConversations(const std::set<std::string>& removed)
+{
+    std::lock_guard lock(configurationMutex_);
+    if (const auto* info = accountManager_->getInfo()) {
+        auto contacts = info->contacts->getContacts();
+        for (auto& [id, c] : contacts) {
+            if (removed.find(c.conversationId) != removed.end()) {
+                info->contacts->updateConversation(id, "");
+                JAMI_WARNING("[Account {}] Detected removed conversation ({}) in contact details for {}",
+                             getAccountID(),
+                             c.conversationId,
+                             id.toString());
+            }
+        }
+    }
+}
+
+bool
+JamiAccount::isValidAccountDevice(const dht::crypto::Certificate& cert) const
+{
+    if (accountManager_) {
+        if (const auto* info = accountManager_->getInfo()) {
+            if (info->contacts)
+                return info->contacts->isValidAccountDevice(cert).isValid();
+        }
+    }
+    return false;
+}
+
+bool
+JamiAccount::revokeDevice(const std::string& device, std::string_view scheme, const std::string& password)
+{
+    if (not accountManager_)
+        return false;
+    return accountManager_
+        ->revokeDevice(device, scheme, password, [this, device](AccountManager::RevokeDeviceResult result) {
+            emitSignal<libjami::ConfigurationSignal::DeviceRevocationEnded>(getAccountID(),
+                                                                            device,
+                                                                            static_cast<int>(result));
+        });
+    return true;
+}
+
+std::pair<std::string, std::string>
+JamiAccount::saveIdentity(const dht::crypto::Identity& id, const std::filesystem::path& path, const std::string& name)
+{
+    auto names = std::make_pair(name + ".key", name + ".crt");
+    if (id.first)
+        fileutils::saveFile(path / names.first, id.first->serialize(), 0600);
+    if (id.second)
+        fileutils::saveFile(path / names.second, id.second->getPacked(), 0600);
+    return names;
+}
+
+void
+JamiAccount::scheduleAccountReady() const
+{
+    const auto accountId = getAccountID();
+    runOnMainThread([accountId] { Manager::instance().markAccountReady(accountId); });
+}
+
+AccountManager::OnChangeCallback
+JamiAccount::setupAccountCallbacks()
+{
+    return AccountManager::OnChangeCallback {
+        [this](const std::string& uri, bool confirmed) { onContactAdded(uri, confirmed); },
+        [this](const std::string& uri, bool banned) { onContactRemoved(uri, banned); },
+        [this](const std::string& uri,
+               const std::string& conversationId,
+               const std::vector<uint8_t>& payload,
+               TimePoint received) { onIncomingTrustRequest(uri, conversationId, payload, received); },
+        [this](const std::map<DeviceId, KnownDevice>& devices) { onKnownDevicesChanged(devices); },
+        [this](const std::string& conversationId, const std::string& deviceId) {
+            onConversationRequestAccepted(conversationId, deviceId);
+        },
+        [this](const std::string& uri, const std::string& convFromReq) { onContactConfirmed(uri, convFromReq); }};
+}
+
+void
+JamiAccount::onContactAdded(const std::string& uri, bool confirmed)
+{
+    if (!id_.first)
+        return;
+    if (jami::Manager::instance().syncOnRegister) {
+        dht::ThreadPool::io().run([w = weak(), uri, confirmed] {
+            if (auto shared = w.lock()) {
+                if (auto* cm = shared->convModule(true)) {
+                    auto activeConv = cm->getOneToOneConversation(uri);
+                    if (!activeConv.empty())
+                        cm->bootstrap(activeConv);
+                }
+                // Propagate the new contact to our other devices.
+                shared->onSyncListChanged();
+                emitSignal<libjami::ConfigurationSignal::ContactAdded>(shared->getAccountID(), uri, confirmed);
+            }
+        });
+    }
+}
+
+void
+JamiAccount::onContactRemoved(const std::string& uri, bool banned)
+{
+    if (!id_.first)
+        return;
+    dht::ThreadPool::io().run([w = weak(), uri, banned] {
+        if (auto shared = w.lock()) {
+            // Erase linked conversation's requests
+            if (auto* convModule = shared->convModule(true))
+                convModule->removeContact(uri, banned);
+            // Remove current connections with contact
+            // Note: if contact is ourself, we don't close the connection
+            // because it's used for syncing other conversations.
+            if (shared->connectionManager_ && uri != shared->getUsername()) {
+                shared->connectionManager_->closeConnectionsWith(uri);
+            }
+            // Propagate the removal to our other devices.
+            shared->onSyncListChanged();
+            // Update client.
+            emitSignal<libjami::ConfigurationSignal::ContactRemoved>(shared->getAccountID(), uri, banned);
+        }
+    });
+}
+
+void
+JamiAccount::onIncomingTrustRequest(const std::string& uri,
+                                    const std::string& conversationId,
+                                    const std::vector<uint8_t>& payload,
+                                    TimePoint received)
+{
+    if (!id_.first)
+        return;
+    dht::ThreadPool::io().run([w = weak(), uri, conversationId, payload, received] {
+        if (auto shared = w.lock()) {
+            shared->clearProfileCache(uri);
+            if (conversationId.empty()) {
+                // Old path
+                emitSignal<libjami::ConfigurationSignal::IncomingTrustRequest>(shared->getAccountID(),
+                                                                               conversationId,
+                                                                               uri,
+                                                                               payload,
+                                                                               toSecondsSinceEpoch(received));
+                return;
+            }
+            // Here account can be initializing
+            if (auto* cm = shared->convModule(true)) {
+                auto activeConv = cm->getOneToOneConversation(uri);
+                if (activeConv != conversationId)
+                    cm->onTrustRequest(uri, conversationId, payload, received);
+            }
+        }
+    });
+}
+
+void
+JamiAccount::onKnownDevicesChanged(const std::map<DeviceId, KnownDevice>& devices)
+{
+    std::map<std::string, std::string> ids;
+    for (auto& d : devices) {
+        auto id = d.first.toString();
+        auto label = d.second.name.empty() ? id.substr(0, 8) : d.second.name;
+        ids.emplace(std::move(id), std::move(label));
+    }
+    runOnMainThread([id = getAccountID(), devices = std::move(ids)] {
+        emitSignal<libjami::ConfigurationSignal::KnownDevicesChanged>(id, devices);
+    });
+}
+
+void
+JamiAccount::onConversationRequestAccepted(const std::string& conversationId, const std::string& deviceId)
+{
+    // Note: Do not retrigger on another thread. This has to be done
+    // at the same time of acceptTrustRequest a synced state between TrustRequest
+    // and convRequests.
+    if (auto* cm = convModule(true))
+        cm->acceptConversationRequest(conversationId, deviceId);
+}
+
+void
+JamiAccount::onContactConfirmed(const std::string& uri, const std::string& convFromReq)
+{
+    dht::ThreadPool::io().run([w = weak(), convFromReq, uri] {
+        if (auto shared = w.lock()) {
+            shared->convModule(true);
+            // Remove cached payload if there is one
+            auto requestPath = shared->cachePath_ / "requests" / uri;
+            dhtnet::fileutils::remove(requestPath);
+        }
+    });
+}
+
+std::unique_ptr<AccountManager::AccountCredentials>
+JamiAccount::buildAccountCredentials(const JamiAccountConfig& conf,
+                                     const dht::crypto::Identity& id,
+                                     const std::string& archive_password_scheme,
+                                     const std::string& archive_password,
+                                     const std::string& archive_path,
+                                     bool& migrating,
+                                     bool& hasPassword)
+{
+    std::unique_ptr<AccountManager::AccountCredentials> creds;
+
+    if (conf.managerUri.empty()) {
+        auto acreds = std::make_unique<ArchiveAccountManager::ArchiveAccountCredentials>();
+        auto archivePath = fileutils::getFullPath(idPath_, conf.archivePath);
+
+        if (!archive_path.empty()) {
+            acreds->scheme = "file";
+            acreds->uri = archive_path;
+        } else if (!conf.archive_url.empty() && conf.archive_url == "jami-auth") {
+            JAMI_DEBUG("[Account {}] [LinkDevice] scheme p2p & uri {}", getAccountID(), conf.archive_url);
+            acreds->scheme = "p2p";
+            acreds->uri = conf.archive_url;
+            if (conf.enabled || isActive())
+                throw std::runtime_error("Device linking requires a disabled, inactive destination");
+            acreds->pairingDht = initDhtConfig(conf);
+            acreds->pairingDht.dht_config.node_config.persist_path.clear();
+            acreds->pairingDht.push_node_id.clear();
+            acreds->pairingDht.push_token.clear();
+            acreds->pairingDht.push_topic.clear();
+            // Preserve the selected DHT node-discovery policy, including
+            // explicit LAN-only operation. This temporary node never publishes
+            // the account/display-name discovery broadcast of a live account.
+            if (conf.proxyEnabled) {
+                acreds->pairingDht.proxy_server = getDhtProxyServer(conf.proxyServer);
+                if (acreds->pairingDht.proxy_server.empty())
+                    throw std::runtime_error("Configured pairing proxy is unavailable");
+            }
+            std::string_view nodes(conf.hostname), node;
+            while (jami::getline(nodes, node, ';')) if (!node.empty()) acreds->dhtBootstrap.emplace_back(node);
+            auto network = std::make_shared<dhtnet::ConnectionManager::Config>();
+            network->turnEnabled = conf.turnEnabled;
+            network->turnServer = conf.turnServer;
+            network->turnServerUserName = conf.turnServerUserName;
+            network->turnServerPwd = conf.turnServerPwd;
+            network->turnServerRealm = conf.turnServerRealm;
+            network->upnpEnabled = conf.upnpEnabled;
+            acreds->pairingConnection = std::move(network);
+        } else if (std::filesystem::is_regular_file(archivePath)) {
+            acreds->scheme = "local";
+            acreds->uri = archivePath.string();
+            acreds->updateIdentity = id;
+            migrating = true;
+        }
+
+        creds = std::move(acreds);
+    } else {
+        auto screds = std::make_unique<ServerAccountManager::ServerAccountCredentials>();
+        screds->username = conf.managerUsername;
+        screds->identity = id;
+        creds = std::move(screds);
+    }
+
+    creds->password = archive_password;
+    hasPassword = !archive_password.empty();
+    creds->password_scheme = (hasPassword && archive_password_scheme.empty()) ? fileutils::ARCHIVE_AUTH_SCHEME_PASSWORD
+                                                                              : archive_password_scheme;
+
+    return creds;
+}
+
+void
+JamiAccount::onAuthenticationSuccess(bool migrating,
+                                     bool hasPassword,
+                                     const AccountInfo& info,
+                                     const std::map<std::string, std::string>& configMap,
+                                     std::string&& receipt,
+                                     std::vector<uint8_t>&& receiptSignature)
+{
+    JAMI_LOG("[Account {}] Auth success! Device: {}", getAccountID(), info.deviceId);
+
+    dhtnet::fileutils::check_dir(idPath_, 0700);
+
+    auto id = info.identity;
+    editConfig([&](JamiAccountConfig& conf) {
+        std::tie(conf.tlsPrivateKeyFile, conf.tlsCertificateFile) = saveIdentity(id, idPath_, DEVICE_ID_PATH);
+        conf.tlsPassword = {};
+
+        auto passwordIt = configMap.find(libjami::Account::ConfProperties::ARCHIVE_HAS_PASSWORD);
+        conf.archiveHasPassword = (passwordIt != configMap.end() && !passwordIt->second.empty())
+                                      ? passwordIt->second == "true"
+                                      : hasPassword;
+
+        if (not conf.managerUri.empty()) {
+            conf.registeredName = conf.managerUsername;
+            registeredName_ = conf.managerUsername;
+        }
+
+        conf.username = info.accountId;
+        conf.deviceName = accountManager_->getAccountDeviceName();
+
+        auto nameServerIt = configMap.find(libjami::Account::ConfProperties::Nameserver::URI);
+        if (nameServerIt != configMap.end() && !nameServerIt->second.empty())
+            conf.nameServer = nameServerIt->second;
+
+        auto displayNameIt = configMap.find(libjami::Account::ConfProperties::DISPLAYNAME);
+        if (displayNameIt != configMap.end() && !displayNameIt->second.empty())
+            conf.displayName = displayNameIt->second;
+
+        conf.receipt = std::move(receipt);
+        conf.receiptSignature = std::move(receiptSignature);
+        conf.fromAuthenticatedMap(configMap);
+        // The import selector is one-shot input, not the account's next startup.
+        conf.archive_url.clear();
+    });
+
+    id_ = std::move(id);
+    {
+        std::lock_guard lk(moduleMtx_);
+        convModule_.reset();
+    }
+
+    if (migrating)
+        Migration::setState(getAccountID(), Migration::State::SUCCESS);
+
+    setRegistrationState(RegistrationState::UNREGISTERED);
+
+    if (!info.photo.empty() || !info.displayName.empty()) {
+        try {
+            auto newProfile = vCard::utils::initVcard();
+            newProfile[std::string(vCard::Property::FORMATTED_NAME)] = info.displayName;
+            newProfile[std::string(vCard::Property::PHOTO)] = info.photo;
+
+            const auto& profiles = idPath_ / "profiles";
+            const auto& vCardPath = profiles / fmt::format("{}.vcf", base64::encode(info.accountId));
+            vCard::utils::save(newProfile, vCardPath, profilePath());
+
+            runOnMainThread([w = weak(), id = info.accountId, vCardPath] {
+                if (auto shared = w.lock()) {
+                    emitSignal<libjami::ConfigurationSignal::ProfileReceived>(shared->getAccountID(),
+                                                                              id,
+                                                                              vCardPath.string());
+                }
+            });
+        } catch (const std::exception& e) {
+            JAMI_WARNING("[Account {}] Unable to save profile after authentication: {}", getAccountID(), e.what());
+        }
+    }
+
+    doRegister();
+    scheduleAccountReady();
+}
+
+void
+JamiAccount::onAuthenticationError(const std::weak_ptr<JamiAccount>& w,
+                                   bool hadIdentity,
+                                   bool migrating,
+                                   std::string accountId,
+                                   AccountManager::AuthError error,
+                                   const std::string& message)
+{
+    JAMI_WARNING("[Account {}] Auth error: {} {}", accountId, (int) error, message);
+
+    if ((hadIdentity || migrating) && error == AccountManager::AuthError::INVALID_ARGUMENTS) {
+        Migration::setState(accountId, Migration::State::INVALID);
+        if (auto acc = w.lock())
+            acc->setRegistrationState(RegistrationState::ERROR_NEED_MIGRATION);
+        return;
+    }
+
+    if (auto acc = w.lock())
+        acc->setRegistrationState(RegistrationState::ERROR_GENERIC);
+
+    runOnMainThread([accountId = std::move(accountId)] { Manager::instance().removeAccount(accountId, true); });
+}
+
+// must be called while configurationMutex_ is locked
+void
+JamiAccount::loadAccount(const std::string& archive_password_scheme,
+                         const std::string& archive_password,
+                         const std::string& archive_path)
+{
+    if (registrationState_ == RegistrationState::INITIALIZING)
+        return;
+
+    // Policy preparation must not replace the manager that owns the live
+    // pairing channel and its expected certificates after a disabled import.
+    if (auto manager = std::dynamic_pointer_cast<ArchiveAccountManager>(accountManager_))
+        if (manager->hasPendingDeviceLink()) return;
+
+    JAMI_DEBUG("[Account {:s}] Loading account", getAccountID());
+
+    const auto scheduleAccountReady = [accountId = getAccountID()] {
+        runOnMainThread([accountId] {
+            auto& manager = Manager::instance();
+            manager.markAccountReady(accountId);
+        });
+    };
+
+    const auto& conf = config();
+    auto callbacks = setupAccountCallbacks();
+
+    try {
+        auto oldIdentity = id_.first ? id_.first->getPublicKey().getLongId() : DeviceId();
+
+        if (conf.managerUri.empty()) {
+            accountManager_ = std::make_shared<ArchiveAccountManager>(
+                getAccountID(),
+                getPath(),
+                [this]() { return getAccountDetails(); },
+                [this](DeviceSync&& syncData) {
+                    if (auto* sm = syncModule()) {
+                        auto syncDataPtr = std::make_shared<SyncMsg>();
+                        syncDataPtr->ds = std::move(syncData);
+                        sm->syncWithConnected(syncDataPtr);
+                    }
+                },
+                conf.archivePath.empty() ? "archive.gz" : conf.archivePath,
+                conf.nameServer);
+        } else {
+            accountManager_ = std::make_shared<ServerAccountManager>(getAccountID(),
+                                                                     getPath(),
+                                                                     conf.managerUri,
+                                                                     conf.nameServer);
+        }
+
+        auto id = accountManager_->loadIdentity(conf.tlsCertificateFile, conf.tlsPrivateKeyFile, conf.tlsPassword);
+
+        if (const auto* info
+            = accountManager_->useIdentity(id, conf.receipt, conf.receiptSignature, conf.managerUsername, callbacks)) {
+            id_ = std::move(id);
+            config_->username = info->accountId;
+            JAMI_WARNING("[Account {:s}] Loaded account identity", getAccountID());
+
+            if (info->identity.first->getPublicKey().getLongId() != oldIdentity) {
+                JAMI_WARNING("[Account {:s}] Identity changed", getAccountID());
+                {
+                    std::lock_guard lk(moduleMtx_);
+                    convModule_.reset();
+                }
+                convModule();
+            } else {
+                convModule()->setAccountManager(accountManager_);
+            }
+
+            convModule()->initPresence();
+            if (not isEnabled())
+                setRegistrationState(RegistrationState::UNREGISTERED);
+
+            scheduleAccountReady();
+            return;
+        }
+
+        if (!isEnabled() && conf.archive_url != "jami-auth")
+            return;
+
+        JAMI_WARNING("[Account {}] useIdentity failed!", getAccountID());
+
+        if (not conf.managerUri.empty() && archive_password.empty()) {
+            Migration::setState(accountID_, Migration::State::INVALID);
+            setRegistrationState(RegistrationState::ERROR_NEED_MIGRATION);
+            return;
+        }
+
+        bool migrating = registrationState_ == RegistrationState::ERROR_NEED_MIGRATION;
+        setRegistrationState(RegistrationState::INITIALIZING);
+
+        bool hasPassword = false;
+        auto creds = buildAccountCredentials(conf,
+                                             id,
+                                             archive_password_scheme,
+                                             archive_password,
+                                             archive_path,
+                                             migrating,
+                                             hasPassword);
+
+        JAMI_WARNING("[Account {}] initAuthentication {}", getAccountID(), fmt::ptr(this));
+
+        const bool hadIdentity = static_cast<bool>(id.first);
+        accountManager_->initAuthentication(
+            ip_utils::getDeviceName(),
+            std::move(creds),
+            [w = weak(), migrating, hasPassword](const AccountInfo& info,
+                                                 const std::map<std::string, std::string>& configMap,
+                                                 std::string&& receipt,
+                                                 std::vector<uint8_t>&& receiptSignature) {
+                if (auto self = w.lock())
+                    self->onAuthenticationSuccess(migrating,
+                                                  hasPassword,
+                                                  info,
+                                                  configMap,
+                                                  std::move(receipt),
+                                                  std::move(receiptSignature));
+            },
+            [w = weak(), hadIdentity, accountId = getAccountID(), migrating](AccountManager::AuthError error,
+                                                                             const std::string& message) {
+                JamiAccount::onAuthenticationError(w, hadIdentity, migrating, accountId, error, message);
+            },
+            callbacks);
+    } catch (const std::exception& e) {
+        JAMI_WARNING("[Account {}] Error loading account: {}", getAccountID(), e.what());
+        accountManager_.reset();
+        setRegistrationState(RegistrationState::ERROR_GENERIC);
+    }
+}
+
+std::map<std::string, std::string>
+JamiAccount::getVolatileAccountDetails() const
+{
+    auto a = SIPAccountBase::getVolatileAccountDetails();
+    a.emplace(libjami::Account::VolatileProperties::InstantMessaging::OFF_CALL, TRUE_STR);
+    auto registeredName = getRegisteredName();
+    if (not registeredName.empty())
+        a.emplace(libjami::Account::VolatileProperties::REGISTERED_NAME, registeredName);
+    a.emplace(libjami::Account::ConfProperties::PROXY_SERVER, proxyServerCached_);
+    a.emplace(libjami::Account::VolatileProperties::DHT_BOUND_PORT, std::to_string(dhtBoundPort_));
+    a.emplace(libjami::Account::VolatileProperties::DEVICE_ANNOUNCED, deviceAnnounced_ ? TRUE_STR : FALSE_STR);
+    if (accountManager_) {
+        if (const auto* info = accountManager_->getInfo()) {
+            a.emplace(libjami::Account::ConfProperties::DEVICE_ID, info->deviceId);
+        }
+    }
+    return a;
+}
+
+void
+JamiAccount::lookupName(const std::string& name)
+{
+    std::lock_guard lock(configurationMutex_);
+    if (accountManager_)
+        accountManager_->lookupUri(name,
+                                   config().nameServer,
+                                   [acc = getAccountID(), name](const std::string& regName,
+                                                                const std::string& address,
+                                                                NameDirectory::Response response) {
+                                       emitSignal<libjami::ConfigurationSignal::RegisteredNameFound>(acc,
+                                                                                                     name,
+                                                                                                     (int) response,
+                                                                                                     address,
+                                                                                                     regName);
+                                   });
+}
+
+void
+JamiAccount::lookupAddress(const std::string& addr)
+{
+    std::lock_guard lock(configurationMutex_);
+    auto acc = getAccountID();
+    if (accountManager_)
+        accountManager_->lookupAddress(addr,
+                                       [acc, addr](const std::string& regName,
+                                                   const std::string& address,
+                                                   NameDirectory::Response response) {
+                                           emitSignal<libjami::ConfigurationSignal::RegisteredNameFound>(acc,
+                                                                                                         addr,
+                                                                                                         (int) response,
+                                                                                                         address,
+                                                                                                         regName);
+                                       });
+}
+
+void
+JamiAccount::registerName(const std::string& name, const std::string& scheme, const std::string& password)
+{
+    std::lock_guard lock(configurationMutex_);
+    if (accountManager_)
+        accountManager_
+            ->registerName(name,
+                           scheme,
+                           password,
+                           [acc = getAccountID(), name, w = weak()](NameDirectory::RegistrationResponse response,
+                                                                    const std::string& regName) {
+                               auto res = (int) std::min(response, NameDirectory::RegistrationResponse::error);
+                               if (response == NameDirectory::RegistrationResponse::success) {
+                                   if (auto this_ = w.lock()) {
+                                       if (this_->setRegisteredName(regName)) {
+                                           this_->editConfig(
+                                               [&](JamiAccountConfig& config) { config.registeredName = regName; });
+                                           emitSignal<libjami::ConfigurationSignal::VolatileDetailsChanged>(
+                                               this_->accountID_, this_->getVolatileAccountDetails());
+                                       }
+                                   }
+                               }
+                               emitSignal<libjami::ConfigurationSignal::NameRegistrationEnded>(acc, res, name);
+                           });
+}
+
+bool
+JamiAccount::searchUser(const std::string& query)
+{
+    if (accountManager_)
+        return accountManager_
+            ->searchUser(query,
+                         [acc = getAccountID(), query](const jami::NameDirectory::SearchResult& result,
+                                                       jami::NameDirectory::Response response) {
+                             jami::emitSignal<libjami::ConfigurationSignal::UserSearchEnded>(acc,
+                                                                                             (int) response,
+                                                                                             query,
+                                                                                             result);
+                         });
+    return false;
+}
+
+void
+JamiAccount::forEachPendingCall(const DeviceId& deviceId, const std::function<void(const std::shared_ptr<SIPCall>&)>& cb)
+{
+    std::vector<std::shared_ptr<SIPCall>> pc;
+    {
+        std::lock_guard lk(pendingCallsMutex_);
+        pc = std::move(pendingCalls_[deviceId]);
+    }
+    for (const auto& pendingCall : pc) {
+        cb(pendingCall);
+    }
+}
+
+void
+JamiAccount::registerAsyncOps()
+{
+    loadCachedProxyServer([w = weak()](const std::string&) {
+        runOnMainThread([w] {
+            if (auto s = w.lock()) {
+                std::lock_guard lock(s->configurationMutex_);
+                s->doRegister_();
+            }
+        });
+    });
+}
+
+void
+JamiAccount::doRegister()
+{
+    std::lock_guard lock(configurationMutex_);
+    if (not isUsable()) {
+        JAMI_WARNING("[Account {:s}] Account must be enabled and active to register, ignoring", getAccountID());
+        return;
+    }
+
+    JAMI_LOG("[Account {:s}] Starting account…", getAccountID());
+
+    // invalid state transitions:
+    // INITIALIZING: generating/loading certificates, unable to register
+    // NEED_MIGRATION: old account detected, user needs to migrate
+    if (registrationState_ == RegistrationState::INITIALIZING
+        || registrationState_ == RegistrationState::ERROR_NEED_MIGRATION)
+        return;
+
+    convModule(); // Init conv module before passing in trying
+    setRegistrationState(RegistrationState::TRYING);
+    if (proxyServerCached_.empty()) {
+        registerAsyncOps();
+    } else {
+        doRegister_();
+    }
+}
+
+std::vector<std::string>
+JamiAccount::loadBootstrap() const
+{
+    std::vector<std::string> bootstrap;
+    std::string_view stream(config().hostname), node_addr;
+    while (jami::getline(stream, node_addr, ';'))
+        bootstrap.emplace_back(node_addr);
+    for (const auto& b : bootstrap)
+        JAMI_LOG("[Account {}] Bootstrap node: {}", getAccountID(), b);
+    return bootstrap;
+}
+
+void
+JamiAccount::trackBuddyPresence(const std::string& buddy_id, bool track)
+{
+    std::string buddyUri;
+    try {
+        buddyUri = parseJamiUri(buddy_id);
+    } catch (...) {
+        JAMI_ERROR("[Account {:s}] Failed to track presence: invalid URI {:s}", getAccountID(), buddy_id);
+        return;
+    }
+    JAMI_LOG("[Account {:s}] {:s} presence for {:s}", getAccountID(), track ? "Track" : "Untrack", buddy_id);
+
+    if (!presenceManager_)
+        return;
+
+    if (track) {
+        presenceManager_->trackBuddy(buddyUri);
+        std::lock_guard lock(presenceStateMtx_);
+        auto it = presenceState_.find(buddyUri);
+        if (it != presenceState_.end() && it->second != PresenceState::DISCONNECTED) {
+            emitSignal<libjami::PresenceSignal::NewBuddyNotification>(getAccountID(),
+                                                                      buddyUri,
+                                                                      static_cast<int>(it->second),
+                                                                      "");
+        }
+    } else {
+        presenceManager_->untrackBuddy(buddyUri);
+    }
+}
+
+std::map<std::string, bool>
+JamiAccount::getTrackedBuddyPresence() const
+{
+    if (!presenceManager_)
+        return {};
+    return presenceManager_->getTrackedBuddyPresence();
+}
+
+void
+JamiAccount::onTrackedBuddyOnline(const std::string& contactId)
+{
+    JAMI_DEBUG("[Account {:s}] Buddy {} online", getAccountID(), contactId);
+    std::lock_guard lock(presenceStateMtx_);
+    auto& state = presenceState_[contactId];
+    if (state < PresenceState::AVAILABLE) {
+        state = PresenceState::AVAILABLE;
+        emitSignal<libjami::PresenceSignal::NewBuddyNotification>(getAccountID(),
+                                                                  contactId,
+                                                                  static_cast<int>(PresenceState::AVAILABLE),
+                                                                  "");
+    }
+
+    if (auto details = getContactInfo(contactId)) {
+        if (!details->confirmed) {
+            auto convId = convModule()->getOneToOneConversation(contactId);
+            if (convId.empty())
+                return;
+            // In this case, the TrustRequest was sent but never confirmed (cause the contact was
+            // offline maybe) To avoid the contact to never receive the conv request, retry there
+            std::lock_guard lock(configurationMutex_);
+            if (accountManager_) {
+                // Retrieve cached payload for trust request.
+                auto requestPath = cachePath_ / "requests" / contactId;
+                std::vector<uint8_t> payload;
+                try {
+                    payload = fileutils::loadFile(requestPath);
+                } catch (...) {
+                }
+                if (payload.size() >= 64000) {
+                    JAMI_WARNING("[Account {:s}] Trust request for contact {:s} is too big, reset payload",
+                                 getAccountID(),
+                                 contactId);
+                    payload.clear();
+                }
+                accountManager_->sendTrustRequest(contactId, convId, payload);
+            }
+        }
+    }
+}
+
+void
+JamiAccount::onTrackedBuddyOffline(const std::string& contactId)
+{
+    JAMI_DEBUG("[Account {:s}] Buddy {} offline", getAccountID(), contactId);
+    std::lock_guard lock(presenceStateMtx_);
+    auto& state = presenceState_[contactId];
+    if (state > PresenceState::DISCONNECTED) {
+        if (state == PresenceState::CONNECTED) {
+            JAMI_WARNING("[Account {:s}] Buddy {} is not present on the DHT, but P2P connected",
+                         getAccountID(),
+                         contactId);
+            return;
+        }
+        state = PresenceState::DISCONNECTED;
+        emitSignal<libjami::PresenceSignal::NewBuddyNotification>(getAccountID(),
+                                                                  contactId,
+                                                                  static_cast<int>(PresenceState::DISCONNECTED),
+                                                                  "");
+    }
+}
+
+void
+JamiAccount::doRegister_()
+{
+    if (registrationState_ != RegistrationState::TRYING) {
+        JAMI_ERROR("[Account {}] Already registered", getAccountID());
+        return;
+    }
+
+    JAMI_DEBUG("[Account {}] Starting account…", getAccountID());
+    const auto& conf = config();
+
+    try {
+        if (not accountManager_ or not accountManager_->getInfo())
+            throw std::runtime_error("No identity configured for this account.");
+
+        if (dht_->isRunning()) {
+            JAMI_ERROR("[Account {}] DHT already running (stopping it first).", getAccountID());
+            dht_->join();
+        }
+
+        convModule()->clearPendingFetch();
+
+        // Look for registered name
+        accountManager_->lookupAddress(accountManager_->getInfo()->accountId,
+                                       [w = weak()](const std::string& regName,
+                                                    const std::string& /*address*/,
+                                                    const NameDirectory::Response& response) {
+                                           if (auto this_ = w.lock())
+                                               this_->lookupRegisteredName(regName, response);
+                                       });
+
+        dht::DhtRunner::Config config = initDhtConfig(conf);
+
+        // check if dht peer service is enabled
+        if (conf.accountPeerDiscovery or conf.accountPublish) {
+            peerDiscovery_ = std::make_shared<dht::PeerDiscovery>();
+            if (conf.accountPeerDiscovery) {
+                JAMI_LOG("[Account {}] Starting Jami account discovery…", getAccountID());
+                startAccountDiscovery();
+            }
+            if (conf.accountPublish)
+                startAccountPublish();
+        }
+
+        dht::DhtRunner::Context context = initDhtContext();
+
+        dht_->run(conf.dhtPort, config, std::move(context));
+        dhtBoundPort_ = dht_->getBoundPort();
+
+        // Now that the DHT is running and we know the actual bound port,
+        // request a UPnP mapping for it.
+        if (upnpCtrl_) {
+            JAMI_LOG("[Account {:s}] UPnP: requesting mapping for DHT port {}", getAccountID(), dhtBoundPort_);
+
+            if (dhtUpnpMapping_.isValid()) {
+                upnpCtrl_->releaseMapping(dhtUpnpMapping_);
+            }
+
+            dhtUpnpMapping_.enableAutoUpdate(true);
+
+            dhtnet::upnp::Mapping desired(dhtnet::upnp::PortType::UDP, dhtBoundPort_, dhtBoundPort_);
+            dhtUpnpMapping_.updateFrom(desired);
+
+            dhtUpnpMapping_.setNotifyCallback([w = weak()](const dhtnet::upnp::Mapping::sharedPtr_t& mapRes) {
+                if (auto accPtr = w.lock()) {
+                    auto& dhtMap = accPtr->dhtUpnpMapping_;
+                    const auto& accId = accPtr->getAccountID();
+
+                    JAMI_LOG("[Account {:s}] DHT UPnP mapping changed to {:s}", accId, mapRes->toString(true));
+
+                    if (dhtMap.getMapKey() != mapRes->getMapKey() or dhtMap.getState() != mapRes->getState()) {
+                        dhtMap.updateFrom(mapRes);
+                        if (mapRes->getState() == dhtnet::upnp::MappingState::OPEN) {
+                            JAMI_LOG("[Account {:s}] Mapping {:s} successfully allocated", accId, dhtMap.toString());
+                            accPtr->dht_->connectivityChanged();
+                        } else if (mapRes->getState() == dhtnet::upnp::MappingState::FAILED) {
+                            JAMI_WARNING("[Account {:s}] UPnP mapping failed", accId);
+                        }
+                    } else {
+                        dhtMap.updateFrom(mapRes);
+                    }
+                }
+            });
+
+            upnpCtrl_->reserveMapping(dhtUpnpMapping_);
+        }
+
+        for (const auto& bootstrap : loadBootstrap())
+            dht_->bootstrap(bootstrap);
+
+        accountManager_->setDht(dht_);
+
+        if (conf.dhtProxyServerEnabled) {
+            dht::ProxyServerConfig proxyConfig;
+            proxyConfig.port = conf.dhtProxyServerPort;
+            proxyConfig.identity = id_;
+            dhtProxyServer_ = std::make_shared<dht::DhtProxyServer>(dht_, proxyConfig);
+        } else {
+            dhtProxyServer_.reset();
+        }
+
+        std::unique_lock lkCM(connManagerMtx_);
+        initConnectionManager();
+        connectionManager_->dhtStarted();
+        connectionManager_->onICERequest([this](const DeviceId& deviceId) { return onICERequest(deviceId); });
+        connectionManager_->onChannelRequest([this](const std::shared_ptr<dht::crypto::Certificate>& cert,
+                                                    const std::string& name) { return onChannelRequest(cert, name); });
+        connectionManager_->onNewDeviceConnection(
+            [this](const std::shared_ptr<dht::crypto::Certificate>& cert) { onNewDeviceConnection(cert); });
+        connectionManager_->onConnectionReady(
+            [this](const DeviceId& deviceId, const std::string& name, std::shared_ptr<dhtnet::ChannelSocket> channel) {
+                onConnectionReady(deviceId, name, std::move(channel));
+            });
+        lkCM.unlock();
+
+        if (!conf.managerUri.empty() && accountManager_) {
+            dynamic_cast<ServerAccountManager*>(accountManager_.get())->onDeviceRevoked([this]() {
+                JAMI_WARNING("[Account {}] Device revoked by server, deleting identity", getAccountID());
+                editConfig([&](JamiAccountConfig& conf) {
+                    // Delete the revoked device's key and certificate files
+                    std::error_code ec;
+                    if (!conf.tlsPrivateKeyFile.empty())
+                        std::filesystem::remove(idPath_ / conf.tlsPrivateKeyFile, ec);
+                    if (!conf.tlsCertificateFile.empty())
+                        std::filesystem::remove(idPath_ / conf.tlsCertificateFile, ec);
+                    conf.tlsPrivateKeyFile.clear();
+                    conf.tlsCertificateFile.clear();
+                    conf.receipt.clear();
+                    conf.receiptSignature.clear();
+                });
+                Migration::setState(accountID_, Migration::State::INVALID);
+                setRegistrationState(RegistrationState::ERROR_NEED_MIGRATION);
+            });
+            dynamic_cast<ServerAccountManager*>(accountManager_.get())
+                ->syncBlueprintConfig([this](const std::map<std::string, std::string>& config) {
+                    editConfig([&](JamiAccountConfig& conf) { conf.fromMap(config); });
+                    emitSignal<libjami::ConfigurationSignal::AccountDetailsChanged>(getAccountID(), getAccountDetails());
+                });
+        }
+
+        if (presenceManager_)
+            presenceManager_->refresh();
+    } catch (const std::exception& e) {
+        JAMI_ERROR("Error registering DHT account: {}", e.what());
+        setRegistrationState(RegistrationState::ERROR_GENERIC);
+    }
+}
+
+void
+JamiAccount::lookupRegisteredName(const std::string& regName, const NameDirectory::Response& response)
+{
+    if (response == NameDirectory::Response::found or response == NameDirectory::Response::notFound) {
+        const auto& nameResult = response == NameDirectory::Response::found ? regName : "";
+        if (setRegisteredName(nameResult)) {
+            editConfig([&](JamiAccountConfig& config) { config.registeredName = nameResult; });
+            emitSignal<libjami::ConfigurationSignal::VolatileDetailsChanged>(accountID_, getVolatileAccountDetails());
+        }
+    }
+}
+
+dht::DhtRunner::Config
+JamiAccount::initDhtConfig(const JamiAccountConfig& conf)
+{
+    dht::DhtRunner::Config config {};
+    config.dht_config.node_config.network = 0;
+    config.dht_config.node_config.maintain_storage = false;
+    config.dht_config.node_config.persist_path = (cachePath_ / "dhtstate").string();
+    config.dht_config.id = id_;
+    config.dht_config.cert_cache_all = true;
+    config.push_node_id = getAccountID();
+    config.push_token = conf.deviceKey;
+    config.push_topic = conf.notificationTopic;
+    config.push_platform = conf.platform;
+    config.proxy_user_agent = jami::userAgent();
+    config.threaded = true;
+    config.peer_discovery = conf.dhtPeerDiscovery;
+    config.peer_publish = conf.dhtPeerDiscovery;
+    if (conf.proxyEnabled)
+        config.proxy_server = proxyServerCached_;
+
+    if (not config.proxy_server.empty()) {
+        JAMI_LOG("[Account {}] Using proxy server {}", getAccountID(), config.proxy_server);
+        if (not config.push_token.empty()) {
+            JAMI_LOG("[Account {}] using push notifications with platform: {}, topic: {}, token: {}",
+                     getAccountID(),
+                     config.push_platform,
+                     config.push_topic,
+                     config.push_token);
+        }
+    }
+    return config;
+}
+
+dht::DhtRunner::Context
+JamiAccount::initDhtContext()
+{
+    dht::DhtRunner::Context context {};
+    context.peerDiscovery = peerDiscovery_;
+    context.rng = std::make_unique<std::mt19937_64>(dht::crypto::getDerivedRandomEngine(rand));
+
+    auto dht_log_level = Manager::instance().dhtLogLevel;
+    if (dht_log_level > 0) {
+        context.logger = logger_;
+    }
+
+    context.certificateStore = [&](const DeviceId& pk_id) {
+        std::vector<std::shared_ptr<dht::crypto::Certificate>> ret;
+        if (auto cert = certStore().getCertificate(pk_id.toString()))
+            ret.emplace_back(std::move(cert));
+        JAMI_LOG("[Account {}] Query for local certificate store: {}: {} found.",
+                 getAccountID(),
+                 pk_id.toString(),
+                 ret.size());
+        return ret;
+    };
+
+    context.statusChangedCallback = [this](dht::NodeStatus s4, dht::NodeStatus s6) {
+        JAMI_LOG("[Account {}] DHT status: IPv4 {}; IPv6 {}", getAccountID(), dhtStatusStr(s4), dhtStatusStr(s6));
+        RegistrationState state;
+        auto newStatus = std::max(s4, s6);
+        switch (newStatus) {
+        case dht::NodeStatus::Connecting:
+            state = RegistrationState::TRYING;
+            break;
+        case dht::NodeStatus::Connected:
+            state = RegistrationState::REGISTERED;
+            break;
+        case dht::NodeStatus::Disconnected:
+            state = RegistrationState::UNREGISTERED;
+            break;
+        default:
+            state = RegistrationState::ERROR_GENERIC;
+            break;
+        }
+
+        setRegistrationState(state);
+    };
+
+    auto announcement = std::make_shared<IdentityAnnouncement>();
+    if (auto retired = std::atomic_exchange(&identityAnnouncement_, announcement))
+        retired->retire();
+    context.identityAnnouncedCb = [w = weak(), announcement](bool published) {
+        if (auto account = w.lock())
+            account->onIdentityAnnouncement(announcement, 0, published);
+    };
+
+    return context;
+}
+
+void
+JamiAccount::onIdentityAnnouncement(const std::shared_ptr<IdentityAnnouncement>& owner,
+                                    unsigned attempt,
+                                    bool published)
+{
+    // doUnregister holds configurationMutex_ while joining the DHT thread.
+    // Never acquire that mutex from a DHT completion callback itself.
+    dht::ThreadPool::io().run([w = weak(), owner, attempt, published] {
+        auto acc = w.lock();
+        if (!acc)
+            return;
+        std::unique_lock lock(acc->configurationMutex_);
+        if (std::atomic_load(&acc->identityAnnouncement_) != owner || !acc->isUsable())
+            return;
+        const auto outcome = owner->finish(attempt, published);
+        if (outcome.action == IdentityAnnouncement::Action::Published) {
+            JAMI_WARNING("[Account {}] Identity announcement succeeded", acc->getAccountID());
+            acc->accountManager_->startSync(
+                [w, owner](const std::shared_ptr<dht::crypto::Certificate>& certificate) {
+                    auto account = w.lock();
+                    if (account && std::atomic_load(&account->identityAnnouncement_) == owner)
+                        account->onAccountDeviceFound(certificate);
+                },
+                [w, owner] {
+                    auto account = w.lock();
+                    if (account && std::atomic_load(&account->identityAnnouncement_) == owner)
+                        account->onAccountDeviceAnnounced();
+                },
+                acc->publishPresence_);
+            return;
+        }
+        if (outcome.action == IdentityAnnouncement::Action::Exhausted) {
+            JAMI_ERROR("[Account {}] Identity announcement retries exhausted", acc->getAccountID());
+            return;
+        }
+        if (outcome.action != IdentityAnnouncement::Action::Retry)
+            return;
+        JAMI_WARNING("[Account {}] Identity announcement failed; retry {}/{}",
+                     acc->getAccountID(), outcome.attempt, IdentityAnnouncement::maximumRetries);
+        const auto delay = std::chrono::seconds(1u << (outcome.attempt - 1));
+        auto timer = std::make_shared<asio::steady_timer>(*Manager::instance().ioContext(), delay);
+        timer->async_wait([w, owner, next = outcome.attempt, timer](const std::error_code& error) {
+            if (error)
+                return;
+            if (auto account = w.lock())
+                account->retryIdentityAnnouncement(owner, next);
+        });
+    });
+}
+
+void
+JamiAccount::retryIdentityAnnouncement(const std::shared_ptr<IdentityAnnouncement>& owner,
+                                       unsigned attempt)
+{
+    std::unique_lock lock(configurationMutex_);
+    if (std::atomic_load(&identityAnnouncement_) != owner || !isUsable()
+        || !dht_->isRunning() || !id_.second)
+        return;
+    // Re-publish the same public certificate at the same key and value ID.
+    // This is idempotent discovery metadata, not a new message or identity.
+    const auto certificate = id_.second;
+    dht_->put(dht::InfoHash::get(certificate->getLongId()),
+              dht::Value {dht::CERTIFICATE_TYPE, *certificate, 1},
+              [w = weak(), owner, attempt](bool published) {
+                  if (auto account = w.lock())
+                      account->onIdentityAnnouncement(owner, attempt, published);
+              }, {}, true);
+}
+
+void
+JamiAccount::onAccountDeviceFound(const std::shared_ptr<dht::crypto::Certificate>& crt)
+{
+    if (jami::Manager::instance().syncOnRegister) {
+        if (!crt)
+            return;
+        auto deviceId = crt->getLongId().toString();
+        if (accountManager_->getInfo()->deviceId == deviceId)
+            return;
+
+        dht::ThreadPool::io().run([w = weak(), crt] {
+            auto shared = w.lock();
+            if (!shared)
+                return;
+            // Only establish a sync connection if this device may be missing a
+            // local contact/conversation-list change. This avoids waking up
+            // devices (especially mobiles) when there is nothing new to sync.
+            if (auto* sm = shared->syncModule()) {
+                if (!sm->needsSync(crt->getLongId())) {
+                    JAMI_DEBUG("[Account {}] [device {}] up to date, skipping sync connection",
+                               shared->getAccountID(),
+                               crt->getLongId());
+                    return;
+                }
+            }
+            // Initiate a message connection to create the first TCP link.
+            // Once established, onNewDeviceConnection will set up sync and
+            // swarm channels.
+            shared->connectSyncDevice(crt->getLongId());
+        });
+    }
+}
+
+void
+JamiAccount::connectSyncDevice(const DeviceId& deviceId)
+{
+    requestMessageConnection(getUsername(), deviceId, "sync");
+}
+
+void
+JamiAccount::onSyncListChanged()
+{
+    if (!jami::Manager::instance().syncOnRegister)
+        return;
+    // Coalesce bursts of changes (e.g. initial sync delivering many contacts
+    // and conversations) into a single propagation pass. A single version bump
+    // already marks every device out of date, and sync is full-state, so
+    // collapsing many changes into one pass is also semantically correct.
+    std::lock_guard lk(syncListChangedMtx_);
+    if (!syncListChangedTimer_)
+        syncListChangedTimer_ = std::make_shared<asio::steady_timer>(*jami::Manager::instance().ioContext());
+    syncListChangedTimer_->expires_after(std::chrono::seconds(1));
+    syncListChangedTimer_->async_wait([w = weak()](const std::error_code& ec) {
+        if (ec) // cancelled by a more recent change (debounce) or shutting down
+            return;
+        dht::ThreadPool::io().run([w] {
+            auto shared = w.lock();
+            if (!shared)
+                return;
+            auto* sm = shared->syncModule();
+            if (!sm)
+                return;
+            // A list change makes every device potentially out of date.
+            sm->bumpVersion();
+            // (Re)connect to the account's other devices that are not up to
+            // date so the change is pushed. Offline ones are reached on their
+            // next presence announcement (onAccountDeviceFound).
+            auto am = shared->accountManager();
+            if (am && am->getInfo()) {
+                auto currentDevice = shared->currentDeviceId();
+                for (const auto& [deviceId, device] : am->getKnownDevices()) {
+                    if (deviceId.toString() == currentDevice)
+                        continue;
+                    if (sm->needsSync(deviceId))
+                        shared->connectSyncDevice(deviceId);
+                }
+            }
+            // Push immediately to already-connected devices.
+            sm->syncWithConnected();
+        });
+    });
+}
+
+void
+JamiAccount::onAccountDeviceAnnounced()
+{
+    if (jami::Manager::instance().syncOnRegister) {
+        deviceAnnounced_ = true;
+
+        // Bootstrap at the end to avoid to be long to load.
+        dht::ThreadPool::io().run([w = weak()] {
+            if (auto shared = w.lock())
+                shared->convModule()->bootstrap();
+        });
+        emitSignal<libjami::ConfigurationSignal::VolatileDetailsChanged>(accountID_, getVolatileAccountDetails());
+    }
+}
+
+void
+JamiAccount::onNewDeviceConnection(const std::shared_ptr<dht::crypto::Certificate>& cert)
+{
+    if (!cert || !cert->issuer)
+        return;
+
+    dht::ThreadPool::io().run([w = weak(), cert] {
+        auto shared = w.lock();
+        if (!shared)
+            return;
+
+        JAMI_WARNING("[Account {}] New device connection: {}", shared->getAccountID(), cert->getLongId());
+
+        const auto peerId = cert->issuer->getId().toString();
+        const auto deviceId = cert->getLongId();
+        auto am = shared->accountManager();
+        if (!am || am->getCertificateStatus(peerId) == dhtnet::tls::TrustStore::PermissionStatus::BANNED) {
+            return;
+        }
+
+        const auto isSyncDevice = jami::Manager::instance().syncOnRegister && peerId == shared->getUsername();
+        shared->requestMessageConnection(peerId, deviceId, isSyncDevice ? "sync" : "");
+
+        if (isSyncDevice) {
+            auto* sm = shared->syncModule();
+            if (sm && !sm->isConnected(deviceId)) {
+                std::shared_lock lk(shared->connManagerMtx_);
+                if (!shared->connectionManager_)
+                    return;
+
+                auto it = shared->channelHandlers_.find(Uri::Scheme::SYNC);
+                if (it != shared->channelHandlers_.end() && it->second)
+                    it->second->connect(deviceId,
+                                        "",
+                                        [](const std::shared_ptr<dhtnet::ChannelSocket>& /*socket*/,
+                                           const DeviceId& /*deviceId*/) {});
+            }
+        }
+
+        // Notify the DRT in all conversations where this peer is a member,
+        // so it can decide whether to open a swarm channel over the new connection.
+        if (auto* cm = shared->convModule())
+            cm->addKnownDevice(peerId, deviceId);
+
+        // Proactively refresh the service cache for this device.
+        {
+            std::shared_lock lk(shared->connManagerMtx_);
+            auto it = shared->channelHandlers_.find(Uri::Scheme::SVC_DISCOVERY);
+            if (it != shared->channelHandlers_.end() && it->second) {
+                static_cast<SvcDiscoveryChannelHandler*>(it->second.get())->refreshDevice(peerId, deviceId);
+            }
+        }
+    });
+}
+
+bool
+JamiAccount::onICERequest(const DeviceId& deviceId)
+{
+    std::promise<bool> accept;
+    std::future<bool> fut = accept.get_future();
+    accountManager_->findCertificate(deviceId, [this, &accept](const std::shared_ptr<dht::crypto::Certificate>& cert) {
+        if (!cert) {
+            accept.set_value(false);
+            return;
+        }
+        dht::InfoHash peer_account_id;
+        auto res = accountManager_->onPeerCertificate(cert, this->config().dhtPublicInCalls, peer_account_id);
+        JAMI_LOG("[Account {}] [device {}] {} ICE request from {}",
+                 getAccountID(),
+                 cert->getLongId(),
+                 res ? "Accepting" : "Discarding",
+                 peer_account_id);
+        accept.set_value(res);
+    });
+    fut.wait();
+    auto result = fut.get();
+    return result;
+}
+
+bool
+JamiAccount::onChannelRequest(const std::shared_ptr<dht::crypto::Certificate>& cert, const std::string& name)
+{
+    JAMI_LOG("[Account {}] [device {}] New channel requested: '{}'", getAccountID(), cert->getLongId(), name);
+
+    if (this->config().turnEnabled && turnCache_) {
+        auto addr = turnCache_->getResolvedTurn();
+        if (addr == std::nullopt) {
+            // If TURN is enabled, but no TURN cached, there can be a temporary
+            // resolution error to solve. Sometimes, a connectivity change is not
+            // enough, so even if this case is really rare, it should be easy to avoid.
+            turnCache_->refresh();
+        }
+    }
+
+    auto uri = Uri(name);
+    std::shared_lock lk(connManagerMtx_);
+    auto itHandler = channelHandlers_.find(uri.scheme());
+    if (itHandler != channelHandlers_.end() && itHandler->second)
+        return itHandler->second->onRequest(cert, name);
+    return name == "sip";
+}
+
+void
+JamiAccount::onConnectionReady(const DeviceId& deviceId,
+                               const std::string& name,
+                               std::shared_ptr<dhtnet::ChannelSocket> channel)
+{
+    if (channel) {
+        auto cert = channel->peerCertificate();
+        if (!cert || !cert->issuer)
+            return;
+        auto peerId = cert->issuer->getId().toString();
+        // A connection request can be sent just before member is banned and this must be ignored.
+        if (accountManager()->getCertificateStatus(peerId) == dhtnet::tls::TrustStore::PermissionStatus::BANNED) {
+            channel->shutdown();
+            return;
+        }
+        if (name == "sip") {
+            cacheSIPConnection(std::move(channel), peerId, deviceId);
+        } else if (name.find("git://") == 0) {
+            auto sep = name.find_last_of('/');
+            auto conversationId = name.substr(sep + 1);
+            auto targetDevice = name.substr(6, sep - 6);
+            auto remoteDevice = deviceId.toString();
+
+            if (channel->isInitiator()) {
+                // Check if wanted remote is our side (git://targetDevice/conversationId)
+                return;
+            }
+
+            if (targetDevice != currentDeviceId()) {
+                JAMI_WARNING(
+                    "[Account {:s}] [Conversation {}] Git server requested for device {}, but this is not ours.",
+                    getAccountID(),
+                    conversationId,
+                    targetDevice);
+                channel->shutdown();
+                return;
+            }
+
+            if (!convModule()->isPeerAuthorized(conversationId, peerId, remoteDevice, true)) {
+                JAMI_WARNING("[Account {:s}] [Conversation {}] Git server requested, but peer {}/{} is not authorized",
+                             getAccountID(),
+                             conversationId,
+                             peerId,
+                             remoteDevice);
+                channel->shutdown();
+                return;
+            }
+
+            auto sock = convModule()->gitSocket(remoteDevice, conversationId);
+            if (sock == channel) {
+                // The onConnectionReady is already used as client (for retrieving messages)
+                // So it's not the server socket
+                return;
+            }
+            JAMI_LOG("[Account {:s}] [Conversation {}] [device {}] Git server requested",
+                     accountID_,
+                     conversationId,
+                     remoteDevice);
+            auto gs = std::make_unique<GitServer>(accountID_, conversationId, channel);
+            syncCnt_.fetch_add(1);
+            gs->setOnFetched([w = weak(), conversationId, remoteDevice](const std::string& commit) {
+                dht::ThreadPool::computation().run([w, conversationId, remoteDevice, commit]() {
+                    if (auto shared = w.lock()) {
+                        shared->convModule()->setFetched(conversationId, remoteDevice, commit);
+                        if (shared->syncCnt_.fetch_sub(1) == 1) {
+                            emitSignal<libjami::ConversationSignal::ConversationCloned>(shared->getAccountID().c_str());
+                        }
+                    }
+                });
+            });
+            const dht::Value::Id serverId = ValueIdDist()(rand);
+            {
+                std::lock_guard lk(gitServersMtx_);
+                gitServers_[serverId] = std::move(gs);
+            }
+            channel->onShutdown([w = weak(), serverId](const std::error_code&) {
+                // Run on main thread to avoid to be in mxSock's eventLoop
+                runOnMainThread([serverId, w]() {
+                    if (auto sthis = w.lock()) {
+                        std::lock_guard lk(sthis->gitServersMtx_);
+                        sthis->gitServers_.erase(serverId);
+                    }
+                });
+            });
+        } else {
+            // TODO move git://
+            std::shared_lock lk(connManagerMtx_);
+            auto uri = Uri(name);
+            auto itHandler = channelHandlers_.find(uri.scheme());
+            if (itHandler != channelHandlers_.end() && itHandler->second)
+                itHandler->second->onReady(cert, name, std::move(channel));
+        }
+    }
+}
+
+void
+JamiAccount::conversationNeedsSyncing(std::shared_ptr<SyncMsg>&& syncMsg)
+{
+    // Decide from the message *content* whether it can require (re)opening sync
+    // connections. A change to the contact/conversation list (or requests) must
+    // reach devices that are not currently connected; a metadata-only update
+    // (read status, preferences) only rides the existing connections. Checking
+    // the content rather than merely "is syncMsg null" keeps this correct if
+    // list data is ever attached to a syncMsg in the future.
+    if (syncMsg && !syncMsg->affectsList()) {
+        // Metadata-only update: ride the existing sync connections, never open
+        // new ones.
+        dht::ThreadPool::computation().run([w = weak(), syncMsg = std::move(syncMsg)] {
+            if (auto shared = w.lock())
+                if (auto* sm = shared->syncModule())
+                    sm->syncWithConnected(syncMsg);
+        });
+        return;
+    }
+    // Contact/conversation-list change: for JAMS accounts, update the server;
+    // then bump the local sync version and (re)connect/push to other devices.
+    // A non-null syncMsg carrying list state is covered by the full-state push
+    // performed by onSyncListChanged().
+    dht::ThreadPool::computation().run([w = weak()] {
+        auto shared = w.lock();
+        if (!shared)
+            return;
+        const auto& config = shared->config();
+        if (!config.managerUri.empty())
+            if (auto am = shared->accountManager())
+                am->syncDevices();
+        shared->onSyncListChanged();
+    });
+}
+
+uint64_t
+JamiAccount::conversationSendMessage(const std::string& uri,
+                                     const DeviceId& device,
+                                     const std::map<std::string, std::string>& msg,
+                                     uint64_t token)
+{
+    // No need to retrigger, sendTextMessage will call
+    // messageEngine_.sendMessage, already retriggering on
+    // main thread.
+    auto deviceId = device ? device.toString() : "";
+    return sendTextMessage(uri, deviceId, msg, token);
+}
+
+void
+JamiAccount::onConversationNeedSocket(const std::string& convId,
+                                      const std::string& deviceId,
+                                      ChannelCb&& cb,
+                                      const std::string& type,
+                                      bool /*noNewSocket*/)
+{
+    dht::ThreadPool::io().run([w = weak(), convId, deviceId, cb = std::move(cb), type] {
+        auto shared = w.lock();
+        if (!shared)
+            return;
+        if (auto socket = shared->convModule()->gitSocket(deviceId, convId)) {
+            auto remoteCert = socket->peerCertificate();
+            if (!remoteCert || !remoteCert->issuer
+                || !shared->convModule()->isPeerAuthorized(convId,
+                                                           remoteCert->issuer->getId().toString(),
+                                                           socket->deviceId().toString(),
+                                                           true)) {
+                socket->shutdown();
+                shared->convModule()->removeGitSocket(socket->deviceId().toString(), convId);
+                cb({});
+                return;
+            }
+            if (!cb(socket))
+                socket->shutdown();
+            return;
+        }
+        std::shared_lock lkCM(shared->connManagerMtx_);
+        if (!shared->connectionManager_) {
+            lkCM.unlock();
+            cb({});
+            return;
+        }
+
+        shared->connectionManager_->connectDevice(
+            DeviceId(deviceId),
+            fmt::format("git://{}/{}", deviceId, convId),
+            [w, cb = std::move(cb), convId, requestedDeviceId = deviceId](std::shared_ptr<dhtnet::ChannelSocket> socket,
+                                                                          const DeviceId&) {
+                dht::ThreadPool::io().run(
+                    [w, cb = std::move(cb), socket = std::move(socket), convId, requestedDeviceId] {
+                        if (socket) {
+                            auto shared = w.lock();
+                            auto remoteCert = socket->peerCertificate();
+                            auto remoteDeviceId = socket->deviceId().toString();
+                            if (!shared || !remoteCert || !remoteCert->issuer || remoteDeviceId != requestedDeviceId
+                                || !shared->convModule()->isPeerAuthorized(convId,
+                                                                           remoteCert->issuer->getId().toString(),
+                                                                           remoteDeviceId,
+                                                                           true)) {
+                                socket->shutdown();
+                                cb({});
+                                return;
+                            }
+                            socket->onShutdown([w, deviceId = socket->deviceId(), convId](const std::error_code&) {
+                                dht::ThreadPool::io().run([w, deviceId, convId] {
+                                    if (auto shared = w.lock())
+                                        shared->convModule()->removeGitSocket(deviceId.toString(), convId);
+                                });
+                            });
+                            if (!cb(socket))
+                                socket->shutdown();
+                        } else
+                            cb({});
+                    });
+            },
+            false,
+            false,
+            type);
+    });
+}
+
+void
+JamiAccount::onConversationNeedSwarmSocket(const std::string& convId,
+                                           const std::string& deviceId,
+                                           ChannelCb&& cb,
+                                           const std::string& /*type*/,
+                                           bool noNewSocket)
+{
+    dht::ThreadPool::io().run([w = weak(), convId, deviceId, cb = std::forward<ChannelCb&&>(cb), noNewSocket] {
+        auto shared = w.lock();
+        if (!shared)
+            return;
+        auto* cm = shared->convModule();
+        std::shared_lock lkCM(shared->connManagerMtx_);
+        if (!shared->connectionManager_ || !cm || cm->isDeviceBanned(convId, deviceId)) {
+            asio::post(*Manager::instance().ioContext(), [cb = std::move(cb)] { cb({}); });
+            return;
+        }
+        DeviceId device(deviceId);
+        auto swarmUri = fmt::format("swarm://{}", convId);
+        dhtnet::ConnectDeviceOptions opts;
+        opts.connType = "";
+        opts.noNewSocket = noNewSocket;
+        opts.uniqueName = true;
+        shared->connectionManager_->connectDevice(
+            device,
+            swarmUri,
+            [w,
+             cb = std::move(cb),
+             wam = std::weak_ptr(shared->accountManager())](std::shared_ptr<dhtnet::ChannelSocket> socket,
+                                                            const DeviceId&) {
+                dht::ThreadPool::io().run([w, wam, cb = std::move(cb), socket = std::move(socket)] {
+                    if (socket) {
+                        auto shared = w.lock();
+                        auto am = wam.lock();
+                        auto remoteCert = socket->peerCertificate();
+                        if (!remoteCert || !remoteCert->issuer) {
+                            cb(nullptr);
+                            return;
+                        }
+                        auto uri = remoteCert->issuer->getId().toString();
+                        if (!shared || !am
+                            || am->getCertificateStatus(uri) == dhtnet::tls::TrustStore::PermissionStatus::BANNED) {
+                            cb(nullptr);
+                            return;
+                        }
+                    }
+                    cb(socket);
+                });
+            },
+            opts);
+    });
+}
+
+void
+JamiAccount::conversationOneToOneReceive(const std::string& convId, const std::string& from)
+{
+    accountManager_->findCertificate(dht::InfoHash(from),
+                                     [this, from, convId](const std::shared_ptr<dht::crypto::Certificate>& cert) {
+                                         const auto* info = accountManager_->getInfo();
+                                         if (!cert || !info)
+                                             return;
+                                         info->contacts->onTrustRequest(dht::InfoHash(from),
+                                                                        cert->getSharedPublicKey(),
+                                                                        nowMs(),
+                                                                        false,
+                                                                        convId,
+                                                                        {});
+                                     });
+}
+
+ConversationModule*
+JamiAccount::convModule(bool noCreation)
+{
+    if (noCreation)
+        return convModule_.get();
+    if (!accountManager() || currentDeviceId() == "") {
+        JAMI_ERROR("[Account {}] Calling convModule() with an uninitialized account", getAccountID());
+        return nullptr;
+    }
+    std::unique_lock lock(configurationMutex_);
+    std::lock_guard lk(moduleMtx_);
+    if (!convModule_) {
+        convModule_ = std::make_unique<ConversationModule>(
+            shared(),
+            accountManager_,
+            [this](auto&& syncMsg) { conversationNeedsSyncing(std::forward<std::shared_ptr<SyncMsg>>(syncMsg)); },
+            [this](auto&& uri, auto&& device, auto&& msg, auto token = 0) {
+                return conversationSendMessage(uri, device, msg, token);
+            },
+            [this](const auto& convId, const auto& deviceId, auto&& cb, const auto& connectionType, bool noNewSocket) {
+                onConversationNeedSocket(convId, deviceId, std::forward<decltype(cb)>(cb), connectionType, noNewSocket);
+            },
+            [this](const auto& convId, const auto& deviceId, auto&& cb, const auto& connectionType, bool noNewSocket) {
+                onConversationNeedSwarmSocket(convId,
+                                              deviceId,
+                                              std::forward<decltype(cb)>(cb),
+                                              connectionType,
+                                              noNewSocket);
+            },
+            [this](const auto& convId, const auto& from) { conversationOneToOneReceive(convId, from); },
+            autoLoadConversations_);
+    }
+    return convModule_.get();
+}
+
+SyncModule*
+JamiAccount::syncModule()
+{
+    if (!accountManager() || currentDeviceId() == "") {
+        JAMI_ERROR("Calling syncModule() with an uninitialized account.");
+        return nullptr;
+    }
+    std::lock_guard lk(moduleMtx_);
+    if (!syncModule_)
+        syncModule_ = std::make_unique<SyncModule>(shared());
+    return syncModule_.get();
+}
+
+void
+JamiAccount::onTextMessage(const std::string& id,
+                           const std::string& from,
+                           const std::shared_ptr<dht::crypto::Certificate>& peerCert,
+                           const std::map<std::string, std::string>& payloads)
+{
+    try {
+        const std::string fromUri {parseJamiUri(from)};
+        SIPAccountBase::onTextMessage(id, fromUri, peerCert, payloads);
+    } catch (...) {
+    }
+}
+
+void
+JamiAccount::loadConversation(const std::string& convId)
+{
+    if (auto* cm = convModule(true))
+        cm->loadSingleConversation(convId);
+}
+
+void
+JamiAccount::doUnregister(bool forceShutdownConnections)
+{
+    std::unique_lock lock(configurationMutex_);
+    if (auto retired = std::atomic_exchange(&identityAnnouncement_, std::shared_ptr<IdentityAnnouncement> {}))
+        retired->retire();
+    if (registrationState_ >= RegistrationState::ERROR_GENERIC) {
+        return;
+    }
+
+    std::mutex mtx;
+    std::condition_variable cv;
+    bool shutdown_complete {false};
+
+    if (peerDiscovery_) {
+        peerDiscovery_->stopPublish(PEER_DISCOVERY_JAMI_SERVICE);
+        peerDiscovery_->stopDiscovery(PEER_DISCOVERY_JAMI_SERVICE);
+    }
+
+    JAMI_WARNING("[Account {}] Unregistering account {}", getAccountID(), fmt::ptr(this));
+    dht_->shutdown(
+        [&] {
+            JAMI_WARNING("[Account {}] DHT shutdown complete", getAccountID());
+            std::lock_guard lock(mtx);
+            shutdown_complete = true;
+            cv.notify_all();
+        },
+        true);
+
+    {
+        std::lock_guard lk(pendingCallsMutex_);
+        pendingCalls_.clear();
+    }
+
+    // Stop all current P2P connections if account is disabled
+    // or if explicitly requested by the caller.
+    // NOTE: Leaving the connections open is useful when changing an account's config.
+    if (not isEnabled() || forceShutdownConnections)
+        shutdownConnections();
+
+    // Release current UPnP mapping if any.
+    if (upnpCtrl_ and dhtUpnpMapping_.isValid()) {
+        upnpCtrl_->releaseMapping(dhtUpnpMapping_);
+    }
+
+    {
+        std::unique_lock lock(mtx);
+        cv.wait(lock, [&] { return shutdown_complete; });
+    }
+    dht_->join();
+    setRegistrationState(RegistrationState::UNREGISTERED);
+
+    lock.unlock();
+
+#ifdef ENABLE_PLUGIN
+    jami::Manager::instance().getJamiPluginManager().getChatServicesManager().cleanChatSubjects(getAccountID());
+#endif
+}
+
+void
+JamiAccount::setRegistrationState(RegistrationState state, int detail_code, const std::string& detail_str)
+{
+    if (registrationState_ != state) {
+        if (state == RegistrationState::REGISTERED) {
+            JAMI_WARNING("[Account {}] Connected", getAccountID());
+            turnCache_->refresh();
+            if (connectionManager_)
+                connectionManager_->storeActiveIpAddress();
+        } else if (state == RegistrationState::TRYING) {
+            JAMI_WARNING("[Account {}] Connecting…", getAccountID());
+        } else {
+            deviceAnnounced_ = false;
+            JAMI_WARNING("[Account {}] Disconnected", getAccountID());
+        }
+    }
+    // Update registrationState_ & emit signals
+    Account::setRegistrationState(state, detail_code, detail_str);
+}
+
+void
+JamiAccount::reloadContacts()
+{
+    accountManager_->reloadContacts();
+}
+
+void
+JamiAccount::connectivityChanged()
+{
+    if (not isUsable()) {
+        // nothing to do
+        return;
+    }
+    JAMI_WARNING("[{}] connectivityChanged", getAccountID());
+
+    if (auto* cm = convModule())
+        cm->connectivityChanged();
+    dht_->connectivityChanged();
+    {
+        std::shared_lock lkCM(connManagerMtx_);
+        if (connectionManager_) {
+            connectionManager_->connectivityChanged();
+            // reset cache
+            connectionManager_->setPublishedAddress({});
+        }
+    }
+}
+
+bool
+JamiAccount::findCertificate(const dht::InfoHash& h,
+                             std::function<void(const std::shared_ptr<dht::crypto::Certificate>&)>&& cb)
+{
+    if (accountManager_)
+        return accountManager_->findCertificate(h, std::move(cb));
+    return false;
+}
+
+bool
+JamiAccount::findCertificate(const dht::PkId& id,
+                             std::function<void(const std::shared_ptr<dht::crypto::Certificate>&)>&& cb)
+{
+    if (accountManager_)
+        return accountManager_->findCertificate(id, std::move(cb));
+    return false;
+}
+
+bool
+JamiAccount::findCertificate(const std::string& crt_id)
+{
+    if (accountManager_)
+        return accountManager_->findCertificate(dht::InfoHash(crt_id));
+    return false;
+}
+
+bool
+JamiAccount::setCertificateStatus(const std::string& cert_id, dhtnet::tls::TrustStore::PermissionStatus status)
+{
+    bool done = accountManager_ ? accountManager_->setCertificateStatus(cert_id, status) : false;
+    if (done) {
+        findCertificate(cert_id);
+        emitSignal<libjami::ConfigurationSignal::CertificateStateChanged>(getAccountID(),
+                                                                          cert_id,
+                                                                          dhtnet::tls::TrustStore::statusToStr(status));
+    }
+    return done;
+}
+
+bool
+JamiAccount::setCertificateStatus(const std::shared_ptr<crypto::Certificate>& cert,
+                                  dhtnet::tls::TrustStore::PermissionStatus status,
+                                  bool local)
+{
+    bool done = accountManager_ ? accountManager_->setCertificateStatus(cert, status, local) : false;
+    if (done) {
+        findCertificate(cert->getLongId().toString());
+        emitSignal<libjami::ConfigurationSignal::CertificateStateChanged>(getAccountID(),
+                                                                          cert->getLongId().toString(),
+                                                                          dhtnet::tls::TrustStore::statusToStr(status));
+    }
+    return done;
+}
+
+std::vector<std::string>
+JamiAccount::getCertificatesByStatus(dhtnet::tls::TrustStore::PermissionStatus status)
+{
+    if (accountManager_)
+        return accountManager_->getCertificatesByStatus(status);
+    return {};
+}
+
+bool
+JamiAccount::isMessageTreated(dht::Value::Id id)
+{
+    std::lock_guard lock(messageMutex_);
+    return !treatedMessages_.add(id);
+}
+
+bool
+JamiAccount::sha3SumVerify() const
+{
+    return !noSha3sumVerification_;
+}
+
+#ifdef LIBJAMI_TEST
+void
+JamiAccount::noSha3sumVerification(bool newValue)
+{
+    noSha3sumVerification_ = newValue;
+}
+#endif
+
+std::map<std::string, std::string>
+JamiAccount::getKnownDevices() const
+{
+    std::lock_guard lock(configurationMutex_);
+    if (not accountManager_ or not accountManager_->getInfo())
+        return {};
+    std::map<std::string, std::string> ids;
+    for (const auto& d : accountManager_->getKnownDevices()) {
+        auto id = d.first.toString();
+        auto label = d.second.name.empty() ? id.substr(0, 8) : d.second.name;
+        ids.emplace(std::move(id), std::move(label));
+    }
+    return ids;
+}
+
+void
+JamiAccount::loadCachedUrl(const std::string& url,
+                           const std::filesystem::path& cachePath,
+                           const std::chrono::seconds& cacheDuration,
+                           const std::function<void(const dht::http::Response& response)>& cb)
+{
+    dht::ThreadPool::io().run([cb, url, cachePath, cacheDuration, w = weak()]() {
+        try {
+            std::string data;
+            {
+                std::lock_guard lk(dhtnet::fileutils::getFileLock(cachePath));
+                data = fileutils::loadCacheTextFile(cachePath, cacheDuration);
+            }
+            dht::http::Response ret;
+            ret.body = std::move(data);
+            ret.status_code = 200;
+            cb(ret);
+        } catch (const std::exception& e) {
+            JAMI_LOG("Failed to load '{}' from '{}': {}", url, cachePath, e.what());
+
+            if (auto sthis = w.lock()) {
+                auto req = std::make_shared<dht::http::Request>(
+                    *Manager::instance().ioContext(), url, [cb, cachePath, w](const dht::http::Response& response) {
+                        if (response.status_code == 200) {
+                            try {
+                                std::lock_guard lk(dhtnet::fileutils::getFileLock(cachePath));
+                                fileutils::saveFile(cachePath,
+                                                    (const uint8_t*) response.body.data(),
+                                                    response.body.size(),
+                                                    0600);
+                                JAMI_LOG("Cached result to '{}'", cachePath);
+                            } catch (const std::exception& ex) {
+                                JAMI_WARNING("Failed to save result to '{}': {}", cachePath, ex.what());
+                            }
+                            cb(response);
+                        } else {
+                            try {
+                                if (std::filesystem::exists(cachePath)) {
+                                    JAMI_WARNING("Failed to download URL, using cached data");
+                                    std::string data;
+                                    {
+                                        std::lock_guard lk(dhtnet::fileutils::getFileLock(cachePath));
+                                        data = fileutils::loadTextFile(cachePath);
+                                    }
+                                    dht::http::Response ret;
+                                    ret.body = std::move(data);
+                                    ret.status_code = 200;
+                                    cb(ret);
+                                } else
+                                    throw std::runtime_error("No cached data");
+                            } catch (...) {
+                                cb(response);
+                            }
+                        }
+                        if (auto req = response.request.lock())
+                            if (auto sthis = w.lock())
+                                sthis->requests_.erase(req);
+                    });
+                sthis->requests_.emplace(req);
+                req->send();
+            }
+        }
+    });
+}
+
+void
+JamiAccount::loadCachedProxyServer(std::function<void(const std::string& proxy)> cb)
+{
+    const auto& conf = config();
+    if (conf.proxyEnabled and proxyServerCached_.empty()) {
+        JAMI_DEBUG("[Account {:s}] Loading DHT proxy URL: {:s}", getAccountID(), conf.proxyListUrl);
+        if (conf.proxyListUrl.empty() or not conf.proxyListEnabled) {
+            cb(getDhtProxyServer(conf.proxyServer));
+        } else {
+            loadCachedUrl(conf.proxyListUrl,
+                          cachePath_ / "dhtproxylist",
+                          std::chrono::hours(24 * 3),
+                          [w = weak(), cb = std::move(cb)](const dht::http::Response& response) {
+                              if (auto sthis = w.lock()) {
+                                  if (response.status_code == 200) {
+                                      cb(sthis->getDhtProxyServer(response.body));
+                                  } else {
+                                      cb(sthis->getDhtProxyServer(sthis->config().proxyServer));
+                                  }
+                              }
+                          });
+        }
+    } else {
+        cb(proxyServerCached_);
+    }
+}
+
+std::string
+JamiAccount::getDhtProxyServer(const std::string& serverList)
+{
+    if (proxyServerCached_.empty()) {
+        std::vector<std::string> proxys;
+        // Split the list of servers
+        std::sregex_iterator begin = {serverList.begin(), serverList.end(), PROXY_REGEX}, end;
+        for (auto it = begin; it != end; ++it) {
+            auto& match = *it;
+            if (match[5].matched and match[6].matched) {
+                try {
+                    auto start = std::stoi(match[5]), end = std::stoi(match[6]);
+                    for (auto p = start; p <= end; p++)
+                        proxys.emplace_back(match[1].str() + match[2].str() + ":" + std::to_string(p));
+                } catch (...) {
+                    JAMI_WARNING("Malformed proxy, ignore it");
+                    continue;
+                }
+            } else {
+                proxys.emplace_back(match[0].str());
+            }
+        }
+        if (proxys.empty())
+            return {};
+        // Select one of the list as the current proxy.
+        auto randIt = proxys.begin();
+        std::advance(randIt, std::uniform_int_distribution<unsigned long>(0, proxys.size() - 1)(rand));
+        proxyServerCached_ = *randIt;
+        // Cache it!
+        dhtnet::fileutils::check_dir(cachePath_, 0700);
+        auto proxyCachePath = cachePath_ / "dhtproxy";
+        std::ofstream file(proxyCachePath);
+        JAMI_DEBUG("Cache DHT proxy server: {}", proxyServerCached_);
+        Json::Value node(Json::objectValue);
+        node[getProxyConfigKey()] = proxyServerCached_;
+        if (file.is_open())
+            file << node;
+        else
+            JAMI_WARNING("Unable to write into {}", proxyCachePath);
+    }
+    return proxyServerCached_;
+}
+
+MatchRank
+JamiAccount::matches(std::string_view userName, std::string_view server) const
+{
+    if (not accountManager_ or not accountManager_->getInfo())
+        return MatchRank::NONE;
+
+    if (userName == accountManager_->getInfo()->accountId || server == accountManager_->getInfo()->accountId
+        || userName == accountManager_->getInfo()->deviceId) {
+        JAMI_LOG("Matching account ID in request with username {}", userName);
+        return MatchRank::FULL;
+    } else {
+        return MatchRank::NONE;
+    }
+}
+
+std::string
+JamiAccount::getFromUri() const
+{
+    std::string uri = "<sip:" + accountManager_->getInfo()->accountId + "@ring.dht>";
+    if (not config().displayName.empty())
+        return "\"" + config().displayName + "\" " + uri;
+    return uri;
+}
+
+std::string
+JamiAccount::getToUri(const std::string& to) const
+{
+    auto username = to;
+    string_replace(username, "sip:", "");
+    return fmt::format("<sips:{};transport=tls>", username);
+}
+
+std::string
+getDisplayed(const std::string& conversationId, const std::string& messageId)
+{
+    // implementing https://tools.ietf.org/rfc/rfc5438.txt
+    return fmt::format("<?xml version=\"1.0\" encoding=\"utf-8\" ?>\n"
+                       "<imdn><message-id>{}</message-id>\n"
+                       "{}"
+                       "<display-notification><status><displayed/></status></display-notification>\n"
+                       "</imdn>",
+                       messageId,
+                       conversationId.empty() ? "" : "<conversation>" + conversationId + "</conversation>");
+}
+
+std::string
+getPIDF(const std::string& note)
+{
+    // implementing https://datatracker.ietf.org/doc/html/rfc3863
+    return fmt::format("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+                       "<presence xmlns=\"urn:ietf:params:xml:ns:pidf\">\n"
+                       "    <tuple>\n"
+                       "    <status>\n"
+                       "        <basic>{}</basic>\n"
+                       "    </status>\n"
+                       "    </tuple>\n"
+                       "</presence>",
+                       note);
+}
+
+void
+JamiAccount::setIsComposing(const std::string& conversationUri, bool isWriting)
+{
+    Uri uri(conversationUri);
+    std::string conversationId = {};
+    if (uri.scheme() == Uri::Scheme::SWARM) {
+        conversationId = uri.authority();
+    } else {
+        return;
+    }
+
+    if (auto* cm = convModule(true)) {
+        if (auto typer = cm->getTypers(conversationId)) {
+            if (isWriting)
+                typer->addTyper(getUsername(), true);
+            else
+                typer->removeTyper(getUsername(), true);
+        }
+    }
+}
+
+bool
+JamiAccount::setMessageDisplayed(const std::string& conversationUri, const std::string& messageId, int status)
+{
+    Uri uri(conversationUri);
+    std::string conversationId = {};
+    if (uri.scheme() == Uri::Scheme::SWARM)
+        conversationId = uri.authority();
+    auto sendMessage = status == (int) libjami::Account::MessageStates::DISPLAYED && isReadReceiptEnabled();
+    if (!conversationId.empty())
+        sendMessage &= convModule()->onMessageDisplayed(getUsername(), conversationId, messageId);
+    if (sendMessage)
+        sendInstantMessage(uri.authority(), {{MIME_TYPE_IMDN, getDisplayed(conversationId, messageId)}});
+    return true;
+}
+
+std::string
+JamiAccount::getContactHeader(const std::shared_ptr<SipTransport>& sipTransport)
+{
+    if (sipTransport and sipTransport->get() != nullptr) {
+        auto* transport = sipTransport->get();
+        auto* td = reinterpret_cast<tls::AbstractSIPTransport::TransportData*>(transport);
+        auto address = td->self->getLocalAddress().toString(true);
+        bool reliable = transport->flag & PJSIP_TRANSPORT_RELIABLE;
+        return fmt::format("\"{}\" <sips:{}{}{};transport={}>",
+                           config().displayName,
+                           id_.second->getId().toString(),
+                           address.empty() ? "" : "@",
+                           address,
+                           reliable ? "tls" : "dtls");
+    } else {
+        JAMI_ERROR("getContactHeader: no SIP transport provided");
+        return fmt::format("\"{}\" <sips:{}@ring.dht>", config().displayName, id_.second->getId().toString());
+    }
+}
+
+void
+JamiAccount::addContact(const std::string& uri, bool confirmed)
+{
+    dht::InfoHash h(uri);
+    if (not h) {
+        JAMI_ERROR("addContact: invalid contact URI");
+        return;
+    }
+    auto conversation = convModule()->getOneToOneConversation(uri);
+    if (!confirmed && conversation.empty())
+        conversation = convModule()->startConversation(ConversationMode::ONE_TO_ONE, h);
+    std::unique_lock lock(configurationMutex_);
+    if (accountManager_)
+        accountManager_->addContact(h, confirmed, conversation);
+    else
+        JAMI_WARNING("[Account {}] addContact: account not loaded", getAccountID());
+}
+
+void
+JamiAccount::removeContact(const std::string& uri, bool ban)
+{
+    std::lock_guard lock(configurationMutex_);
+    if (accountManager_)
+        accountManager_->removeContact(uri, ban);
+    else
+        JAMI_WARNING("[Account {}] removeContact: account not loaded", getAccountID());
+}
+
+std::map<std::string, std::string>
+JamiAccount::getContactDetails(const std::string& uri) const
+{
+    std::lock_guard lock(configurationMutex_);
+    return accountManager_ ? accountManager_->getContactDetails(uri) : std::map<std::string, std::string> {};
+}
+
+std::optional<Contact>
+JamiAccount::getContactInfo(const std::string& uri) const
+{
+    std::lock_guard lock(configurationMutex_);
+    return accountManager_ ? accountManager_->getContactInfo(uri) : std::nullopt;
+}
+
+bool
+JamiAccount::isContact(const std::string& peerAccountUri) const
+{
+    auto info = getContactInfo(peerAccountUri);
+    return info && info->isActive();
+}
+
+// ----------------------------------------------------------------------------
+// Service-exposure: peer discovery & tunnel orchestration.
+// ----------------------------------------------------------------------------
+
+struct JamiAccount::PendingSvcQuery
+{
+    uint32_t requestId {0};
+    std::string peerUri;
+};
+
+void
+JamiAccount::finalizeSvcQuery(uint32_t requestId, int status, const std::string& servicesJson)
+{
+    JAMI_LOG("[Account {}] finalizeSvcQuery req={} status={}", getAccountID(), requestId, status);
+    std::shared_ptr<PendingSvcQuery> q;
+    {
+        std::lock_guard lk(pendingSvcQueriesMtx_);
+        auto it = pendingSvcQueries_.find(requestId);
+        if (it == pendingSvcQueries_.end())
+            return;
+        q = std::move(it->second);
+        pendingSvcQueries_.erase(it);
+    }
+    emitSignal<libjami::ServiceSignal::PeerServicesReceived>(requestId, getAccountID(), q->peerUri, status, servicesJson);
+}
+
+std::string
+JamiAccount::buildPeerServicesJson(const std::string& peerUri, const DeviceId* forceAvailableDevice)
+{
+    std::vector<SvcDiscoveryChannelHandler::CachedSvcInfo> services;
+    {
+        std::shared_lock lk(connManagerMtx_);
+        auto it = channelHandlers_.find(Uri::Scheme::SVC_DISCOVERY);
+        if (it == channelHandlers_.end() || !it->second)
+            return {};
+        services = static_cast<SvcDiscoveryChannelHandler*>(it->second.get())->getCachedServices(peerUri);
+    }
+    if (services.empty())
+        return {};
+
+    std::vector<DeviceId> onlineDevices;
+    if (presenceManager_)
+        onlineDevices = presenceManager_->getDevices(peerUri);
+
+    Json::Value arr(Json::arrayValue);
+    for (const auto& s : services) {
+        Json::Value v(Json::objectValue);
+        v["id"] = s.info.id;
+        v["name"] = s.info.name;
+        v["description"] = s.info.description;
+        v["proto"] = s.info.proto;
+        v["scheme"] = s.info.scheme;
+        v["device"] = s.deviceId.toString();
+        v["available"] = (forceAvailableDevice && *forceAvailableDevice == s.deviceId)
+                         || std::find(onlineDevices.begin(), onlineDevices.end(), s.deviceId) != onlineDevices.end();
+        arr.append(std::move(v));
+    }
+    return json::toString(arr);
+}
+
+uint32_t
+JamiAccount::queryPeerServices(const std::string& peerUri)
+{
+    using PSStatus = libjami::ServiceSignal::PeerServicesStatus;
+
+    static std::atomic<uint32_t> sQueryCounter {0};
+    const auto requestId = ++sQueryCounter;
+
+    JAMI_LOG("[Account {}] queryPeerServices req={} peer={}", getAccountID(), requestId, peerUri);
+
+    auto state = std::make_shared<PendingSvcQuery>();
+    state->requestId = requestId;
+    state->peerUri = peerUri;
+    {
+        std::lock_guard lk(pendingSvcQueriesMtx_);
+        pendingSvcQueries_.emplace(requestId, state);
+    }
+
+    std::shared_lock lk(connManagerMtx_);
+    auto* handler = static_cast<SvcDiscoveryChannelHandler*>(channelHandlers_[Uri::Scheme::SVC_DISCOVERY].get());
+    if (!handler) {
+        return 0;
+    }
+
+    runOnMainThread([w = weak(), requestId, peerUri] {
+        auto sthis = w.lock();
+        if (!sthis)
+            return;
+        auto servicesJson = sthis->buildPeerServicesJson(peerUri);
+        sthis->finalizeSvcQuery(requestId,
+                                static_cast<int>(servicesJson.empty() ? PSStatus::NoDevices : PSStatus::OK),
+                                servicesJson);
+    });
+    return requestId;
+}
+
+std::string
+JamiAccount::openServiceTunnel(const std::string& peerUri,
+                               const std::string& deviceId,
+                               const std::string& serviceId,
+                               const std::string& serviceName,
+                               uint16_t localPort)
+{
+    auto* handler = static_cast<SvcTunnelChannelHandler*>(channelHandlers_[Uri::Scheme::SVC_TUNNEL].get());
+    if (!handler)
+        return {};
+    DeviceId dev;
+    try {
+        dev = DeviceId(deviceId);
+    } catch (...) {
+        return {};
+    }
+    auto accId = getAccountID();
+    return handler->openTunnel(
+        peerUri,
+        dev,
+        serviceId,
+        serviceName,
+        localPort,
+        [accId](const std::string& tunnelId, uint16_t port) {
+            emitSignal<libjami::ServiceSignal::TunnelOpened>(accId, tunnelId, port);
+        },
+        [accId](const std::string& tunnelId, const std::string& reason) {
+            emitSignal<libjami::ServiceSignal::TunnelClosed>(accId, tunnelId, reason);
+        });
+}
+
+bool
+JamiAccount::closeServiceTunnel(const std::string& tunnelId)
+{
+    auto* handler = static_cast<SvcTunnelChannelHandler*>(channelHandlers_[Uri::Scheme::SVC_TUNNEL].get());
+    if (!handler)
+        return false;
+    return handler->closeTunnel(tunnelId);
+}
+
+void
+JamiAccount::closeServerTunnelsForService(const std::string& serviceId)
+{
+    auto* handler = static_cast<SvcTunnelChannelHandler*>(channelHandlers_[Uri::Scheme::SVC_TUNNEL].get());
+    if (!handler)
+        return;
+    handler->closeServerChannelsForService(serviceId);
+}
+
+std::vector<std::map<std::string, std::string>>
+JamiAccount::getActiveServiceTunnels() const
+{
+    auto it = channelHandlers_.find(Uri::Scheme::SVC_TUNNEL);
+    if (it == channelHandlers_.end())
+        return {};
+    auto* handler = static_cast<SvcTunnelChannelHandler*>(it->second.get());
+    if (!handler)
+        return {};
+    auto tunnels = handler->activeTunnels();
+    std::vector<std::map<std::string, std::string>> out;
+    out.reserve(tunnels.size());
+    for (auto& t : tunnels) {
+        out.push_back({{"id", t.id},
+                       {"peerUri", t.peerUri},
+                       {"deviceId", t.peerDevice},
+                       {"serviceId", t.serviceId},
+                       {"serviceName", t.serviceName},
+                       {"localPort", std::to_string(t.localPort)}});
+    }
+    return out;
+}
+
+std::vector<std::map<std::string, std::string>>
+JamiAccount::getContacts(bool includeRemoved) const
+{
+    std::lock_guard lock(configurationMutex_);
+    if (not accountManager_)
+        return {};
+    const auto& contacts = accountManager_->getContacts(includeRemoved);
+    std::vector<std::map<std::string, std::string>> ret;
+    ret.reserve(contacts.size());
+    for (const auto& c : contacts) {
+        auto details = c.second.toMap();
+        if (not details.empty()) {
+            details["id"] = c.first.toString();
+            ret.emplace_back(std::move(details));
+        }
+    }
+    return ret;
+}
+
+/* trust requests */
+
+std::vector<std::map<std::string, std::string>>
+JamiAccount::getTrustRequests() const
+{
+    std::lock_guard lock(configurationMutex_);
+    return accountManager_ ? accountManager_->getTrustRequests() : std::vector<std::map<std::string, std::string>> {};
+}
+
+bool
+JamiAccount::acceptTrustRequest(const std::string& from, bool includeConversation)
+{
+    dht::InfoHash h(from);
+    if (not h) {
+        JAMI_ERROR("addContact: invalid contact URI");
+        return false;
+    }
+    std::unique_lock lock(configurationMutex_);
+    if (accountManager_) {
+        if (!accountManager_->acceptTrustRequest(from, includeConversation)) {
+            // Note: unused for swarm
+            // Typically the case where the trust request doesn't exists, only incoming DHT messages
+            return accountManager_->addContact(h, true);
+        }
+        return true;
+    }
+    JAMI_WARNING("[Account {}] acceptTrustRequest: account not loaded", getAccountID());
+    return false;
+}
+
+bool
+JamiAccount::discardTrustRequest(const std::string& from)
+{
+    // Remove 1:1 generated conv requests
+    auto requests = getTrustRequests();
+    for (const auto& req : requests) {
+        if (req.at(libjami::Account::TrustRequest::FROM) == from) {
+            convModule()->declineConversationRequest(req.at(libjami::Account::TrustRequest::CONVERSATIONID));
+        }
+    }
+
+    // Remove trust request
+    std::lock_guard lock(configurationMutex_);
+    if (accountManager_)
+        return accountManager_->discardTrustRequest(from);
+    JAMI_WARNING("[Account {:s}] discardTrustRequest: account not loaded", getAccountID());
+    return false;
+}
+
+void
+JamiAccount::declineConversationRequest(const std::string& conversationId)
+{
+    auto peerId = convModule()->peerFromConversationRequest(conversationId);
+    convModule()->declineConversationRequest(conversationId);
+    if (!peerId.empty()) {
+        std::lock_guard lock(configurationMutex_);
+        // Match and erase under the contact-list mutex. A newer request from
+        // this peer may have arrived since the conversation was declined.
+        if (accountManager_ && accountManager_->discardTrustRequest(peerId, conversationId))
+            JAMI_DEBUG("[Account {:s}] Declined trust request with {:s}", getAccountID(), peerId);
+    }
+}
+
+void
+JamiAccount::sendTrustRequest(const std::string& to, const std::vector<uint8_t>& payload)
+{
+    dht::InfoHash h(to);
+    if (not h) {
+        JAMI_ERROR("addContact: invalid contact URI");
+        return;
+    }
+    // Here we cache payload sent by the client
+    auto requestPath = cachePath_ / "requests";
+    dhtnet::fileutils::recursive_mkdir(requestPath, 0700);
+    auto cachedFile = requestPath / to;
+    std::ofstream req(cachedFile, std::ios::trunc | std::ios::binary);
+    if (!req.is_open()) {
+        JAMI_ERROR("Unable to write data to {}", cachedFile);
+        return;
+    }
+
+    if (not payload.empty()) {
+        req.write(reinterpret_cast<const char*>(payload.data()), static_cast<std::streamsize>(payload.size()));
+    }
+
+    if (payload.size() >= 64000) {
+        JAMI_WARNING("Trust request is too big. Remove payload");
+    }
+
+    auto conversation = convModule()->getOneToOneConversation(to);
+    if (conversation.empty())
+        conversation = convModule()->startConversation(ConversationMode::ONE_TO_ONE, h);
+    if (not conversation.empty()) {
+        std::lock_guard lock(configurationMutex_);
+        if (accountManager_)
+            accountManager_->sendTrustRequest(to,
+                                              conversation,
+                                              payload.size() >= 64000 ? std::vector<uint8_t> {} : payload);
+        else
+            JAMI_WARNING("[Account {}] sendTrustRequest: account not loaded", getAccountID());
+    } else
+        JAMI_WARNING("[Account {}] sendTrustRequest: account not loaded", getAccountID());
+}
+
+void
+JamiAccount::forEachDevice(const dht::InfoHash& to,
+                           std::function<void(const std::shared_ptr<dht::crypto::PublicKey>&)>&& op,
+                           std::function<void(bool)>&& end)
+{
+    accountManager_->forEachDevice(to, std::move(op), std::move(end));
+}
+
+uint64_t
+JamiAccount::sendTextMessage(const std::string& to,
+                             const std::string& deviceId,
+                             const std::map<std::string, std::string>& payloads,
+                             uint64_t refreshToken,
+                             bool onlyConnected)
+{
+    Uri uri(to);
+    if (uri.scheme() == Uri::Scheme::SWARM) {
+        sendInstantMessage(uri.authority(), payloads);
+        return 0;
+    }
+
+    std::string toUri;
+    try {
+        toUri = parseJamiUri(to);
+    } catch (...) {
+        JAMI_ERROR("Failed to send a text message due to an invalid URI {}", to);
+        return 0;
+    }
+    if (payloads.size() != 1) {
+        JAMI_ERROR("Multi-part im is not supported yet by JamiAccount");
+        return 0;
+    }
+    return SIPAccountBase::sendTextMessage(toUri, deviceId, payloads, refreshToken, onlyConnected);
+}
+
+void
+JamiAccount::sendMessage(const std::string& to,
+                         const std::string& deviceId,
+                         const std::map<std::string, std::string>& payloads,
+                         uint64_t token,
+                         bool retryOnTimeout,
+                         bool onlyConnected)
+{
+    std::string toUri;
+    try {
+        toUri = parseJamiUri(to);
+    } catch (...) {
+        JAMI_ERROR("[Account {}] Failed to send a text message due to an invalid URI {}", getAccountID(), to);
+        if (!onlyConnected)
+            messageEngine_.onMessageSent(to, token, false, deviceId);
+        return;
+    }
+    if (payloads.size() != 1) {
+        JAMI_ERROR("Multi-part im is not supported");
+        if (!onlyConnected)
+            messageEngine_.onMessageSent(toUri, token, false, deviceId);
+        return;
+    }
+
+    // Use the Message channel if available
+    std::shared_lock clk(connManagerMtx_);
+    auto* handler = static_cast<MessageChannelHandler*>(channelHandlers_[Uri::Scheme::MESSAGE].get());
+    if (!handler) {
+        clk.unlock();
+        if (!onlyConnected)
+            messageEngine_.onMessageSent(to, token, false, deviceId);
+        return;
+    }
+
+    auto devices = std::make_shared<SendMessageContext>(
+        [w = weak(), to, token, deviceId, onlyConnected, retryOnTimeout](bool success, bool sent) {
+            if (auto acc = w.lock())
+                acc->onMessageSent(to, token, deviceId, success, onlyConnected, sent && retryOnTimeout);
+        });
+
+    auto completed = [w = weak(), to, devices](const DeviceId& device,
+                                               const std::shared_ptr<dhtnet::ChannelSocket>& conn,
+                                               bool success) {
+        if (!success)
+            if (auto acc = w.lock()) {
+                std::shared_lock clk(acc->connManagerMtx_);
+                if (auto* handler = static_cast<MessageChannelHandler*>(
+                        acc->channelHandlers_[Uri::Scheme::MESSAGE].get())) {
+                    handler->closeChannel(to, device, conn);
+                }
+            }
+        devices->complete(device, success);
+    };
+
+    const auto& payload = *payloads.begin();
+    auto msg = std::make_shared<MessageChannelHandler::Message>();
+    msg->id = token;
+    msg->t = payload.first;
+    msg->c = payload.second;
+    auto device = deviceId.empty() ? DeviceId() : DeviceId(deviceId);
+    if (deviceId.empty()) {
+        auto conns = handler->getChannels(toUri);
+        clk.unlock();
+        for (const auto& conn : conns) {
+            auto connDevice = conn->deviceId();
+            if (!devices->add(connDevice))
+                continue;
+            dht::ThreadPool::io().run([completed, connDevice, conn, msg] {
+                completed(connDevice, conn, MessageChannelHandler::sendMessage(conn, *msg));
+            });
+        }
+    } else {
+        if (auto conn = handler->getChannel(toUri, device)) {
+            clk.unlock();
+            devices->add(device);
+            dht::ThreadPool::io().run([completed, device, conn, msg] {
+                completed(device, conn, MessageChannelHandler::sendMessage(conn, *msg));
+            });
+            devices->start();
+            return;
+        }
+    }
+    if (clk)
+        clk.unlock();
+
+    devices->start();
+
+    if (onlyConnected)
+        return;
+    // We are unable to send the message directly, try connecting
+
+    // Get conversation id, which will be used by the iOS notification extension
+    // to load the conversation.
+    auto extractIdFromJson = [](const std::string& jsonData) -> std::string {
+        Json::Value parsed;
+        if (json::parse(jsonData, parsed)) {
+            auto value = parsed.get("id", Json::nullValue);
+            if (value && value.isString()) {
+                return value.asString();
+            }
+        } else {
+            JAMI_WARNING("Unable to parse jsonData to get conversation ID");
+        }
+        return "";
+    };
+
+    // get request type
+    auto payload_type = msg->t;
+    if (payload_type == MIME_TYPE_GIT) {
+        std::string id = extractIdFromJson(msg->c);
+        if (!id.empty()) {
+            payload_type += "/" + id;
+        }
+    }
+
+    if (deviceId.empty()) {
+        auto toH = dht::InfoHash(toUri);
+        // Find listening devices for this account
+        accountManager_->forEachDevice(toH,
+                                       [this, to, devices, payload_type, currentDevice = DeviceId(currentDeviceId())](
+                                           const std::shared_ptr<dht::crypto::PublicKey>& dev) {
+                                           // Test if already sent
+                                           auto deviceId = dev->getLongId();
+                                           if (deviceId == currentDevice || devices->pending(deviceId)) {
+                                               return;
+                                           }
+
+                                           // Else, ask for a channel to send the message
+                                           dht::ThreadPool::io().run([this, to, deviceId, payload_type]() {
+                                               requestMessageConnection(to, deviceId, payload_type);
+                                           });
+                                       });
+    } else {
+        requestMessageConnection(to, device, payload_type);
+    }
+}
+
+void
+JamiAccount::onMessageSent(
+    const std::string& to, uint64_t id, const std::string& deviceId, bool success, bool onlyConnected, bool retry)
+{
+    if (!onlyConnected)
+        messageEngine_.onMessageSent(to, id, success, deviceId);
+
+    if (!success) {
+        if (retry)
+            messageEngine_.onPeerOnline(to, deviceId);
+    }
+}
+
+dhtnet::IceTransportOptions
+JamiAccount::getIceOptions() const
+{
+    return connectionManager_->getIceOptions();
+}
+
+void
+JamiAccount::getIceOptions(std::function<void(dhtnet::IceTransportOptions&&)> cb) const
+{
+    return connectionManager_->getIceOptions(std::move(cb));
+}
+
+dhtnet::IpAddr
+JamiAccount::getPublishedIpAddress(uint16_t family) const
+{
+    return connectionManager_->getPublishedIpAddress(family);
+}
+
+bool
+JamiAccount::setPushNotificationToken(const std::string& token)
+{
+    if (SIPAccountBase::setPushNotificationToken(token)) {
+        JAMI_WARNING("[Account {:s}] setPushNotificationToken: {:s}", getAccountID(), token);
+        if (dht_)
+            dht_->setPushNotificationToken(token);
+        return true;
+    }
+    return false;
+}
+
+bool
+JamiAccount::setPushNotificationTopic(const std::string& topic)
+{
+    if (SIPAccountBase::setPushNotificationTopic(topic)) {
+        if (dht_)
+            dht_->setPushNotificationTopic(topic);
+        return true;
+    }
+    return false;
+}
+
+bool
+JamiAccount::setPushNotificationConfig(const std::map<std::string, std::string>& data)
+{
+    if (SIPAccountBase::setPushNotificationConfig(data)) {
+        if (dht_) {
+            dht_->setPushNotificationPlatform(config_->platform);
+            dht_->setPushNotificationTopic(config_->notificationTopic);
+            dht_->setPushNotificationToken(config_->deviceKey);
+        }
+        return true;
+    }
+    return false;
+}
+
+/**
+ * To be called by clients with relevant data when a push notification is received.
+ */
+void
+JamiAccount::pushNotificationReceived(const std::string& /*from*/, const std::map<std::string, std::string>& data)
+{
+    auto ret_future = dht_->pushNotificationReceived(data);
+    dht::ThreadPool::computation().run([id = getAccountID(), ret_future = ret_future.share()] {
+        JAMI_WARNING("[Account {:s}] pushNotificationReceived: {}", id, (uint8_t) ret_future.get());
+    });
+}
+
+std::string
+JamiAccount::getUserUri() const
+{
+    if (not registeredName_.empty())
+        return JAMI_URI_PREFIX + registeredName_;
+    return JAMI_URI_PREFIX + config().username;
+}
+
+std::vector<libjami::Message>
+JamiAccount::getLastMessages(const uint64_t& base_timestamp)
+{
+    return SIPAccountBase::getLastMessages(base_timestamp);
+}
+
+void
+JamiAccount::startAccountPublish()
+{
+    AccountPeerInfo info_pub;
+    info_pub.accountId = dht::InfoHash(accountManager_->getInfo()->accountId);
+    info_pub.displayName = config().displayName;
+    peerDiscovery_->startPublish<AccountPeerInfo>(PEER_DISCOVERY_JAMI_SERVICE, info_pub);
+}
+
+void
+JamiAccount::startAccountDiscovery()
+{
+    auto id = dht::InfoHash(accountManager_->getInfo()->accountId);
+    peerDiscovery_
+        ->startDiscovery<AccountPeerInfo>(PEER_DISCOVERY_JAMI_SERVICE, [this, id](AccountPeerInfo&& v, dht::SockAddr&&) {
+            std::lock_guard lc(discoveryMapMtx_);
+            // Make sure that account itself will not be recorded
+            if (v.accountId != id) {
+                // Create or find the old one
+                auto& dp = discoveredPeers_[v.accountId];
+                dp.displayName = v.displayName;
+                discoveredPeerMap_[v.accountId.toString()] = v.displayName;
+                if (!dp.cleanupTimer) {
+                    // Avoid repeat reception of same peer
+                    JAMI_LOG("Account discovered: {}: {}", v.displayName, v.accountId.to_c_str());
+                    // Send Added Peer and corrsponding accoundID
+                    emitSignal<libjami::PresenceSignal::NearbyPeerNotification>(getAccountID(),
+                                                                                v.accountId.toString(),
+                                                                                0,
+                                                                                v.displayName);
+                    dp.cleanupTimer = std::make_unique<asio::steady_timer>(*Manager::instance().ioContext(),
+                                                                           PEER_DISCOVERY_EXPIRATION);
+                }
+                dp.cleanupTimer->expires_after(PEER_DISCOVERY_EXPIRATION);
+                dp.cleanupTimer->async_wait(
+                    [w = weak(), p = v.accountId, a = v.displayName](const asio::error_code& ec) {
+                        if (ec)
+                            return;
+                        if (auto this_ = w.lock()) {
+                            {
+                                std::lock_guard lc(this_->discoveryMapMtx_);
+                                this_->discoveredPeers_.erase(p);
+                                this_->discoveredPeerMap_.erase(p.toString());
+                            }
+                            // Send deleted peer
+                            emitSignal<libjami::PresenceSignal::NearbyPeerNotification>(this_->getAccountID(),
+                                                                                        p.toString(),
+                                                                                        1,
+                                                                                        a);
+                        }
+                        JAMI_LOG("Account removed from discovery list: {}", a);
+                    });
+            }
+        });
+}
+
+std::map<std::string, std::string>
+JamiAccount::getNearbyPeers() const
+{
+    return discoveredPeerMap_;
+}
+
+void
+JamiAccount::sendProfileToPeers()
+{
+    if (!connectionManager_)
+        return;
+    std::set<std::string> peers;
+    const auto& accountUri = accountManager_->getInfo()->accountId;
+    // TODO: avoid using getConnectionList
+    for (const auto& connection : connectionManager_->getConnectionList()) {
+        const auto& device = connection.at("device");
+        const auto& peer = connection.at("peer");
+        if (!peers.emplace(peer).second)
+            continue;
+        if (peer == accountUri) {
+            sendProfile("", accountUri, device);
+            continue;
+        }
+        const auto& conversationId = convModule()->getOneToOneConversation(peer);
+        if (!conversationId.empty()) {
+            sendProfile(conversationId, peer, device);
+        }
+    }
+}
+
+void
+JamiAccount::updateProfile(const std::string& displayName,
+                           const std::string& avatar,
+                           const std::string& fileType,
+                           int32_t flag)
+{
+    // if the fileType is empty then only the display name will be upated
+
+    const auto& accountUri = accountManager_->getInfo()->accountId;
+    const auto& path = profilePath();
+    const auto& profiles = idPath_ / "profiles";
+
+    try {
+        if (!std::filesystem::exists(profiles)) {
+            std::filesystem::create_directories(profiles);
+        }
+    } catch (const std::exception& e) {
+        JAMI_ERROR("Failed to create profiles directory: {}", e.what());
+        return;
+    }
+
+    const auto& vCardPath = profiles / fmt::format("{}.vcf", base64::encode(accountUri));
+
+    auto profile = getProfileVcard();
+    if (profile.empty()) {
+        profile = vCard::utils::initVcard();
+    }
+
+    profile[std::string(vCard::Property::FORMATTED_NAME)] = displayName;
+    editConfig([&](JamiAccountConfig& config) { config.displayName = displayName; });
+    emitSignal<libjami::ConfigurationSignal::AccountDetailsChanged>(getAccountID(), getAccountDetails());
+
+    if (!fileType.empty()) {
+        const std::string& key = "PHOTO;ENCODING=BASE64;TYPE=" + fileType;
+        if (flag == 0) {
+            vCard::utils::removeByKey(profile, vCard::Property::PHOTO);
+            const auto& avatarPath = std::filesystem::path(avatar);
+            if (std::filesystem::exists(avatarPath)) {
+                try {
+                    profile[key] = base64::encode(fileutils::loadFile(avatarPath));
+                } catch (const std::exception& e) {
+                    JAMI_ERROR("Failed to load avatar: {}", e.what());
+                }
+            }
+        } else if (flag == 1) {
+            vCard::utils::removeByKey(profile, vCard::Property::PHOTO);
+            profile[key] = avatar;
+        }
+    }
+    if (flag == 2) {
+        vCard::utils::removeByKey(profile, vCard::Property::PHOTO);
+    }
+    try {
+        vCard::utils::save(profile, vCardPath, path);
+        emitSignal<libjami::ConfigurationSignal::ProfileReceived>(getAccountID(), accountUri, path.string());
+
+        // Delete all profile sent markers:
+        std::error_code ec;
+        std::filesystem::remove_all(cachePath_ / "vcard", ec);
+        sendProfileToPeers();
+    } catch (const std::exception& e) {
+        JAMI_ERROR("Error writing profile: {}", e.what());
+    }
+}
+
+void
+JamiAccount::setActiveCodecs(const std::vector<unsigned>& list)
+{
+    Account::setActiveCodecs(list);
+    if (!hasActiveCodec(MEDIA_AUDIO))
+        setCodecActive(AV_CODEC_ID_OPUS);
+    if (!hasActiveCodec(MEDIA_VIDEO)) {
+        setCodecActive(AV_CODEC_ID_HEVC);
+        setCodecActive(AV_CODEC_ID_H264);
+        setCodecActive(AV_CODEC_ID_VP8);
+    }
+    config_->activeCodecs = getActiveCodecs(MEDIA_ALL);
+}
+
+void
+JamiAccount::sendInstantMessage(const std::string& convId, const std::map<std::string, std::string>& msg)
+{
+    auto members = convModule()->getConversationMembers(convId);
+    if (convId.empty() && members.empty()) {
+        // TODO remove, it's for old API for contacts
+        sendTextMessage(convId, "", msg);
+        return;
+    }
+    for (const auto& m : members) {
+        const auto& uri = m.at("uri");
+        auto token = std::uniform_int_distribution<uint64_t> {1, JAMI_ID_MAX_VAL}(rand);
+        // Announce to all members that a new message is sent
+        sendMessage(uri, "", msg, token, false, true);
+    }
+}
+
+bool
+JamiAccount::handleMessage(const std::shared_ptr<dht::crypto::Certificate>& cert,
+                           const std::string& from,
+                           const std::pair<std::string, std::string>& m)
+{
+    if (not cert or not cert->issuer)
+        return true; // stop processing message
+
+    if (cert->issuer->getId().to_view() != from) {
+        JAMI_WARNING("[Account {}] [device {}] handleMessage: invalid author {}",
+                     getAccountID(),
+                     cert->issuer->getId().to_view(),
+                     from);
+        return true;
+    }
+    if (m.first == MIME_TYPE_GIT) {
+        Json::Value json;
+        if (!json::parse(m.second, json)) {
+            return true;
+        }
+
+        // fetchNewCommits will do heavy stuff like fetching, avoid to block SIP socket
+        dht::ThreadPool::io().run([w = weak(),
+                                   from,
+                                   deviceId = json["deviceId"].asString(),
+                                   id = json["id"].asString(),
+                                   commit = json["commit"].asString()] {
+            if (auto shared = w.lock()) {
+                if (auto* cm = shared->convModule())
+                    cm->fetchNewCommits(from, deviceId, id, commit);
+            }
+        });
+        return true;
+    } else if (m.first == MIME_TYPE_INVITE) {
+        convModule()->onNeedConversationRequest(from, m.second);
+        return true;
+    } else if (m.first == MIME_TYPE_INVITE_JSON) {
+        Json::Value json;
+        if (!json::parse(m.second, json)) {
+            return true;
+        }
+        convModule()->onConversationRequest(from, json);
+        return true;
+    } else if (m.first == MIME_TYPE_IM_COMPOSING) {
+        try {
+            static const std::regex COMPOSING_REGEX("<state>\\s*(\\w+)\\s*<\\/state>");
+            std::smatch matched_pattern;
+            std::regex_search(m.second, matched_pattern, COMPOSING_REGEX);
+            bool isComposing {false};
+            if (matched_pattern.ready() && !matched_pattern.empty() && matched_pattern[1].matched) {
+                isComposing = matched_pattern[1] == "active";
+            }
+            static const std::regex CONVID_REGEX("<conversation>\\s*(\\w+)\\s*<\\/conversation>");
+            std::regex_search(m.second, matched_pattern, CONVID_REGEX);
+            std::string conversationId = "";
+            if (matched_pattern.ready() && !matched_pattern.empty() && matched_pattern[1].matched) {
+                conversationId = matched_pattern[1];
+            }
+            if (!conversationId.empty()) {
+                if (auto* cm = convModule(true)) {
+                    if (auto typer = cm->getTypers(conversationId)) {
+                        if (isComposing)
+                            typer->addTyper(from);
+                        else
+                            typer->removeTyper(from);
+                    }
+                }
+            }
+            return true;
+        } catch (const std::exception& e) {
+            JAMI_WARNING("Error parsing composing state: {}", e.what());
+        }
+    } else if (m.first == MIME_TYPE_IMDN) {
+        try {
+            static const std::regex IMDN_MSG_ID_REGEX("<message-id>\\s*(\\w+)\\s*<\\/message-id>");
+            std::smatch matched_pattern;
+
+            std::regex_search(m.second, matched_pattern, IMDN_MSG_ID_REGEX);
+            std::string messageId;
+            if (matched_pattern.ready() && !matched_pattern.empty() && matched_pattern[1].matched) {
+                messageId = matched_pattern[1];
+            } else {
+                JAMI_WARNING("Message displayed: unable to parse message ID");
+                return true;
+            }
+
+            static const std::regex STATUS_REGEX("<status>\\s*<(\\w+)\\/>\\s*<\\/status>");
+            std::regex_search(m.second, matched_pattern, STATUS_REGEX);
+            bool isDisplayed {false};
+            if (matched_pattern.ready() && !matched_pattern.empty() && matched_pattern[1].matched) {
+                isDisplayed = matched_pattern[1] == "displayed";
+            } else {
+                JAMI_WARNING("Message displayed: unable to parse status");
+                return true;
+            }
+
+            static const std::regex CONVID_REGEX("<conversation>\\s*(\\w+)\\s*<\\/conversation>");
+            std::regex_search(m.second, matched_pattern, CONVID_REGEX);
+            std::string conversationId = "";
+            if (matched_pattern.ready() && !matched_pattern.empty() && matched_pattern[1].matched) {
+                conversationId = matched_pattern[1];
+            }
+
+            if (!isReadReceiptEnabled())
+                return true;
+            if (isDisplayed) {
+                if (convModule()->onMessageDisplayed(from, conversationId, messageId)) {
+                    JAMI_DEBUG("[message {}] Displayed by peer", messageId);
+                    emitSignal<libjami::ConfigurationSignal::AccountMessageStatusChanged>(
+                        accountID_,
+                        conversationId,
+                        from,
+                        messageId,
+                        static_cast<int>(libjami::Account::MessageStates::DISPLAYED));
+                }
+            }
+            return true;
+        } catch (const std::exception& e) {
+            JAMI_ERROR("Error parsing display notification: {}", e.what());
+        }
+    } else if (m.first == MIME_TYPE_PIDF) {
+        std::smatch matched_pattern;
+        static const std::regex BASIC_REGEX("<basic>([\\w\\s]+)<\\/basic>");
+        std::regex_search(m.second, matched_pattern, BASIC_REGEX);
+        std::string customStatus {};
+        if (matched_pattern.ready() && !matched_pattern.empty() && matched_pattern[1].matched) {
+            customStatus = matched_pattern[1];
+            emitSignal<libjami::PresenceSignal::NewBuddyNotification>(getAccountID(),
+                                                                      from,
+                                                                      static_cast<int>(PresenceState::CONNECTED),
+                                                                      customStatus);
+        } else {
+            JAMI_WARNING("Presence: unable to parse status");
+        }
+        return true;
+    }
+
+    return false;
+}
+
+void
+JamiAccount::callConnectionClosed(const DeviceId& deviceId, bool eraseDummy)
+{
+    std::function<void(const DeviceId&, bool)> cb;
+    {
+        std::lock_guard lk(onConnectionClosedMtx_);
+        auto it = onConnectionClosed_.find(deviceId);
+        if (it != onConnectionClosed_.end()) {
+            if (eraseDummy) {
+                cb = std::move(it->second);
+                onConnectionClosed_.erase(it);
+            } else {
+                // In this case a new subcall is created and the callback
+                // will be re-called once with eraseDummy = true
+                cb = it->second;
+            }
+        }
+    }
+    dht::ThreadPool::io().run([w = weak(), cb = std::move(cb), id = deviceId, erase = std::move(eraseDummy)] {
+        if (auto acc = w.lock()) {
+            if (cb)
+                cb(id, erase);
+        }
+    });
+}
+
+void
+JamiAccount::requestMessageConnection(const std::string& peerId,
+                                      const DeviceId& deviceId,
+                                      const std::string& connectionType)
+{
+    std::shared_lock lk(connManagerMtx_);
+    auto* handler = static_cast<MessageChannelHandler*>(channelHandlers_[Uri::Scheme::MESSAGE].get());
+    if (!handler)
+        return;
+    if (deviceId) {
+        if (auto connected = handler->getChannel(peerId, deviceId)) {
+            return;
+        }
+    } else {
+        auto connected = handler->getChannels(peerId);
+        if (!connected.empty()) {
+            return;
+        }
+    }
+    handler->connect(
+        deviceId,
+        "",
+        [w = weak(), peerId, transport = std::weak_ptr(connectionManager_)](
+            const std::shared_ptr<dhtnet::ChannelSocket>& socket, const DeviceId& deviceId) {
+            if (!socket) {
+                // The connection attempt did not publish a message. Its queued
+                // entries are still IDLE, but cached DHT presence may already
+                // say online and never produce another edge after reconnect.
+                // Wake the existing bounded message queue, not a new send.
+                auto timer = std::make_shared<asio::steady_timer>(
+                    *Manager::instance().ioContext(), std::chrono::seconds(1));
+                timer->async_wait([w, peerId, deviceId, transport, timer](const std::error_code& ec) {
+                    if (ec)
+                        return;
+                    auto acc = w.lock();
+                    auto owner = transport.lock();
+                    if (!acc || !owner || !acc->isUsable())
+                        return;
+                    {
+                        std::shared_lock lock(acc->connManagerMtx_);
+                        if (acc->connectionManager_ != owner)
+                            return;
+                    }
+                    // retrySend admits only IDLE entries and preserves their
+                    // tokens and MAX_RETRIES. Empty queues do not reconnect.
+                    acc->messageEngine_.onPeerOnline(peerId);
+                    acc->messageEngine_.onPeerOnline(peerId, deviceId.toString(), true);
+                });
+                return;
+            }
+            if (socket)
+                dht::ThreadPool::io().run([w, peerId, deviceId] {
+                    if (auto acc = w.lock()) {
+                        acc->messageEngine_.onPeerOnline(peerId);
+                        acc->messageEngine_.onPeerOnline(peerId, deviceId.toString(), true);
+                        if (!acc->presenceNote_.empty()) {
+                            // If a presence note is set, send it to this device.
+                            auto token = std::uniform_int_distribution<uint64_t> {1, JAMI_ID_MAX_VAL}(acc->rand);
+                            std::map<std::string, std::string> msg = {{MIME_TYPE_PIDF, getPIDF(acc->presenceNote_)}};
+                            acc->sendMessage(peerId, deviceId.toString(), msg, token, false, true);
+                        }
+                        acc->convModule()->syncConversations(peerId, deviceId.toString());
+                    }
+                });
+        },
+        connectionType);
+}
+
+void
+JamiAccount::requestSIPConnection(const std::string& peerId,
+                                  const DeviceId& deviceId,
+                                  const std::string& connectionType,
+                                  bool forceNewConnection,
+                                  const std::shared_ptr<SIPCall>& pc)
+{
+    JAMI_LOG("[Account {}] Request SIP connection to peer {} on device {}", getAccountID(), peerId, deviceId);
+
+    // If a connection already exists or is in progress, no need to do this
+    std::lock_guard lk(sipConnsMtx_);
+    auto id = std::make_pair(peerId, deviceId);
+
+    if (sipConns_.find(id) != sipConns_.end()) {
+        JAMI_LOG("[Account {}] A SIP connection with {} already exists", getAccountID(), deviceId);
+        return;
+    }
+    // If not present, create it
+    std::shared_lock lkCM(connManagerMtx_);
+    if (!connectionManager_)
+        return;
+    // Note, Even if we send 50 "sip" request, the connectionManager_ will only use one socket.
+    // however, this will still ask for multiple channels, so only ask
+    // if there is no pending request
+    if (!forceNewConnection && connectionManager_->isConnecting(deviceId, "sip")) {
+        JAMI_LOG("[Account {}] Already connecting to {}", getAccountID(), deviceId);
+        return;
+    }
+    JAMI_LOG("[Account {}] Ask {} for a new SIP channel", getAccountID(), deviceId);
+    dhtnet::ConnectDeviceOptions options;
+    options.noNewSocket = false;
+    options.forceNewSocket = forceNewConnection;
+    options.connType = connectionType;
+    options.channelTimeout = 3s;
+    options.uniqueName = true;
+    connectionManager_->connectDevice(
+        deviceId,
+        "sip",
+        [w = weak(), id = std::move(id), pc = std::move(pc)](const std::shared_ptr<dhtnet::ChannelSocket>& socket,
+                                                             const DeviceId&) {
+            if (socket)
+                return;
+            auto shared = w.lock();
+            if (!shared)
+                return;
+            // If this is triggered, this means that the
+            // connectDevice didn't get any response from the DHT.
+            // Stop searching pending call.
+            shared->callConnectionClosed(id.second, true);
+            if (pc)
+                pc->onFailure(PJSIP_SC_TEMPORARILY_UNAVAILABLE);
+        },
+        options);
+}
+
+bool
+JamiAccount::isConnectedWith(const DeviceId& deviceId) const
+{
+    std::shared_lock lkCM(connManagerMtx_);
+    if (connectionManager_)
+        return connectionManager_->isConnected(deviceId);
+    return false;
+}
+
+void
+JamiAccount::sendPresenceNote(const std::string& note)
+{
+    if (const auto* info = accountManager_->getInfo()) {
+        if (!info || !info->contacts)
+            return;
+        presenceNote_ = note;
+        auto contacts = info->contacts->getContacts();
+        std::vector<std::pair<std::string, DeviceId>> keys;
+        {
+            std::shared_lock lkCM(connManagerMtx_);
+            auto* handler = static_cast<MessageChannelHandler*>(channelHandlers_[Uri::Scheme::MESSAGE].get());
+            if (!handler)
+                return;
+            for (const auto& contact : contacts) {
+                auto peerId = contact.first.toString();
+                auto channels = handler->getChannels(peerId);
+                for (const auto& channel : channels) {
+                    keys.emplace_back(peerId, channel->deviceId());
+                }
+            }
+        }
+        auto token = std::uniform_int_distribution<uint64_t> {1, JAMI_ID_MAX_VAL}(rand);
+        std::map<std::string, std::string> msg = {{MIME_TYPE_PIDF, getPIDF(presenceNote_)}};
+        for (auto& key : keys) {
+            sendMessage(key.first, key.second.toString(), msg, token, false, true);
+        }
+    }
+}
+
+void
+JamiAccount::sendProfile(const std::string& convId, const std::string& peerUri, const std::string& deviceId)
+{
+    auto accProfilePath = profilePath();
+    if (not std::filesystem::is_regular_file(accProfilePath))
+        return;
+    auto currentSha3 = fileutils::sha3File(accProfilePath);
+    // VCard sync for peerUri
+    if (not needToSendProfile(peerUri, deviceId, currentSha3)) {
+        JAMI_DEBUG("[Account {}] [device {}] Peer {} already got an up-to-date vCard",
+                   getAccountID(),
+                   deviceId,
+                   peerUri);
+        return;
+    }
+    // We need a new channel
+    transferFile(convId,
+                 accProfilePath.string(),
+                 deviceId,
+                 "profile.vcf",
+                 "",
+                 0,
+                 0,
+                 currentSha3,
+                 fileutils::lastWriteTimeInSeconds(accProfilePath),
+                 [accId = getAccountID(), peerUri, deviceId]() {
+                     // Mark the VCard as sent
+                     auto sendDir = fileutils::get_cache_dir() / accId / "vcard" / peerUri;
+                     auto path = sendDir / deviceId;
+                     dhtnet::fileutils::recursive_mkdir(sendDir);
+                     std::lock_guard lock(dhtnet::fileutils::getFileLock(path));
+                     if (std::filesystem::is_regular_file(path))
+                         return;
+                     std::ofstream p(path);
+                 });
+}
+
+bool
+JamiAccount::needToSendProfile(const std::string& peerUri, const std::string& deviceId, const std::string& sha3Sum)
+{
+    std::string previousSha3 {};
+    auto vCardPath = cachePath_ / "vcard";
+    auto sha3Path = vCardPath / "sha3";
+    dhtnet::fileutils::check_dir(vCardPath, 0700);
+    try {
+        previousSha3 = fileutils::loadTextFile(sha3Path);
+    } catch (...) {
+        fileutils::saveFile(sha3Path, (const uint8_t*) sha3Sum.data(), sha3Sum.size(), 0600);
+        return true;
+    }
+    if (sha3Sum != previousSha3) {
+        // Incorrect sha3 stored. Update it
+        dhtnet::fileutils::removeAll(vCardPath, true);
+        dhtnet::fileutils::check_dir(vCardPath, 0700);
+        fileutils::saveFile(sha3Path, (const uint8_t*) sha3Sum.data(), sha3Sum.size(), 0600);
+        return true;
+    }
+    auto peerPath = vCardPath / peerUri;
+    dhtnet::fileutils::recursive_mkdir(peerPath);
+    return not std::filesystem::is_regular_file(peerPath / deviceId);
+}
+
+void
+JamiAccount::clearProfileCache(const std::string& peerUri)
+{
+    std::error_code ec;
+    std::filesystem::remove_all(cachePath_ / "vcard" / peerUri, ec);
+}
+
+std::filesystem::path
+JamiAccount::profilePath() const
+{
+    return idPath_ / "profile.vcf";
+}
+
+void
+JamiAccount::cacheSIPConnection(std::shared_ptr<dhtnet::ChannelSocket>&& socket,
+                                const std::string& peerId,
+                                const DeviceId& deviceId)
+{
+    std::unique_lock lk(sipConnsMtx_);
+    // Verify that the connection is not already cached
+    SipConnectionKey key(peerId, deviceId);
+    auto& connections = sipConns_[key];
+    auto conn = std::find_if(connections.begin(), connections.end(), [&](const auto& v) { return v.channel == socket; });
+    if (conn != connections.end()) {
+        JAMI_WARNING("[Account {}] Channel socket already cached with this peer", getAccountID());
+        return;
+    }
+
+    // Convert to SIP transport
+    auto onShutdown = [w = weak(), peerId, key, socket]() {
+        dht::ThreadPool::io().run([w = std::move(w), peerId, key, socket] {
+            auto shared = w.lock();
+            if (!shared)
+                return;
+            shared->shutdownSIPConnection(socket, key.first, key.second);
+            // The connection can be closed during the SIP initialization, so
+            // if this happens, the request should be re-sent to ask for a new
+            // SIP channel to make the call pass through
+            shared->callConnectionClosed(key.second, false);
+        });
+    };
+    auto sip_tr = link_.sipTransportBroker->getChanneledTransport(shared(), socket, std::move(onShutdown));
+    if (!sip_tr) {
+        JAMI_ERROR("No channeled transport found");
+        return;
+    }
+    // Store the connection
+    connections.emplace_back(SipConnection {sip_tr, socket});
+    JAMI_WARNING("[Account {:s}] [device {}] New SIP channel opened", getAccountID(), deviceId);
+    lk.unlock();
+
+    // Retry messages
+    messageEngine_.onPeerOnline(peerId);
+    messageEngine_.onPeerOnline(peerId, deviceId.toString(), true);
+
+    // Connect pending calls
+    forEachPendingCall(deviceId, [&](const auto& pc) {
+        if (pc->getConnectionState() != Call::ConnectionState::TRYING
+            and pc->getConnectionState() != Call::ConnectionState::PROGRESSING)
+            return;
+        pc->setSipTransport(sip_tr, getContactHeader(sip_tr));
+        pc->setState(Call::ConnectionState::PROGRESSING);
+        if (auto remote_address = socket->getRemoteAddress()) {
+            try {
+                onConnectedOutgoingCall(pc, peerId, remote_address);
+            } catch (const VoipLinkException&) {
+                // In this case, the main scenario is that SIPStartCall failed because
+                // the ICE is dead and the TLS session didn't send any packet on that dead
+                // link (connectivity change, killed by the os, etc)
+                // Here, we don't need to do anything, the TLS will fail and will delete
+                // the cached transport
+            }
+        }
+    });
+}
+
+void
+JamiAccount::shutdownSIPConnection(const std::shared_ptr<dhtnet::ChannelSocket>& channel,
+                                   const std::string& peerId,
+                                   const DeviceId& deviceId)
+{
+    std::unique_lock lk(sipConnsMtx_);
+    SipConnectionKey key(peerId, deviceId);
+    auto it = sipConns_.find(key);
+    if (it != sipConns_.end()) {
+        auto& conns = it->second;
+        conns.erase(std::remove_if(conns.begin(), conns.end(), [&](auto v) { return v.channel == channel; }),
+                    conns.end());
+        if (conns.empty()) {
+            sipConns_.erase(it);
+        }
+    }
+    lk.unlock();
+    // Shutdown after removal to let the callbacks do stuff if needed
+    if (channel)
+        channel->shutdown();
+}
+
+std::string_view
+JamiAccount::currentDeviceId() const
+{
+    if (!accountManager_ or not accountManager_->getInfo())
+        return {};
+    return accountManager_->getInfo()->deviceId;
+}
+
+std::shared_ptr<TransferManager>
+JamiAccount::dataTransfer(const std::string& id)
+{
+    if (id.empty())
+        return nonSwarmTransferManager_;
+    if (auto* cm = convModule())
+        return cm->dataTransfer(id);
+    return {};
+}
+
+void
+JamiAccount::monitor()
+{
+    JAMI_DEBUG("[Account {:s}] Monitor connections", getAccountID());
+    JAMI_DEBUG("[Account {:s}] Using proxy: {:s}", getAccountID(), proxyServerCached_);
+
+    if (auto* cm = convModule())
+        cm->monitor();
+    std::shared_lock lkCM(connManagerMtx_);
+    if (connectionManager_)
+        connectionManager_->monitor();
+}
+
+std::vector<std::map<std::string, std::string>>
+JamiAccount::getConnectionList(const std::string& conversationId)
+{
+    std::shared_lock lkCM(connManagerMtx_);
+    if (connectionManager_ && conversationId.empty()) {
+        return connectionManager_->getConnectionList();
+    } else if (connectionManager_ && convModule_) {
+        std::vector<std::map<std::string, std::string>> connectionList;
+        if (auto conv = convModule_->getConversation(conversationId)) {
+            for (const auto& deviceId : conv->getDeviceIdList()) {
+                auto connections = connectionManager_->getConnectionList(deviceId);
+                connectionList.reserve(connectionList.size() + connections.size());
+                std::move(connections.begin(), connections.end(), std::back_inserter(connectionList));
+            }
+        }
+        return connectionList;
+    } else {
+        return {};
+    }
+}
+
+std::vector<std::map<std::string, std::string>>
+JamiAccount::getConversationConnectivity(const std::string& conversationId)
+{
+    std::shared_lock lkCM(connManagerMtx_);
+    if (convModule_) {
+        if (auto conv = convModule_->getConversation(conversationId)) {
+            return conv->getConnectivity();
+        }
+    }
+    return {};
+}
+
+std::vector<std::map<std::string, std::string>>
+JamiAccount::getConversationTrackedMembers(const std::string& conversationId)
+{
+    std::shared_lock lkCM(connManagerMtx_);
+    if (convModule_) {
+        if (auto conv = convModule_->getConversation(conversationId)) {
+            return conv->getTrackedMembers();
+        }
+    }
+    return {};
+}
+
+std::vector<std::map<std::string, std::string>>
+JamiAccount::getChannelList(const std::string& connectionId)
+{
+    std::shared_lock lkCM(connManagerMtx_);
+    if (!connectionManager_)
+        return {};
+    return connectionManager_->getChannelList(connectionId);
+}
+
+std::string
+JamiAccount::sendFile(const std::string& conversationId,
+                      const std::filesystem::path& path,
+                      const std::string& name,
+                      const std::string& replyTo,
+                      const std::string& syblTopic,
+                      const std::string& syblRoom,
+                      const std::string& syblMedia,
+                      const std::string& operationId)
+{
+    std::error_code ec;
+    if (std::filesystem::symlink_status(path, ec).type()
+            != std::filesystem::file_type::regular || ec)
+        return "failed-before-commit";
+    const auto fileSize = std::filesystem::file_size(path, ec);
+    if (ec || fileSize == static_cast<decltype(fileSize)>(-1))
+        return "failed-before-commit";
+
+    dht::ThreadPool::computation().run(
+        [w = weak(), conversationId, path, name, fileSize, replyTo,
+         syblTopic, syblRoom, syblMedia, operationId]() {
+        if (auto shared = w.lock()) {
+            const auto accId = shared->getAccountID();
+            try {
+                const auto tid = jami::generateUID(shared->rand);
+                const auto displayName = name.empty() ? path.filename().string() : name;
+                const auto hash = fileutils::sha3File(path);
+                if (hash.empty()) {
+                    if (!operationId.empty())
+                        emitSignal<libjami::ConversationSignal::SybLMessageCompleted>(
+                            accId, conversationId, operationId, std::string {});
+                    return;
+                }
+                auto message = CommitMessage::fileSent(
+                    displayName, hash, tid, fileSize, replyTo, syblTopic);
+                message.syblRoom = syblRoom;
+                message.syblMedia = syblMedia;
+                message.syblOperation = operationId;
+                shared->convModule()->createCommit(conversationId, std::move(message), true,
+                    [w, accId, conversationId, tid, displayName, path, fileSize, hash, operationId]
+                    (const std::string& commitId) {
+                        // A commit is already durable even when seed setup fails.
+                        if (!operationId.empty())
+                            emitSignal<libjami::ConversationSignal::SybLMessageCompleted>(
+                                accId, conversationId, operationId, commitId);
+                        if (commitId.empty()) return;
+                        const auto fileId = getFileId(commitId, std::to_string(tid), displayName);
+                        bool ready = false;
+                        if (auto owner = w.lock()) {
+                            if (auto transfer = owner->dataTransfer(conversationId)) {
+                                ready = transfer->recordCompleted(fileId, commitId, path.string(),
+                                                                  int64_t(fileSize), hash);
+                            }
+                        }
+                        if (!operationId.empty())
+                            emitSignal<libjami::ConversationSignal::SybLFileSeedReady>(
+                                accId, conversationId, operationId, commitId, fileId, ready);
+                        // Legacy clients also receive created only for a validated,
+                        // independent seed. Failure retains their staging source.
+                        emitSignal<libjami::DataTransferSignal::DataTransferEvent>(
+                            accId, conversationId, commitId, path.string(),
+                            uint32_t(ready ? libjami::DataTransferEventCode::created
+                                           : libjami::DataTransferEventCode::invalid));
+                    });
+            } catch (...) {
+                if (!operationId.empty())
+                    emitSignal<libjami::ConversationSignal::SybLMessageCompleted>(
+                        accId, conversationId, operationId, std::string {});
+            }
+        }
+    });
+    return "pending";
+}
+void
+JamiAccount::transferFile(const std::string& conversationId,
+                          const std::string& path,
+                          const std::string& deviceId,
+                          const std::string& fileId,
+                          const std::string& interactionId,
+                          size_t start,
+                          size_t end,
+                          const std::string& sha3Sum,
+                          uint64_t lastWriteTime,
+                          std::function<void()> onFinished)
+{
+    std::string modified;
+    if (lastWriteTime != 0) {
+        modified = fmt::format("&modified={}", lastWriteTime);
+    }
+    auto fid = fileId == "profile.vcf" ? fmt::format("profile.vcf?sha3={}{}", sha3Sum, modified) : fileId;
+    auto channelName = conversationId.empty()
+                           ? fmt::format("{}profile.vcf?sha3={}{}", DATA_TRANSFER_SCHEME, sha3Sum, modified)
+                           : fmt::format("{}{}/{}/{}", DATA_TRANSFER_SCHEME, conversationId, currentDeviceId(), fid);
+    std::shared_lock lkCM(connManagerMtx_);
+    if (!connectionManager_)
+        return;
+    connectionManager_->connectDevice(
+        DeviceId(deviceId),
+        channelName,
+        [this,
+         conversationId,
+         path = std::move(path),
+         fileId,
+         interactionId,
+         start,
+         end,
+         onFinished = std::move(onFinished)](std::shared_ptr<dhtnet::ChannelSocket> socket, const DeviceId&) {
+            if (!socket)
+                return;
+            dht::ThreadPool::io().run([w = weak(),
+                                       path = std::move(path),
+                                       socket = std::move(socket),
+                                       conversationId = std::move(conversationId),
+                                       fileId,
+                                       interactionId,
+                                       start,
+                                       end,
+                                       onFinished = std::move(onFinished)] {
+                if (auto shared = w.lock())
+                    if (auto dt = shared->dataTransfer(conversationId))
+                        dt->transferFile(socket, fileId, interactionId, path, start, end, std::move(onFinished));
+            });
+        });
+}
+
+void
+JamiAccount::askForFileChannel(const std::string& conversationId,
+                               const std::string& deviceId,
+                               const std::string& interactionId,
+                               const std::string& fileId,
+                               size_t start,
+                               size_t end, const std::string& expectedAttempt)
+{
+    const auto transfer = dataTransfer(conversationId);
+    if (!transfer) return;
+    const auto attempt = interactionId.empty() ? std::string{} : transfer->waitingAttempt(fileId);
+    if (!interactionId.empty() && attempt.empty()) return;
+    if (!expectedAttempt.empty() && attempt != expectedAttempt) return;
+    const auto manager = std::weak_ptr<TransferManager>(transfer);
+    // A peer may observe the durable Git commit before the verified seed has
+    // finished publishing. Retry only this receive admission, with a finite
+    // backoff shared by all responding devices. Cancellation/replacement makes
+    // the queued callback inert; no message is republished.
+    auto retry = [w = weak(), manager, conversationId, deviceId, interactionId,
+                  fileId, start, end, attempt] {
+        auto transfer = manager.lock();
+        if (!transfer || interactionId.empty()) return;
+        const auto delay = transfer->reserveChannelRetry(fileId, attempt);
+        if (!delay) return;
+        auto timer = std::make_shared<asio::steady_timer>(*Manager::instance().ioContext());
+        timer->expires_after(std::chrono::milliseconds(delay));
+        timer->async_wait([w, manager, timer, conversationId, deviceId, interactionId,
+                           fileId, start, end, attempt](const std::error_code& error) {
+            if (error) return;
+            dht::ThreadPool::io().run([w, manager, conversationId, deviceId, interactionId,
+                                     fileId, start, end, attempt] {
+                auto account = w.lock();
+                auto transfer = manager.lock();
+                if (account && transfer && transfer->consumeChannelRetry(fileId, attempt))
+                    account->askForFileChannel(conversationId, deviceId, interactionId,
+                                               fileId, start, end, attempt);
+            });
+        });
+    };
+    auto tryDevice = [=](const auto& did) {
+        std::shared_lock lkCM(connManagerMtx_);
+        if (!connectionManager_)
+            return;
+
+        auto channelName = fmt::format("{}{}/{}/{}", DATA_TRANSFER_SCHEME, conversationId, currentDeviceId(), fileId);
+        if (start != 0 || end != 0) {
+            channelName += fmt::format("?start={}&end={}", start, end);
+        }
+        // We can avoid to negotiate new sessions, as the file notif
+        // probably came from an online device or last connected device.
+        connectionManager_->connectDevice(
+            did,
+            channelName,
+            [manager, retry,
+             attempt,
+             fileId,
+             interactionId,
+             start](const std::shared_ptr<dhtnet::ChannelSocket>& channel, const DeviceId&) {
+                if (!channel) {
+                    retry();
+                    return;
+                }
+                dht::ThreadPool::io().run([manager, attempt, channel, fileId, interactionId, start] {
+                    auto dt = manager.lock();
+                    if (!dt) {
+                        channel->shutdown();
+                        return;
+                    }
+                    if (interactionId.empty())
+                        dt->onIncomingProfile(channel);
+                    else
+                        dt->onIncomingFileTransfer(fileId, channel, start, attempt);
+                });
+            },
+            false);
+    };
+
+    if (!deviceId.empty()) {
+        // Only ask for device
+        tryDevice(DeviceId(deviceId));
+    } else {
+        // Only ask for connected devices. For others we will attempt
+        // with new peer online
+        for (const auto& m : convModule()->getConversationMembers(conversationId)) {
+            accountManager_->forEachDevice(dht::InfoHash(m.at("uri")),
+                                           [tryDevice](const std::shared_ptr<dht::crypto::PublicKey>& dev) {
+                                               tryDevice(dev->getLongId());
+                                           });
+        }
+    }
+}
+
+void
+JamiAccount::askForProfile(const std::string& conversationId, const std::string& deviceId, const std::string& memberUri)
+{
+    std::shared_lock lkCM(connManagerMtx_);
+    if (!connectionManager_)
+        return;
+
+    auto channelName = fmt::format("{}{}/profile/{}.vcf", DATA_TRANSFER_SCHEME, conversationId, memberUri);
+    // We can avoid to negotiate new sessions, as the file notif
+    // probably came from an online device or last connected device.
+    connectionManager_->connectDevice(
+        DeviceId(deviceId),
+        channelName,
+        [this, conversationId](const std::shared_ptr<dhtnet::ChannelSocket>& channel, const DeviceId&) {
+            if (!channel)
+                return;
+            dht::ThreadPool::io().run([w = weak(), conversationId, channel] {
+                if (auto shared = w.lock())
+                    if (auto dt = shared->dataTransfer(conversationId))
+                        dt->onIncomingProfile(channel);
+            });
+        },
+        false);
+}
+
+void
+JamiAccount::onPeerConnected(const std::string& peerId, bool connected)
+{
+    auto isOnline = presenceManager_ && presenceManager_->isOnline(peerId);
+    auto newState = connected ? PresenceState::CONNECTED
+                              : (isOnline ? PresenceState::AVAILABLE : PresenceState::DISCONNECTED);
+
+    runOnMainThread([w = weak(), peerId, newState] {
+        if (auto sthis = w.lock()) {
+            std::lock_guard lock(sthis->presenceStateMtx_);
+            auto& state = sthis->presenceState_[peerId];
+            if (state != newState) {
+                state = newState;
+                emitSignal<libjami::PresenceSignal::NewBuddyNotification>(sthis->getAccountID(),
+                                                                          peerId,
+                                                                          static_cast<int>(newState),
+                                                                          "");
+            }
+        }
+    });
+}
+
+void
+JamiAccount::initConnectionManager()
+{
+    if (!nonSwarmTransferManager_)
+        nonSwarmTransferManager_ = std::make_shared<TransferManager>(accountID_,
+                                                                     config().username,
+                                                                     "",
+                                                                     dht::crypto::getDerivedRandomEngine(rand));
+    if (!connectionManager_) {
+        auto connectionManagerConfig = std::make_shared<dhtnet::ConnectionManager::Config>();
+        connectionManagerConfig->ioContext = Manager::instance().ioContext();
+        connectionManagerConfig->dht = dht();
+        connectionManagerConfig->certStore = certStore_;
+        connectionManagerConfig->id = identity();
+        connectionManagerConfig->upnpCtrl = upnpCtrl_;
+        connectionManagerConfig->turnServer = config().turnServer;
+        connectionManagerConfig->upnpEnabled = config().upnpEnabled;
+        connectionManagerConfig->turnServerUserName = config().turnServerUserName;
+        connectionManagerConfig->turnServerPwd = config().turnServerPwd;
+        connectionManagerConfig->turnServerRealm = config().turnServerRealm;
+        connectionManagerConfig->turnEnabled = config().turnEnabled;
+        connectionManagerConfig->cachePath = cachePath_;
+        if (Manager::instance().dhtnetLogLevel > 0) {
+            connectionManagerConfig->logger = logger_;
+        }
+        connectionManagerConfig->factory = Manager::instance().getIceTransportFactory();
+        connectionManagerConfig->turnCache = turnCache_;
+        connectionManagerConfig->rng = std::make_unique<std::mt19937_64>(dht::crypto::getDerivedRandomEngine(rand));
+        connectionManagerConfig->legacyMode = dhtnet::LegacyMode::Disabled;
+        connectionManager_ = std::shared_ptr<dhtnet::ConnectionManager>(
+            new dhtnet::ConnectionManager(connectionManagerConfig),
+            [](dhtnet::ConnectionManager* manager) {
+                dht::ThreadPool::io().run(
+                    [owned = std::shared_ptr<dhtnet::ConnectionManager>(manager)] {});
+            });
+        channelHandlers_[Uri::Scheme::SWARM] = std::make_unique<SwarmChannelHandler>(shared(),
+                                                                                     *connectionManager_.get());
+        channelHandlers_[Uri::Scheme::GIT] = std::make_unique<ConversationChannelHandler>(shared(),
+                                                                                          *connectionManager_.get());
+        if (jami::Manager::instance().syncOnRegister) {
+            channelHandlers_[Uri::Scheme::SYNC] = std::make_unique<SyncChannelHandler>(shared(),
+                                                                                       *connectionManager_.get());
+        }
+        channelHandlers_[Uri::Scheme::DATA_TRANSFER]
+            = std::make_unique<TransferChannelHandler>(shared(), *connectionManager_.get());
+        channelHandlers_[Uri::Scheme::MESSAGE] = std::make_unique<MessageChannelHandler>(
+            *connectionManager_.get(),
+            [this](const auto& cert, std::string& type, const std::string& content) {
+                onTextMessage("", cert->issuer->getId().toString(), cert, {{type, content}});
+            },
+            [w = weak()](const std::string& peer, bool connected) {
+                asio::post(*Manager::instance().ioContext(), [w, peer, connected] {
+                    if (auto acc = w.lock())
+                        acc->onPeerConnected(peer, connected);
+                });
+            });
+        channelHandlers_[Uri::Scheme::AUTH] = std::make_unique<AuthChannelHandler>(shared(), *connectionManager_.get());
+
+        if (!serviceManager_)
+            serviceManager_ = std::make_unique<ServiceManager>(idPath_);
+        channelHandlers_[Uri::Scheme::SVC_DISCOVERY]
+            = std::make_unique<SvcDiscoveryChannelHandler>(shared(), *connectionManager_.get(), cachePath_);
+        static_cast<SvcDiscoveryChannelHandler*>(channelHandlers_[Uri::Scheme::SVC_DISCOVERY].get())
+            ->onCacheUpdated([w = weak()](const std::string& peerUri,
+                                          const DeviceId& deviceId,
+                                          const std::vector<svc_protocol::SvcInfo>&) {
+                auto self = w.lock();
+                if (!self)
+                    return;
+                // Re-publish the peer's full service list. The device that just
+                // answered is flagged available immediately, even if its DHT
+                // presence announcement has not yet been observed. A cache
+                // update is always published, even when the peer's last service
+                // was removed (empty list), so listeners can clear it.
+                auto servicesJson = self->buildPeerServicesJson(peerUri, &deviceId);
+                emitSignal<libjami::ServiceSignal::PeerServicesReceived>(
+                    0u,
+                    self->getAccountID(),
+                    peerUri,
+                    static_cast<int>(libjami::ServiceSignal::PeerServicesStatus::OK),
+                    servicesJson.empty() ? "[]" : servicesJson);
+            });
+        serviceManager_->setOnChanged([w = weak()]() {
+            auto self = w.lock();
+            if (!self)
+                return;
+            runOnMainThread([w]() {
+                auto self = w.lock();
+                if (!self)
+                    return;
+                std::shared_lock lk(self->connManagerMtx_);
+                auto it = self->channelHandlers_.find(Uri::Scheme::SVC_DISCOVERY);
+                if (it != self->channelHandlers_.end() && it->second)
+                    static_cast<SvcDiscoveryChannelHandler*>(it->second.get())->broadcastServiceUpdate();
+            });
+        });
+        channelHandlers_[Uri::Scheme::SVC_TUNNEL]
+            = std::make_unique<SvcTunnelChannelHandler>(shared(),
+                                                        *connectionManager_.get(),
+                                                        Manager::instance().ioContext());
+
+#if TARGET_OS_IOS
+        connectionManager_->oniOSConnected([&](const std::string& connType, dht::InfoHash peer_h) {
+            if ((connType == "videoCall" || connType == "audioCall") && jami::Manager::instance().isIOSExtension) {
+                bool hasVideo = connType == "videoCall";
+                emitSignal<libjami::ConversationSignal::CallConnectionRequest>("", peer_h.toString(), hasVideo);
+                return true;
+            }
+            return false;
+        });
+#endif
+    }
+}
+
+void
+JamiAccount::updateUpnpController()
+{
+    Account::updateUpnpController();
+    if (connectionManager_) {
+        auto config = connectionManager_->getConfig();
+        if (config)
+            config->upnpCtrl = upnpCtrl_;
+    }
+}
+
+} // namespace jami

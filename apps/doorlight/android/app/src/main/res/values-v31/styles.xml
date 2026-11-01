@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="LaunchTheme" parent="Theme.AppCompat.DayNight.NoActionBar">
+        <item name="android:windowBackground">@drawable/launch_background</item>
+        <item name="android:windowSplashScreenBackground">@color/doorlight_icon_background</item>
+        <item name="android:windowSplashScreenAnimatedIcon">@drawable/doorlight_foreground</item>
+    </style>
+</resources>

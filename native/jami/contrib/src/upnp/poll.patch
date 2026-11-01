@@ -1,0 +1,709 @@
+From 8e38d5b38936d1084b9a1c726aff381dec1fad30 Mon Sep 17 00:00:00 2001
+From: moc <marc-olivier.champagne@savoirfairelinux.com>
+Date: Wed, 21 Jan 2026 17:46:08 -0500
+Subject: [PATCH] upnp: adapt code to use poll() instead of select()
+
+select() has an upper-limit on file descriptor numbers it can
+monitor. This patch switches it out for poll() and makes the
+associated necessary changes.
+---
+ upnp/src/genlib/miniserver/miniserver.c  | 140 ++++++++++++---------
+ upnp/src/genlib/net/http/httpreadwrite.c |  89 +++++--------
+ upnp/src/genlib/net/sock.c               | 103 ++++++---------
+ upnp/src/ssdp/ssdp_ctrlpt.c              | 152 ++++++++---------------
+ 4 files changed, 208 insertions(+), 276 deletions(-)
+
+diff --git a/upnp/src/genlib/miniserver/miniserver.c b/upnp/src/genlib/miniserver/miniserver.c
+index c4c1a25b..e3fa7e34 100644
+--- a/upnp/src/genlib/miniserver/miniserver.c
++++ b/upnp/src/genlib/miniserver/miniserver.c
+@@ -60,6 +60,7 @@
+ 
+ 	#include <assert.h>
+ 	#include <errno.h>
++	#include <poll.h>
+ 	#include <stdio.h>
+ 	#include <stdlib.h>
+ 	#include <string.h>
+@@ -502,14 +503,19 @@ static UPNP_INLINE void schedule_request_job(
+ }
+ 	#endif
+ 
+-static UPNP_INLINE void fdset_if_valid(SOCKET sock, fd_set *set)
++static UPNP_INLINE void pollfd_if_valid(
++	SOCKET sock, struct pollfd *pfd, short events)
+ {
+ 	if (sock != INVALID_SOCKET) {
+-		FD_SET(sock, set);
++		pfd->fd = sock;
++		pfd->events = events;
++		pfd->revents = 0;
++	} else {
++		pfd->fd = -1;
+ 	}
+ }
+ 
+-static void web_server_accept(SOCKET lsock, fd_set *set)
++static void web_server_accept(SOCKET lsock, struct pollfd *pfd)
+ {
+ 	#ifdef INTERNAL_WEB_SERVER
+ 	SOCKET asock;
+@@ -517,10 +523,12 @@ static void web_server_accept(SOCKET lsock, fd_set *set)
+ 	struct sockaddr_storage clientAddr;
+ 	char errorBuffer[ERROR_BUFFER_LEN];
+ 
+-	if (lsock != INVALID_SOCKET && FD_ISSET(lsock, set)) {
++	if (lsock != INVALID_SOCKET && (pfd->revents & POLLIN)) {
++
+ 		clientLen = sizeof(clientAddr);
+ 		asock = accept(
+ 			lsock, (struct sockaddr *)&clientAddr, &clientLen);
++
+ 		if (asock == INVALID_SOCKET) {
+ 			strerror_r(errno, errorBuffer, ERROR_BUFFER_LEN);
+ 			UpnpPrintf(UPNP_INFO,
+@@ -537,9 +545,10 @@ static void web_server_accept(SOCKET lsock, fd_set *set)
+ 	#endif /* INTERNAL_WEB_SERVER */
+ }
+ 
+-static void ssdp_read(SOCKET *rsock, fd_set *set)
++static void ssdp_read(SOCKET *rsock, struct pollfd *pfd)
+ {
+-	if (*rsock != INVALID_SOCKET && FD_ISSET(*rsock, set)) {
++	if (*rsock != INVALID_SOCKET && (pfd->revents & POLLIN)) {
++
+ 		int ret = readFromSSDPSocket(*rsock);
+ 		if (ret != 0) {
+ 			UpnpPrintf(UPNP_INFO,
+@@ -555,7 +564,7 @@ static void ssdp_read(SOCKET *rsock, fd_set *set)
+ 	}
+ }
+ 
+-static int receive_from_stopSock(SOCKET ssock, fd_set *set)
++static int receive_from_stopSock(SOCKET ssock, struct pollfd *pfd)
+ {
+ 	ssize_t byteReceived;
+ 	socklen_t clientLen;
+@@ -563,21 +572,27 @@ static int receive_from_stopSock(SOCKET ssock, fd_set *set)
+ 	char requestBuf[256];
+ 	char buf_ntop[INET6_ADDRSTRLEN];
+ 
+-	if (FD_ISSET(ssock, set)) {
++	if (ssock != INVALID_SOCKET && (pfd->revents & POLLIN)) {
++
+ 		clientLen = sizeof(clientAddr);
+-		memset((char *)&clientAddr, 0, sizeof(clientAddr));
++		memset(&clientAddr, 0, sizeof(clientAddr));
++
+ 		byteReceived = recvfrom(ssock,
+ 			requestBuf,
+ 			(size_t)25,
+ 			0,
+ 			(struct sockaddr *)&clientAddr,
+ 			&clientLen);
++
+ 		if (byteReceived > 0) {
+ 			requestBuf[byteReceived] = '\0';
++
++			/* Convert IPv4 address to string */
+ 			inet_ntop(AF_INET,
+ 				&((struct sockaddr_in *)&clientAddr)->sin_addr,
+ 				buf_ntop,
+ 				sizeof(buf_ntop));
++
+ 			UpnpPrintf(UPNP_INFO,
+ 				MSERV,
+ 				__FILE__,
+@@ -585,15 +600,18 @@ static int receive_from_stopSock(SOCKET ssock, fd_set *set)
+ 				"Received response: %s From host %s \n",
+ 				requestBuf,
+ 				buf_ntop);
++
+ 			UpnpPrintf(UPNP_PACKET,
+ 				MSERV,
+ 				__FILE__,
+ 				__LINE__,
+ 				"Received multicast packet: \n %s\n",
+ 				requestBuf);
+-			if (NULL != strstr(requestBuf, "ShutDown")) {
++
++			if (strstr(requestBuf, "ShutDown") != NULL) {
+ 				return 1;
+ 			}
++
+ 		} else {
+ 			UpnpPrintf(UPNP_INFO,
+ 				MSERV,
+@@ -607,6 +625,7 @@ static int receive_from_stopSock(SOCKET ssock, fd_set *set)
+ 	return 0;
+ }
+ 
++	#define MINI_SERVER_MAX_PFDS 9
+ /*!
+  * \brief Run the miniserver.
+  *
+@@ -619,73 +638,79 @@ static void RunMiniServer(
+ 	MiniServerSockArray *miniSock)
+ {
+ 	char errorBuffer[ERROR_BUFFER_LEN];
+-	fd_set expSet;
+-	fd_set rdSet;
+-	SOCKET maxMiniSock;
+ 	int ret = 0;
+ 	int stopSock = 0;
+ 
+-	maxMiniSock = 0;
+-	maxMiniSock = max(maxMiniSock, miniSock->miniServerSock4);
+-	maxMiniSock = max(maxMiniSock, miniSock->miniServerSock6);
+-	maxMiniSock = max(maxMiniSock, miniSock->miniServerSock6UlaGua);
+-	maxMiniSock = max(maxMiniSock, miniSock->miniServerStopSock);
+-	maxMiniSock = max(maxMiniSock, miniSock->ssdpSock4);
+-	maxMiniSock = max(maxMiniSock, miniSock->ssdpSock6);
+-	maxMiniSock = max(maxMiniSock, miniSock->ssdpSock6UlaGua);
+-	#ifdef INCLUDE_CLIENT_APIS
+-	maxMiniSock = max(maxMiniSock, miniSock->ssdpReqSock4);
+-	maxMiniSock = max(maxMiniSock, miniSock->ssdpReqSock6);
+-	#endif /* INCLUDE_CLIENT_APIS */
+-	++maxMiniSock;
++	struct pollfd fds[MINI_SERVER_MAX_PFDS];
++	int nfds = 0;
+ 
+ 	gMServState = MSERV_RUNNING;
++
+ 	while (!stopSock) {
+-		FD_ZERO(&rdSet);
+-		FD_ZERO(&expSet);
+-		/* FD_SET()'s */
+-		FD_SET(miniSock->miniServerStopSock, &expSet);
+-		FD_SET(miniSock->miniServerStopSock, &rdSet);
+-		fdset_if_valid(miniSock->miniServerSock4, &rdSet);
+-		fdset_if_valid(miniSock->miniServerSock6, &rdSet);
+-		fdset_if_valid(miniSock->miniServerSock6UlaGua, &rdSet);
+-		fdset_if_valid(miniSock->ssdpSock4, &rdSet);
+-		fdset_if_valid(miniSock->ssdpSock6, &rdSet);
+-		fdset_if_valid(miniSock->ssdpSock6UlaGua, &rdSet);
++		nfds = 0;
++
++		/* Stop socket: watch for read + error */
++		pollfd_if_valid(miniSock->miniServerStopSock,
++			&fds[nfds++],
++			POLLIN | POLLERR | POLLHUP);
++
++		pollfd_if_valid(
++			miniSock->miniServerSock4, &fds[nfds++], POLLIN);
++
++		pollfd_if_valid(
++			miniSock->miniServerSock6, &fds[nfds++], POLLIN);
++
++		pollfd_if_valid(
++			miniSock->miniServerSock6UlaGua, &fds[nfds++], POLLIN);
++
++		pollfd_if_valid(miniSock->ssdpSock4, &fds[nfds++], POLLIN);
++
++		pollfd_if_valid(miniSock->ssdpSock6, &fds[nfds++], POLLIN);
++
++		pollfd_if_valid(
++			miniSock->ssdpSock6UlaGua, &fds[nfds++], POLLIN);
++
+ 	#ifdef INCLUDE_CLIENT_APIS
+-		fdset_if_valid(miniSock->ssdpReqSock4, &rdSet);
+-		fdset_if_valid(miniSock->ssdpReqSock6, &rdSet);
++		pollfd_if_valid(miniSock->ssdpReqSock4, &fds[nfds++], POLLIN);
++
++		pollfd_if_valid(miniSock->ssdpReqSock6, &fds[nfds++], POLLIN);
+ 	#endif /* INCLUDE_CLIENT_APIS */
+-		/* select() */
+-		ret = select((int)maxMiniSock, &rdSet, NULL, &expSet, NULL);
+-		if (ret == SOCKET_ERROR && errno == EINTR) {
++
++		/* poll() */
++		ret = poll(fds, nfds, -1);
++
++		if (ret < 0 && errno == EINTR) {
+ 			continue;
+ 		}
+-		if (ret == SOCKET_ERROR) {
++
++		if (ret < 0) {
+ 			strerror_r(errno, errorBuffer, ERROR_BUFFER_LEN);
+ 			UpnpPrintf(UPNP_CRITICAL,
+ 				SSDP,
+ 				__FILE__,
+ 				__LINE__,
+-				"Error in select(): %s\n",
++				"Error in poll(): %s\n",
+ 				errorBuffer);
+ 			continue;
+-		} else {
+-			web_server_accept(miniSock->miniServerSock4, &rdSet);
+-			web_server_accept(miniSock->miniServerSock6, &rdSet);
+-			web_server_accept(
+-				miniSock->miniServerSock6UlaGua, &rdSet);
++		}
++
++		web_server_accept(miniSock->miniServerSock4, &fds[1]);
++		web_server_accept(miniSock->miniServerSock6, &fds[2]);
++		web_server_accept(miniSock->miniServerSock6UlaGua, &fds[3]);
++
+ 	#ifdef INCLUDE_CLIENT_APIS
+-			ssdp_read(&miniSock->ssdpReqSock4, &rdSet);
+-			ssdp_read(&miniSock->ssdpReqSock6, &rdSet);
++		ssdp_read(&miniSock->ssdpReqSock4, &fds[7]);
++		ssdp_read(&miniSock->ssdpReqSock6, &fds[8]);
+ 	#endif /* INCLUDE_CLIENT_APIS */
+-			ssdp_read(&miniSock->ssdpSock4, &rdSet);
+-			ssdp_read(&miniSock->ssdpSock6, &rdSet);
+-			ssdp_read(&miniSock->ssdpSock6UlaGua, &rdSet);
+-			stopSock = receive_from_stopSock(
+-				miniSock->miniServerStopSock, &rdSet);
+-		}
++
++		ssdp_read(&miniSock->ssdpSock4, &fds[4]);
++		ssdp_read(&miniSock->ssdpSock6, &fds[5]);
++		ssdp_read(&miniSock->ssdpSock6UlaGua, &fds[6]);
++
++		stopSock = receive_from_stopSock(
++			miniSock->miniServerStopSock, &fds[0]);
+ 	}
++
+ 	/* Close all sockets. */
+ 	sock_close(miniSock->miniServerSock4);
+ 	sock_close(miniSock->miniServerSock6);
+@@ -698,6 +723,7 @@ static void RunMiniServer(
+ 	sock_close(miniSock->ssdpReqSock4);
+ 	sock_close(miniSock->ssdpReqSock6);
+ 	#endif /* INCLUDE_CLIENT_APIS */
++
+ 	/* Free minisock. */
+ 	free(miniSock);
+ 	gMServState = MSERV_IDLE;
+diff --git a/upnp/src/genlib/net/http/httpreadwrite.c b/upnp/src/genlib/net/http/httpreadwrite.c
+index 588d76d3..61240d3b 100644
+--- a/upnp/src/genlib/net/http/httpreadwrite.c
++++ b/upnp/src/genlib/net/http/httpreadwrite.c
+@@ -58,6 +58,7 @@
+ #include <assert.h>
+ #include <stdarg.h>
+ #include <string.h>
++#include <poll.h>
+ 
+ #include "posix_overwrites.h" // IWYU pragma: keep
+ 
+@@ -101,61 +102,39 @@ const int CHUNK_TAIL_SIZE = 10;
+  *
+  * \return 0 if successful, else -1.
+  */
+-static int Check_Connect_And_Wait_Connection(
+-	/*! [in] socket. */
+-	SOCKET sock,
+-	/*! [in] result of connect. */
+-	int connect_res)
+-{
+-	struct timeval tmvTimeout = {DEFAULT_TCP_CONNECT_TIMEOUT, 0};
+-	int result;
+-	#ifdef _WIN32
+-	struct fd_set fdSet;
+-	#else
+-	fd_set fdSet;
+-	#endif
+-	FD_ZERO(&fdSet);
+-	FD_SET(sock, &fdSet);
+-
+-	if (connect_res < 0) {
+-	#ifdef _WIN32
+-		if (WSAEWOULDBLOCK == WSAGetLastError()) {
+-	#else
+-		if (EINPROGRESS == errno) {
+-	#endif
+-			result = select(
+-				(int)sock + 1, NULL, &fdSet, NULL, &tmvTimeout);
+-			if (result < 0) {
+-	#ifdef _WIN32
+-					/* WSAGetLastError(); */
+-	#else
+-					/* errno */
+-	#endif
+-				return -1;
+-			} else if (result == 0) {
+-				/* timeout */
+-				return -1;
+-	#ifndef _WIN32
+-			} else {
+-				int valopt = 0;
+-				socklen_t len = sizeof(valopt);
+-				if (getsockopt(sock,
+-					    SOL_SOCKET,
+-					    SO_ERROR,
+-					    (void *)&valopt,
+-					    &len) < 0) {
+-					/* failed to read delayed error */
+-					return -1;
+-				} else if (valopt) {
+-					/* delayed error = valopt */
+-					return -1;
+-				}
+-	#endif
+-			}
+-		}
+-	}
+-
+-	return 0;
++static int Check_Connect_And_Wait_Connection(SOCKET sock, int connect_res) {
++    struct timeval tmvTimeout = {DEFAULT_TCP_CONNECT_TIMEOUT, 0};
++    int result;
++    struct pollfd fds[1];
++
++    fds[0].fd = sock;
++    fds[0].events = POLLOUT;
++
++    if (connect_res < 0) {
++        result = poll(fds, 1, tmvTimeout.tv_sec * 1000 + tmvTimeout.tv_usec / 1000);
++
++        if (result < 0) {
++            /* Error in poll */
++            return -1;
++        } else if (result == 0) {
++            /* Timeout */
++            return -1;
++        } else {
++            int valopt = 0;
++            socklen_t len = sizeof(valopt);
++
++            /* Check if the socket is now writable (connected) */
++            if (getsockopt(sock, SOL_SOCKET, SO_ERROR, (void *)&valopt, &len) < 0) {
++                /* Failed to read delayed error */
++                return -1;
++            } else if (valopt) {
++                /* Delayed error = valopt */
++                return -1;
++            }
++        }
++    }
++
++    return 0;
+ }
+ #endif /* UPNP_ENABLE_BLOCKING_TCP_CONNECTIONS */
+ 
+diff --git a/upnp/src/genlib/net/sock.c b/upnp/src/genlib/net/sock.c
+index 396c692a..b8a980f0 100644
+--- a/upnp/src/genlib/net/sock.c
++++ b/upnp/src/genlib/net/sock.c
+@@ -56,6 +56,7 @@
+ #include <fcntl.h> /* for F_GETFL, F_SETFL, O_NONBLOCK */
+ #include <string.h>
+ #include <time.h>
++#include <poll.h>
+ 
+ #ifdef UPNP_ENABLE_OPEN_SSL
+ 	#include <openssl/ssl.h>
+@@ -156,85 +157,59 @@ int sock_destroy(SOCKINFO *info, int ShutdownMethod)
+  *	\li \c UPNP_E_TIMEDOUT - Timeout
+  *	\li \c UPNP_E_SOCKET_ERROR - Error on socket calls
+  */
+-static int sock_read_write(
+-	/*! [in] Socket Information Object. */
+-	SOCKINFO *info,
+-	/*! [out] Buffer to get data to or send data from. */
+-	char *buffer,
+-	/*! [in] Size of the buffer. */
+-	size_t bufsize,
+-	/*! [in] timeout value. */
+-	int *timeoutSecs,
+-	/*! [in] Boolean value specifying read or write option. */
+-	int bRead)
+-{
+-	int retCode;
+-	fd_set readSet;
+-	fd_set writeSet;
+-	struct timeval timeout;
+-	long numBytes;
+-	time_t start_time = time(NULL);
+-	SOCKET sockfd = info->socket;
+-	long bytes_sent = 0;
+-	size_t byte_left = 0;
+-	ssize_t num_written;
+-
+-	FD_ZERO(&readSet);
+-	FD_ZERO(&writeSet);
+-	if (bRead)
+-		FD_SET(sockfd, &readSet);
+-	else
+-		FD_SET(sockfd, &writeSet);
+-	timeout.tv_sec = *timeoutSecs;
+-	timeout.tv_usec = 0;
+-	while (1) {
+-		if (*timeoutSecs < 0)
+-			retCode = select((int)sockfd + 1,
+-				&readSet,
+-				&writeSet,
+-				NULL,
+-				NULL);
+-		else
+-			retCode = select((int)sockfd + 1,
+-				&readSet,
+-				&writeSet,
+-				NULL,
+-				&timeout);
+-		if (retCode == 0)
+-			return UPNP_E_TIMEDOUT;
+-		if (retCode == -1) {
+-			if (errno == EINTR)
+-				continue;
+-			return UPNP_E_SOCKET_ERROR;
+-		} else
+-			/* read or write. */
+-			break;
+-	}
++static int sock_read_write(SOCKINFO *info, char *buffer, size_t bufsize, int *timeoutSecs, int bRead) {
++    int retCode;
++    struct pollfd fds[1];
++    time_t start_time = time(NULL);
++    SOCKET sockfd = info->socket;
++    long bytes_sent = 0;
++    size_t byte_left = 0;
++    ssize_t num_written;
++    long numBytes;
++
++    fds[0].fd = sockfd;
++    fds[0].events = (bRead ? POLLIN : POLLOUT);
++
++    while (1) {
++        int timeoutMillis = (*timeoutSecs < 0) ? -1 : (*timeoutSecs * 1000);
++
++        retCode = poll(fds, 1, timeoutMillis);
++
++        if (retCode == 0)
++            return UPNP_E_TIMEDOUT;
++        else if (retCode == -1) {
++            if (errno == EINTR)
++                continue;
++            return UPNP_E_SOCKET_ERROR;
++        } else
++            /* read or write. */
++            break;
++    }
++
+ #ifdef SO_NOSIGPIPE
+-	{
+-		int old;
+-		int set = 1;
+-		socklen_t olen = sizeof(old);
+-		getsockopt(sockfd, SOL_SOCKET, SO_NOSIGPIPE, &old, &olen);
+-		setsockopt(sockfd, SOL_SOCKET, SO_NOSIGPIPE, &set, sizeof(set));
++    {
++        int old;
++        int set = 1;
++        socklen_t olen = sizeof(old);
++        getsockopt(sockfd, SOL_SOCKET, SO_NOSIGPIPE, &old, &olen);
++        setsockopt(sockfd, SOL_SOCKET, SO_NOSIGPIPE, &set, sizeof(set));
+ #endif
+ 		if (bRead) {
+ #ifdef UPNP_ENABLE_OPEN_SSL
+ 			if (info->ssl) {
+ 				numBytes = (long)SSL_read(
+-					info->ssl, buffer, (size_t)bufsize);
++					info->ssl, buffer, bufsize);
+ 			} else {
+ #endif
+ 				/* read data. */
+-				numBytes = (long)recv(
+-					sockfd, buffer, bufsize, MSG_NOSIGNAL);
++				numBytes = (long)recv(sockfd, buffer, (int)bufsize, MSG_NOSIGNAL);
+ #ifdef UPNP_ENABLE_OPEN_SSL
+ 			}
+ #endif
+ 		} else {
+ 			byte_left = bufsize;
+ 			bytes_sent = 0;
+-			while (byte_left != (size_t)0) {
++			while (byte_left != 0) {
+ #ifdef UPNP_ENABLE_OPEN_SSL
+ 				if (info->ssl) {
+ 					num_written = SSL_write(info->ssl,
+diff --git a/upnp/src/ssdp/ssdp_ctrlpt.c b/upnp/src/ssdp/ssdp_ctrlpt.c
+index d6ccf349..cce2bf8a 100644
+--- a/upnp/src/ssdp/ssdp_ctrlpt.c
++++ b/upnp/src/ssdp/ssdp_ctrlpt.c
+@@ -40,6 +40,7 @@
+ #include "config.h"
+ 
+ #include "upnputil.h"
++#include <poll.h>
+ 
+ #ifdef INCLUDE_CLIENT_APIS
+ 	#if EXCLUDE_SSDP == 0
+@@ -588,7 +589,6 @@ int SearchByTarget(int Hnd, int Mx, char *St, void *Cookie)
+ 		#ifdef UPNP_ENABLE_IPV6
+ 	struct sockaddr_in6 *destAddr6 = (struct sockaddr_in6 *)&__ss_v6;
+ 		#endif
+-	fd_set wrSet;
+ 	SsdpSearchArg *newArg = NULL;
+ 	SsdpSearchExpArg *expArg = NULL;
+ 	int timeTillRead = 0;
+@@ -597,6 +597,7 @@ int SearchByTarget(int Hnd, int Mx, char *St, void *Cookie)
+ 	struct in_addr addrv4;
+ 	SOCKET max_fd = 0;
+ 	int retVal;
++	int numCopies;
+ 
+ 	/*ThreadData *ThData; */
+ 	ThreadPoolJob job;
+@@ -674,105 +675,56 @@ int SearchByTarget(int Hnd, int Mx, char *St, void *Cookie)
+ 	HandleUnlock(__FILE__, __LINE__);
+ 	/* End of lock */
+ 
+-	FD_ZERO(&wrSet);
+-	if (gSsdpReqSocket4 != INVALID_SOCKET) {
+-		setsockopt(gSsdpReqSocket4,
+-			IPPROTO_IP,
+-			IP_MULTICAST_IF,
+-			(char *)&addrv4,
+-			sizeof(addrv4));
+-		FD_SET(gSsdpReqSocket4, &wrSet);
+-		max_fd = max(max_fd, gSsdpReqSocket4);
+-	}
+-		#ifdef UPNP_ENABLE_IPV6
+-	if (gSsdpReqSocket6 != INVALID_SOCKET) {
+-		setsockopt(gSsdpReqSocket6,
+-			IPPROTO_IPV6,
+-			IPV6_MULTICAST_IF,
+-			(char *)&gIF_INDEX,
+-			sizeof(gIF_INDEX));
+-		FD_SET(gSsdpReqSocket6, &wrSet);
+-		max_fd = max(max_fd, gSsdpReqSocket6);
+-	}
+-		#endif
+-	ret = select((int)max_fd + 1, NULL, &wrSet, NULL, NULL);
+-	if (ret == -1) {
+-		strerror_r(errno, errorBuffer, ERROR_BUFFER_LEN);
+-		UpnpPrintf(UPNP_INFO,
+-			SSDP,
+-			__FILE__,
+-			__LINE__,
+-			"SSDP_LIB: Error in select(): %s\n",
+-			errorBuffer);
+-		UpnpCloseSocket(gSsdpReqSocket4);
+-		#ifdef UPNP_ENABLE_IPV6
+-		UpnpCloseSocket(gSsdpReqSocket6);
+-		#endif
+-		return UPNP_E_INTERNAL_ERROR;
+-	}
+-		#ifdef UPNP_ENABLE_IPV6
+-	if (gSsdpReqSocket6 != INVALID_SOCKET &&
+-		FD_ISSET(gSsdpReqSocket6, &wrSet)) {
+-		int NumCopy = 0;
+-
+-		while (NumCopy < NUM_SSDP_COPY) {
+-			UpnpPrintf(UPNP_INFO,
+-				SSDP,
+-				__FILE__,
+-				__LINE__,
+-				">>> SSDP SEND M-SEARCH >>>\n%s\n",
+-				ReqBufv6UlaGua);
+-			sendto(gSsdpReqSocket6,
+-				ReqBufv6UlaGua,
+-				strlen(ReqBufv6UlaGua),
+-				0,
+-				(struct sockaddr *)&__ss_v6,
+-				sizeof(struct sockaddr_in6));
+-			NumCopy++;
+-			imillisleep(SSDP_PAUSE);
+-		}
+-		NumCopy = 0;
+-		inet_pton(AF_INET6, SSDP_IPV6_LINKLOCAL, &destAddr6->sin6_addr);
+-		while (NumCopy < NUM_SSDP_COPY) {
+-			UpnpPrintf(UPNP_INFO,
+-				SSDP,
+-				__FILE__,
+-				__LINE__,
+-				">>> SSDP SEND M-SEARCH >>>\n%s\n",
+-				ReqBufv6);
+-			sendto(gSsdpReqSocket6,
+-				ReqBufv6,
+-				strlen(ReqBufv6),
+-				0,
+-				(struct sockaddr *)&__ss_v6,
+-				sizeof(struct sockaddr_in6));
+-			NumCopy++;
+-			imillisleep(SSDP_PAUSE);
+-		}
+-	}
+-		#endif /* IPv6 */
+-	if (gSsdpReqSocket4 != INVALID_SOCKET &&
+-		FD_ISSET(gSsdpReqSocket4, &wrSet)) {
+-		int NumCopy = 0;
+-		while (NumCopy < NUM_SSDP_COPY) {
+-			UpnpPrintf(UPNP_INFO,
+-				SSDP,
+-				__FILE__,
+-				__LINE__,
+-				">>> SSDP SEND M-SEARCH >>>\n%s\n",
+-				ReqBufv4);
+-			sendto(gSsdpReqSocket4,
+-				ReqBufv4,
+-				strlen(ReqBufv4),
+-				0,
+-				(struct sockaddr *)&__ss_v4,
+-				sizeof(struct sockaddr_in));
+-			NumCopy++;
+-			imillisleep(SSDP_PAUSE);
+-		}
+-	}
+-
+-	return 1;
++	struct pollfd fds[2];
++    int nfds = 0;
++
++    if (gSsdpReqSocket4 != INVALID_SOCKET) {
++        setsockopt(gSsdpReqSocket4, IPPROTO_IP, IP_MULTICAST_IF, (char *)&addrv4, sizeof(addrv4));
++        fds[nfds].fd = gSsdpReqSocket4;
++        fds[nfds].events = POLLOUT;
++        nfds++;
++    }
++#ifdef UPNP_ENABLE_IPV6
++    if (gSsdpReqSocket6 != INVALID_SOCKET) {
++        setsockopt(gSsdpReqSocket6, IPPROTO_IPV6, IPV6_MULTICAST_IF, (char *)&gIF_INDEX, sizeof(gIF_INDEX));
++        fds[nfds].fd = gSsdpReqSocket6;
++        fds[nfds].events = POLLOUT;
++        nfds++;
++    }
++#endif
++    ret = poll(fds, nfds, -1); // Wait indefinitely for the sockets to become writable
++    if (ret == -1) {
++        strerror_r(errno, errorBuffer, ERROR_BUFFER_LEN);
++        UpnpPrintf(UPNP_INFO, SSDP, __FILE__, __LINE__, "SSDP_LIB: Error in poll(): %s\n", errorBuffer);
++        UpnpCloseSocket(gSsdpReqSocket4);
++#ifdef UPNP_ENABLE_IPV6
++        UpnpCloseSocket(gSsdpReqSocket6);
++#endif
++        return UPNP_E_INTERNAL_ERROR;
++    }
++#ifdef UPNP_ENABLE_IPV6
++    if (gSsdpReqSocket6 != INVALID_SOCKET && (fds[nfds - 1].revents & POLLOUT)) {
++        for (numCopies = 0; numCopies < NUM_SSDP_COPY; numCopies++) {
++            UpnpPrintf(UPNP_INFO, SSDP, __FILE__, __LINE__, ">>> SSDP SEND M-SEARCH >>>\n%s\n", ReqBufv6UlaGua);
++            sendto(gSsdpReqSocket6, ReqBufv6UlaGua, (int)strlen(ReqBufv6UlaGua), 0, (struct sockaddr *)&__ss_v6, sizeof(struct sockaddr_in6));
++            imillisleep(SSDP_PAUSE);
++        }
++        inet_pton(AF_INET6, SSDP_IPV6_LINKLOCAL, &destAddr6->sin6_addr);
++        for (numCopies = 0; numCopies < NUM_SSDP_COPY; numCopies++) {
++            UpnpPrintf(UPNP_INFO, SSDP, __FILE__, __LINE__, ">>> SSDP SEND M-SEARCH >>>\n%s\n", ReqBufv6);
++            sendto(gSsdpReqSocket6, ReqBufv6, (int)strlen(ReqBufv6), 0, (struct sockaddr *)&__ss_v6, sizeof(struct sockaddr_in6));
++            imillisleep(SSDP_PAUSE);
++        }
++    }
++#endif /* IPv6 */
++    if (gSsdpReqSocket4 != INVALID_SOCKET && (fds[0].revents & POLLOUT)) {
++        for (numCopies = 0; numCopies < NUM_SSDP_COPY; numCopies++) {
++            UpnpPrintf(UPNP_INFO, SSDP, __FILE__, __LINE__, ">>> SSDP SEND M-SEARCH >>>\n%s\n", ReqBufv4);
++            sendto(gSsdpReqSocket4, ReqBufv4, (int)strlen(ReqBufv4), 0, (struct sockaddr *)&__ss_v4, sizeof(struct sockaddr_in));
++            imillisleep(SSDP_PAUSE);
++        }
++    }
++    return 1;
+ }
+ 	#endif /* EXCLUDE_SSDP */
+ #endif	       /* INCLUDE_CLIENT_APIS */
+-- 
+2.34.1
+

@@ -1,0 +1,13 @@
+<Page
+    x:Class="WidgetSampleCS.WeatherWidget"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    Background="Transparent">
+    <Grid x:Name="Viewport"><Viewbox Stretch="Uniform">
+    <StackPanel x:Name="Root" Orientation="Horizontal" Spacing="6" Padding="4,2" HorizontalAlignment="Center" VerticalAlignment="Center">
+        <TextBlock x:Name="Icon" VerticalAlignment="Center" />
+        <TextBlock x:Name="Temp" FontWeight="SemiBold" VerticalAlignment="Center" />
+        <HyperlinkButton Content="Open-Meteo" NavigateUri="https://open-meteo.com/" FontSize="10" MinWidth="0" MinHeight="0" Padding="2,0" VerticalAlignment="Center" />
+    </StackPanel>
+    </Viewbox></Grid>
+</Page>

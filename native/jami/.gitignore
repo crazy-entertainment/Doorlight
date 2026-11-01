@@ -1,0 +1,149 @@
+# Ignore unused objects
+*.lo
+*.o
+*.a
+*.la
+*.Po
+*.Plo
+*.loT
+*.Tpo
+Makefile.in
+Makefile
+/config.*
+*.swp
+*.so
+*.raw
+*.pod
+*.libs
+*.deps
+*.spec
+*.yml.bak
+
+
+config.guess
+config.*
+depcomp
+install-sh
+missing
+stamp-h1
+ltmain.sh
+INSTALL
+build
+.dirstamp
+
+# Binary translation files
+*.mo
+libtool
+
+# The test binary
+*Tester
+*orig
+*.1
+*-glue.h
+
+# Unit test executables
+ut_*
+!ut_*.*
+
+# Ignored folders
+build-*/
+
+# Ignore rendered docs
+doc/doxygen/core-doc
+doc/doxygen/gtk-gui-doc
+doc/*.html
+
+# PJSIP files
+*.depend
+*i686-pc-linux-gnu
+*pjlib-util-test-*
+*pjlib-test-*
+*pjmedia-test-*
+*pjnath-test-*
+*pjturn-client-*
+*pjturn-srv-*
+*pjsua-*
+*pjsystest-*
+*x86_64-unknown-*
+sip_autoconf.h
+os-auto.mak
+cc-auto.mak
+build.mak
+config.log
+config.status
+m_auto.h
+os_auto.h
+config_site.h
+config_auto.h
+
+# Ignore temp files
+*~
+
+# Cscope/Ctags/Etags files
+cscope.*
+tags
+TAGS
+TAGS.LST
+ID
+GPATH
+GRTAGS
+GTAGS
+
+# IDE stuffs
+nbproject
+*.kdev*
+tools/.vscode/
+.idea/
+*iml
+.history/
+.cache/
+
+# JNI generated files
+*_wrap.cpp
+*_wrap.h
+*_loader.c
+
+# Mac
+.DS_Store
+build-macos*
+
+# Android
+/build-android-*/
+/extras/tools/check_sed
+/extras/tools/libtool-*.tar.xz
+
+# Windows native build
+x64/
+Release/
+Debug/
+
+# iOS
+/build-ios*
+
+build-aux/
+configure
+jami.pc
+bin/dbus/*.adaptor.h
+bin/dbus/cx.ring.Ring.service
+bin/dbus/jamid
+doltcompile
+doltlibtool
+__pycache__
+
+# coverage files
+*.gcno
+*.gcda
+*info
+html-output/
+
+#sonarqube generated files
+.scannerwork/
+clang-tidy-report.txt
+sonar-project.properties.save
+compile_commands.json
+
+# Cmake
+*.cmake
+CMakeCache.txt
+Testing
+CMakeFiles

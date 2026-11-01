@@ -1,0 +1,24 @@
+# FMT
+FMT_VERSION := 12.1.0
+PKG_CPE += cpe:2.3:a:fmt:fmt:$(FMT_VERSION):*:*:*:*:*:*:*
+FMT_URL := https://github.com/fmtlib/fmt/archive/$(FMT_VERSION).tar.gz
+
+PKGS += fmt
+ifeq ($(call need_pkg,'fmt >= 10.1'),)
+PKGS_FOUND += fmt
+endif
+
+FMT_CONF = -DCMAKE_CXX_STANDARD=20 \
+		   -DFMT_TEST=Off
+
+$(TARBALLS)/fmt-$(FMT_VERSION).tar.gz:
+	$(call download,$(FMT_URL))
+
+.sum-fmt: fmt-$(FMT_VERSION).tar.gz
+
+fmt: fmt-$(FMT_VERSION).tar.gz
+	$(UNPACK)
+	cd $(UNPACK_DIR)
+	$(MOVE)
+
+CMAKE_PKGS += fmt

@@ -1,0 +1,234 @@
+/*
+ *  Copyright (C) 2004-2026 Savoir-faire Linux Inc.
+ *
+ *  This program is free software: you can redistribute it and/or modify
+ *  it under the terms of the GNU General Public License as published by
+ *  the Free Software Foundation, either version 3 of the License, or
+ *  (at your option) any later version.
+ *
+ *  This program is distributed in the hope that it will be useful,
+ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ *  GNU General Public License for more details.
+ *
+ *  You should have received a copy of the GNU General Public License
+ *  along with this program. If not, see <https://www.gnu.org/licenses/>.
+ */
+#pragma once
+#include "verified_received_seed.h"
+
+#include "jami/datatransfer_interface.h"
+#include "noncopyable.h"
+
+#include <dhtnet/multiplexed_socket.h>
+
+#include <cstdint>
+#include <fstream>
+#include <functional>
+#include <memory>
+#include <string>
+
+namespace jami {
+
+inline constexpr std::int64_t PROFILE_VCARD_MAX_BYTES = 350 * 1024 + 4096;
+
+libjami::DataTransferId generateUID(std::mt19937_64& engine);
+std::string getFileId(const std::string& commitId, const std::string& tid, const std::string& displayName);
+std::string newTransferAttemptId();
+
+class Stream;
+
+struct IncomingFileInfo
+{
+    libjami::DataTransferId id;
+    std::shared_ptr<Stream> stream;
+};
+
+struct WaitingRequest
+{
+    std::string fileId;
+    std::string interactionId;
+    std::string sha3sum;
+    std::string path;
+    std::size_t totalSize;
+    // A fresh process-local admission on load; never revive callbacks from a
+    // cancelled request merely because the signed file ID is unchanged.
+    std::string attemptId = newTransferAttemptId();
+    unsigned channelRetries = 0;
+    bool channelRetryPending = false;
+    MSGPACK_DEFINE(fileId, interactionId, sha3sum, path, totalSize)
+};
+
+typedef std::function<void(const std::string&)> InternalCompletionCb;
+typedef std::function<void()> OnFinishedCb;
+
+class FileInfo
+{
+public:
+    FileInfo(const std::shared_ptr<dhtnet::ChannelSocket>& channel,
+             const std::string& fileId,
+             const std::string& interactionId,
+             const libjami::DataTransferInfo& info);
+    virtual ~FileInfo() {}
+    virtual void process() = 0;
+    std::shared_ptr<dhtnet::ChannelSocket> channel() const { return channel_; }
+    libjami::DataTransferInfo info() const { return info_; }
+    virtual void cancel() = 0;
+    void onFinished(std::function<void(uint32_t)>&& cb) { finishedCb_ = std::move(cb); }
+    void emit(libjami::DataTransferEventCode code);
+
+protected:
+    std::atomic_bool isUserCancelled_ {false};
+    std::string fileId_ {};
+    std::string interactionId_ {};
+    std::string attemptId_ {};
+    libjami::DataTransferInfo info_ {};
+    std::shared_ptr<dhtnet::ChannelSocket> channel_ {};
+    std::function<void(uint32_t)> finishedCb_ {};
+};
+
+class IncomingFile : public FileInfo, public std::enable_shared_from_this<IncomingFile>
+{
+public:
+    IncomingFile(const std::shared_ptr<dhtnet::ChannelSocket>& channel,
+                 const libjami::DataTransferInfo& info,
+                 const std::string& fileId,
+                 const std::string& interactionId,
+                 const std::string& sha3Sum,
+                 const std::filesystem::path& seedPath = {},
+                 const std::string& attemptId = {});
+    ~IncomingFile();
+    void process() override;
+    void cancel() override;
+
+private:
+    std::mutex streamMtx_;
+    std::unique_ptr<received_seed::File> stream_;
+    bool failed_ {false};
+    bool terminal_ {false}; // guarded by streamMtx_
+    std::string sha3Sum_ {};
+    std::filesystem::path path_;
+    std::filesystem::path seedPath_;
+};
+
+class OutgoingFile : public FileInfo
+{
+public:
+    OutgoingFile(const std::shared_ptr<dhtnet::ChannelSocket>& channel,
+                 const std::string& fileId,
+                 const std::string& interactionId,
+                 const libjami::DataTransferInfo& info,
+                 size_t start = 0,
+                 size_t end = 0);
+    ~OutgoingFile();
+    void process() override;
+    void cancel() override;
+
+private:
+    std::ifstream stream_;
+    size_t start_ {0};
+    size_t end_ {0};
+};
+
+class TransferManager : public std::enable_shared_from_this<TransferManager>
+{
+public:
+    TransferManager(const std::string& accountId,
+                    const std::string& accountUri,
+                    const std::string& to,
+                    const std::mt19937_64& rand);
+    ~TransferManager();
+
+    /**
+     * Send a file to a channel
+     * @param channel       channel to use
+     * @param fileId        fileId of the transfer
+     * @param interactionId interactionId of the transfer
+     * @param path          path of the file
+     * @param start         start offset
+     * @param end           end
+     */
+    void transferFile(const std::shared_ptr<dhtnet::ChannelSocket>& channel,
+                      const std::string& fileId,
+                      const std::string& interactionId,
+                      const std::string& path,
+                      size_t start = 0,
+                      size_t end = 0,
+                      OnFinishedCb onFinished = {});
+
+    /**
+     * Refuse a transfer
+     * @param id        of the transfer
+     */
+    bool cancel(const std::string& fileId, const std::string& expectedAttempt = {});
+    bool completed(const std::string& fileId, const std::string& expectedHash, int64_t expectedSize,
+                   std::string& path, int64_t& size) const noexcept;
+    bool recordCompleted(const std::string& fileId, const std::string& interactionId,
+                         const std::string& source, int64_t size, const std::string& hash,
+                         const std::string& expectedAttempt = {});
+
+    /**
+     * Get current transfer info
+     * @param id        of the transfer
+     * @param total     size
+     * @param path      path of the file
+     * @param progress  current progress
+     * @return if found
+     */
+    bool info(const std::string& fileId, std::string& path, int64_t& total, int64_t& progress) const noexcept;
+
+    /**
+     * Inform the transfer manager that a transfer is waited (and will be automatically accepted)
+     * @param id              of the transfer
+     * @param interactionId   linked interaction
+     * @param sha3sum         attended sha3sum
+     * @param path            where the file will be downloaded
+     * @param total           total size of the file
+     */
+    std::string waitForTransfer(const std::string& fileId,
+                         const std::string& interactionId,
+                         const std::string& sha3sum,
+                         const std::string& path,
+                         std::size_t total, const std::string& attemptId = {});
+
+    /**
+     * Handle incoming transfer
+     * @param id        Related id
+     * @param channel   Related channel
+     * @param start     Offset in the file from which the transfer will start.
+     */
+    void onIncomingFileTransfer(const std::string& fileId,
+                                const std::shared_ptr<dhtnet::ChannelSocket>& channel,
+                                size_t start, const std::string& attemptId);
+    std::string waitingAttempt(const std::string& fileId) const;
+    unsigned reserveChannelRetry(const std::string& fileId, const std::string& attemptId);
+    bool consumeChannelRetry(const std::string& fileId, const std::string& attemptId);
+
+    /**
+     * Retrieve path of a file
+     * @param id
+     */
+    std::filesystem::path path(const std::string& fileId) const;
+
+    /**
+     * Retrieve waiting files
+     * @return waiting list
+     */
+    std::vector<WaitingRequest> waitingRequests() const;
+    bool isWaiting(const std::string& fileId) const;
+    void onIncomingProfile(const std::shared_ptr<dhtnet::ChannelSocket>& channel, const std::string& sha3Sum = "");
+
+    /**
+     * @param contactId     contact's id
+     * @return where profile.vcf is stored
+     */
+    std::filesystem::path profilePath(const std::string& contactId) const;
+
+private:
+    std::weak_ptr<TransferManager> weak() { return std::static_pointer_cast<TransferManager>(shared_from_this()); }
+    NON_COPYABLE(TransferManager);
+    class Impl;
+    std::unique_ptr<Impl> pimpl_;
+};
+
+} // namespace jami

@@ -1,0 +1,9 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net8.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings></PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../../app/WeatherResponse.cs" Link="WeatherResponse.cs" />
+    <Compile Include="../../app/WeatherData.cs" Link="WeatherData.cs" />
+    <Compile Include="../../app/WeatherPlace.cs" Link="WeatherPlace.cs" />
+    <EmbeddedResource Include="../../app/Assets/CountryCentres.csv"><LogicalName>Doorlight.CountryCentres.csv</LogicalName></EmbeddedResource>
+  </ItemGroup>
+</Project>

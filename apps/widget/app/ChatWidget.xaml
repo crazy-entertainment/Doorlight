@@ -1,0 +1,7 @@
+<Page x:Class="WidgetSampleCS.ChatWidget" xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" Background="Transparent">
+<Grid x:Name="Root" Padding="12" RowSpacing="8" CornerRadius="12">
+<Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+<StackPanel Spacing="6"><TextBlock x:Name="Status" TextWrapping="Wrap" Foreground="{ThemeResource WidgetMuted}"/><Button x:Name="Enable" Content="Enable chat" Click="Enable_Click" Visibility="Collapsed"/><ComboBox x:Name="Conversations" DisplayMemberPath="Label" SelectionChanged="Conversations_SelectionChanged" HorizontalAlignment="Stretch"/><StackPanel Orientation="Horizontal" Spacing="8"><Button x:Name="Older" Content="Earlier messages" Click="Older_Click" Visibility="Collapsed"/><Button x:Name="Latest" Content="Latest" Click="Latest_Click" Visibility="Collapsed"/></StackPanel></StackPanel>
+<ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto"><StackPanel x:Name="Messages" Spacing="10"/></ScrollViewer>
+<Grid x:Name="ComposeArea" Grid.Row="2" ColumnSpacing="8"><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions><TextBox x:Name="Composer" PlaceholderText="Message" KeyDown="Composer_KeyDown" MaxLength="4000" TextWrapping="Wrap"/><Button x:Name="SendButton" Grid.Column="1" Content="Send" Click="SendButton_Click"/></Grid>
+</Grid></Page>

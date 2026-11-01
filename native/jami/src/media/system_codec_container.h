@@ -1,0 +1,55 @@
+/*
+ *  Copyright (C) 2004-2026 Savoir-faire Linux Inc.
+ *
+ *  This program is free software: you can redistribute it and/or modify
+ *  it under the terms of the GNU General Public License as published by
+ *  the Free Software Foundation, either version 3 of the License, or
+ *  (at your option) any later version.
+ *
+ *  This program is distributed in the hope that it will be useful,
+ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ *  GNU General Public License for more details.
+ *
+ *  You should have received a copy of the GNU General Public License
+ *  along with this program. If not, see <https://www.gnu.org/licenses/>.
+ */
+
+#pragma once
+
+#include "media_codec.h"
+
+#include <string>
+#include <vector>
+#include <memory>
+
+namespace jami {
+
+class SystemCodecContainer
+{
+public:
+    SystemCodecContainer();
+    ~SystemCodecContainer();
+    void init(bool enableAcceleration);
+
+    std::vector<std::shared_ptr<SystemCodecInfo>> getSystemCodecInfoList(MediaType mediaType = MEDIA_ALL);
+
+    std::vector<unsigned> getSystemCodecInfoIdList(MediaType type = MEDIA_ALL);
+
+    std::shared_ptr<SystemCodecInfo> searchCodecById(unsigned codecId, MediaType type = MEDIA_ALL);
+
+    std::shared_ptr<SystemCodecInfo> searchCodecByName(const std::string& name, MediaType type = MEDIA_ALL);
+
+    std::shared_ptr<SystemCodecInfo> searchCodecByPayload(unsigned payload, MediaType type = MEDIA_ALL);
+
+private:
+    /* available audio & video codec  */
+    std::vector<std::shared_ptr<SystemCodecInfo>> availableCodecList_;
+
+    void initCodecConfig();
+    void removeCodecByName(const std::string& name, MediaType type = MEDIA_ALL);
+    bool setActiveH265(bool enableAcceleration);
+    void checkInstalledCodecs();
+};
+
+} // namespace jami

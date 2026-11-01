@@ -1,0 +1,73 @@
+# GnuTLS
+
+GNUTLS_VERSION := 3.8.13
+PKG_CPE += cpe:2.3:a:gnu:gnutls:$(GNUTLS_VERSION):*:*:*:*:*:*:*
+GNUTLS_URL := https://www.gnupg.org/ftp/gcrypt/gnutls/v3.8/gnutls-$(GNUTLS_VERSION).tar.xz
+
+PKGS += gnutls
+
+ifeq ($(call need_pkg,"gnutls >= 3.7.4"),)
+PKGS_FOUND += gnutls
+endif
+
+DEPS_gnutls = nettle gmp iconv zlib
+
+$(TARBALLS)/gnutls-$(GNUTLS_VERSION).tar.xz:
+	$(call download,$(GNUTLS_URL))
+
+.sum-gnutls: gnutls-$(GNUTLS_VERSION).tar.xz
+
+gnutls: gnutls-$(GNUTLS_VERSION).tar.xz .sum-gnutls
+	$(UNPACK)
+#	$(APPLY) $(SRC)/gnutls/0001-fix-autotools-build-errors.patch
+ifndef HAVE_IOS
+	$(APPLY) $(SRC)/gnutls/mac-keychain-lookup.patch
+endif
+	$(call pkg_static,"lib/gnutls.pc.in")
+	$(UPDATE_AUTOCONFIG)
+	$(MOVE)
+
+GNUTLS_CONF := \
+    --enable-heartbeat-support \
+	--disable-gtk-doc \
+	--without-p11-kit \
+	--disable-cxx \
+	--disable-srp-authentication \
+	--with-included-libtasn1 \
+	--with-included-unistring \
+	--disable-openssl-compatibility \
+	--disable-guile \
+	--disable-nls \
+	--without-libintl-prefix \
+	--without-idn \
+	--without-brotli \
+	--without-zstd \
+	$(HOSTCONF)
+
+ifdef HAVE_IOS
+GNUTLS_CONF += --disable-hardware-acceleration
+endif
+
+#Workaround for localtime_r function
+ifdef HAVE_WIN32
+CFLAGS="-D_POSIX_C_SOURCE"
+endif
+
+.gnutls: gnutls
+	$(RECONF)
+ifdef HAVE_ANDROID
+	cd $< && $(HOSTVARS) ./configure $(GNUTLS_CONF)
+else
+ifdef HAVE_IOS
+	cd $< && $(HOSTVARS) ac_cv_func_clock_gettime=no ./configure $(GNUTLS_CONF)
+else
+ifdef HAVE_MACOSX
+	cd $< && $(HOSTVARS) ac_cv_func_clock_gettime=no ./configure $(GNUTLS_CONF)
+else
+	cd $< && $(HOSTVARS) CFLAGS="$(CFLAGS)" ./configure $(GNUTLS_CONF)
+endif
+endif
+endif
+	cd $</gl && $(MAKE) install
+	cd $</lib && $(MAKE) install
+	touch $@

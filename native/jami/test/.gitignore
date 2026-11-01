@@ -1,0 +1,13 @@
+*.o
+
+# test binaries
+ut_*
+
+# test result files
+*.log
+*.trs
+
+.dirstamp
+jami-sample.yml
+jami-sample.bak
+jami-sample.yml.bak

@@ -1,0 +1,13 @@
+Weather data by Open-Meteo
+https://open-meteo.com/
+
+Location data: GeoNames, accessed through Open-Meteo's Geocoding API.
+https://www.geonames.org/
+https://open-meteo.com/en/docs/geocoding-api
+
+API data are supplied under Creative Commons Attribution 4.0 International:
+https://creativecommons.org/licenses/by/4.0/
+
+Doorlight selects current temperature, weather code and day/night fields, presents weather codes as symbols, and formats/sorts location results. These presentation changes do not imply provider endorsement.
+
+The provider's free API permits non-commercial use within its limits. Commercial distribution or increased usage requires a separately reviewed provider arrangement. Terms: https://open-meteo.com/en/terms

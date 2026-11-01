@@ -1,0 +1,123 @@
+<Application
+    x:Class="WidgetSampleCS.App"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:local="using:WidgetSampleCS" RequestedTheme="Dark">
+    <Application.Resources>
+        <ResourceDictionary>
+            <Color x:Key="SystemAccentColor">#F2B775</Color>
+            <SolidColorBrush x:Key="WidgetBackground" Color="#211714" />
+            <SolidColorBrush x:Key="WidgetSurface" Color="#2A1D19" />
+            <SolidColorBrush x:Key="WidgetHigh" Color="#34231F" />
+            <SolidColorBrush x:Key="WidgetInk" Color="#F4E9DF" />
+            <SolidColorBrush x:Key="WidgetMuted" Color="#B49D90" />
+            <SolidColorBrush x:Key="WidgetBorder" Color="#6B5044" />
+            <SolidColorBrush x:Key="WidgetAccent" Color="#F2B775" />
+            <SolidColorBrush x:Key="WidgetOnAccent" Color="#211714" />
+            <SolidColorBrush x:Key="WidgetButton" Color="#34231F" />
+            <SolidColorBrush x:Key="WidgetButtonBorder" Color="#6B5044" />
+            <SolidColorBrush x:Key="WidgetFieldBorder" Color="#6B5044" />
+            <SolidColorBrush x:Key="SystemControlHighlightAccentBrush" Color="#F2B775" />
+            <SolidColorBrush x:Key="SliderTrackValueFill" Color="#F2B775" />
+            <SolidColorBrush x:Key="SliderTrackValueFillPointerOver" Color="#F2B775" />
+            <SolidColorBrush x:Key="SliderTrackValueFillPressed" Color="#E69A4E" />
+            <SolidColorBrush x:Key="SliderThumbBackground" Color="#F4E9DF" />
+            <SolidColorBrush x:Key="SliderThumbBackgroundPointerOver" Color="#F4E9DF" />
+            <SolidColorBrush x:Key="SliderThumbBackgroundPressed" Color="#F4E9DF" />
+            <SolidColorBrush x:Key="SliderThumbBackgroundDisabled" Color="#B19A8F" />
+            <SolidColorBrush x:Key="SliderTrackFill" Color="#6B5044" />
+            <SolidColorBrush x:Key="SliderTrackFillPointerOver" Color="#B19A8F" />
+            <SolidColorBrush x:Key="SliderTrackFillDisabled" Color="#422C26" />
+            <SolidColorBrush x:Key="SliderTrackValueFillDisabled" Color="#6B5044" />
+            <SolidColorBrush x:Key="ToggleSwitchFillOn" Color="#F2B775" />
+            <SolidColorBrush x:Key="ToggleSwitchFillOnPointerOver" Color="#F2B775" />
+            <SolidColorBrush x:Key="ToggleSwitchFillOnPressed" Color="#E69A4E" />
+            <SolidColorBrush x:Key="ToggleSwitchKnobFillOn" Color="#211714" />
+            <SolidColorBrush x:Key="ButtonBackgroundPointerOver" Color="#422C26" />
+            <SolidColorBrush x:Key="ButtonBackgroundPressed" Color="#513928" />
+            <SolidColorBrush x:Key="ButtonBorderBrushPointerOver" Color="#F2B775" />
+            <SolidColorBrush x:Key="ButtonBorderBrushPressed" Color="#F2B775" />
+            <SolidColorBrush x:Key="ButtonForegroundPointerOver" Color="#F4E9DF" />
+            <SolidColorBrush x:Key="ButtonForegroundPressed" Color="#F4E9DF" />
+            <SolidColorBrush x:Key="ComboBoxBackgroundPointerOver" Color="#422C26" />
+            <SolidColorBrush x:Key="ComboBoxBackgroundPressed" Color="#513928" />
+            <SolidColorBrush x:Key="ComboBoxBorderBrushPointerOver" Color="#F2B775" />
+            <SolidColorBrush x:Key="ComboBoxForegroundPointerOver" Color="#F4E9DF" />
+            <SolidColorBrush x:Key="ComboBoxDropDownBackground" Color="#2A1D19" />
+            <SolidColorBrush x:Key="ComboBoxDropDownBorderBrush" Color="#6B5044" />
+            <SolidColorBrush x:Key="ComboBoxItemBackgroundSelected" Color="#513928" />
+            <SolidColorBrush x:Key="ComboBoxItemBackgroundSelectedPointerOver" Color="#422C26" />
+            <SolidColorBrush x:Key="ComboBoxItemForegroundSelected" Color="#F4E9DF" />
+            <SolidColorBrush x:Key="ComboBoxItemBackgroundPointerOver" Color="#34231F" />
+            <SolidColorBrush x:Key="TextControlForeground" Color="#F4E9DF" />
+            <SolidColorBrush x:Key="TextControlForegroundPointerOver" Color="#F4E9DF" />
+            <SolidColorBrush x:Key="TextControlForegroundFocused" Color="#F4E9DF" />
+            <SolidColorBrush x:Key="TextControlForegroundDisabled" Color="#B49D90" />
+            <SolidColorBrush x:Key="TextControlPlaceholderForeground" Color="#B49D90" />
+            <SolidColorBrush x:Key="TextControlPlaceholderForegroundFocused" Color="#B49D90" />
+            <SolidColorBrush x:Key="TextControlBackgroundPointerOver" Color="#34231F" />
+            <SolidColorBrush x:Key="TextControlBackgroundFocused" Color="#140E0C" />
+            <SolidColorBrush x:Key="TextControlBorderBrushFocused" Color="#F2B775" />
+            <SolidColorBrush x:Key="CheckBoxCheckBackgroundFillChecked" Color="#F2B775" />
+            <SolidColorBrush x:Key="CheckBoxCheckBackgroundFillCheckedPointerOver" Color="#F2B775" />
+            <SolidColorBrush x:Key="CheckBoxCheckBackgroundFillCheckedPressed" Color="#E69A4E" />
+            <SolidColorBrush x:Key="CheckBoxCheckGlyphForegroundChecked" Color="#211714" />
+            <SolidColorBrush x:Key="CheckBoxForeground" Color="#F4E9DF" />
+            <SolidColorBrush x:Key="CheckBoxForegroundPointerOver" Color="#F4E9DF" />
+            <SolidColorBrush x:Key="ToggleButtonBackgroundChecked" Color="#513928" />
+            <SolidColorBrush x:Key="ToggleButtonBackgroundCheckedPointerOver" Color="#422C26" />
+            <SolidColorBrush x:Key="ToggleButtonBackgroundCheckedPressed" Color="#513928" />
+            <SolidColorBrush x:Key="ToggleButtonForegroundChecked" Color="#F4E9DF" />
+            <SolidColorBrush x:Key="ToggleButtonBorderBrushChecked" Color="#F2B775" />
+            <SolidColorBrush x:Key="FlyoutBackground" Color="#2A1D19" />
+            <SolidColorBrush x:Key="FlyoutBorderBrush" Color="#6B5044" />
+            <SolidColorBrush x:Key="MenuFlyoutPresenterBackground" Color="#2A1D19" />
+            <SolidColorBrush x:Key="MenuFlyoutPresenterBorderBrush" Color="#6B5044" />
+            <SolidColorBrush x:Key="MenuFlyoutItemForeground" Color="#F4E9DF" />
+            <SolidColorBrush x:Key="MenuFlyoutItemForegroundPointerOver" Color="#F4E9DF" />
+            <SolidColorBrush x:Key="MenuFlyoutItemBackgroundPointerOver" Color="#34231F" />
+            <SolidColorBrush x:Key="MenuFlyoutItemBackgroundPressed" Color="#513928" />
+            <SolidColorBrush x:Key="ContentDialogBackground" Color="#2A1D19" />
+            <SolidColorBrush x:Key="ContentDialogForeground" Color="#F4E9DF" />
+            <SolidColorBrush x:Key="SystemControlForegroundBaseHighBrush" Color="#F4E9DF" />
+            <SolidColorBrush x:Key="SystemControlForegroundBaseMediumBrush" Color="#B49D90" />
+            <Style TargetType="Button">
+                <Setter Property="Background" Value="{ThemeResource WidgetButton}" />
+                <Setter Property="Foreground" Value="{ThemeResource WidgetInk}" />
+                <Setter Property="BorderBrush" Value="{ThemeResource WidgetButtonBorder}" />
+                <Setter Property="BorderThickness" Value="1" />
+                <Setter Property="CornerRadius" Value="8" />
+                <Setter Property="MinHeight" Value="36" />
+                <Setter Property="Padding" Value="12,6" />
+            </Style>
+            <Style TargetType="ComboBox">
+                <Setter Property="Foreground" Value="{ThemeResource WidgetInk}" />
+                <Setter Property="Background" Value="{ThemeResource WidgetHigh}" />
+                <Setter Property="BorderBrush" Value="{ThemeResource WidgetFieldBorder}" />
+                <Setter Property="CornerRadius" Value="8" />
+                <Setter Property="MinHeight" Value="36" />
+            </Style>
+            <Style TargetType="TextBox">
+                <Setter Property="Foreground" Value="{ThemeResource WidgetInk}" />
+                <Setter Property="Background" Value="{ThemeResource WidgetHigh}" />
+                <Setter Property="BorderBrush" Value="{ThemeResource WidgetFieldBorder}" />
+                <Setter Property="CornerRadius" Value="8" />
+                <Setter Property="MinHeight" Value="36" />
+            </Style>
+            <Style TargetType="ToggleButton">
+                <Setter Property="Foreground" Value="{ThemeResource WidgetInk}" />
+                <Setter Property="Background" Value="{ThemeResource WidgetHigh}" />
+                <Setter Property="BorderBrush" Value="{ThemeResource WidgetBorder}" />
+            </Style>
+            <Style TargetType="CheckBox">
+                <Setter Property="Foreground" Value="{ThemeResource WidgetInk}" />
+            </Style>
+            <Style TargetType="ToggleSwitch">
+                <Setter Property="Foreground" Value="{ThemeResource WidgetInk}" />
+            </Style>
+            <Style TargetType="Slider">
+                <Setter Property="Foreground" Value="{ThemeResource WidgetInk}" />
+            </Style>
+        </ResourceDictionary>
+    </Application.Resources>
+</Application>

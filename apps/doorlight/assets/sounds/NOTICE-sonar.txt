@@ -1,0 +1,245 @@
+Doorlight Nearby sonar sounds
+
+Both sounds are used under the Pixabay Content License
+(https://pixabay.com/service/license-summary/). Attribution is not required;
+it is given here as appreciation. The sounds are bundled inside the
+application and are not distributed on a standalone basis. Transformations
+were made with ffmpeg.
+
+sonar_send.wav — played when you reveal yourself.
+  Source: Pixabay item 230712 by NTA88 (sonar sound effect)
+  https://pixabay.com/users/nta88-45311447/
+  Downloaded as nta88-sonar-sound-effect-230712.mp3, acquired 2026-10-01.
+  Original SHA-256 b448e67ec05dce234d975c26c773aec0d7ad1944bd1528a1a8efaf1f3bc98910
+  (MP3, 44.1 kHz stereo, 3.03 s).
+  Transformation: mono, 48 kHz, 16-bit PCM; 0.43 s fade-out from 2.60 s.
+  SHA-256 cfe45b97c2c0da7800b98c7c3d7eaa09faaaf0c00163ee67bd476571d76f6b28
+
+sonar_received.wav — played when someone nearby reveals themselves.
+  Source: Pixabay item 95840 by freesound_community (sonar ping)
+  (Pixabay's account for sounds contributed from the Freesound community)
+  Downloaded as freesound_community-sonar-ping-95840.mp3, acquired 2026-10-01.
+  Original SHA-256 1448e767e52db8c9d0a663c58fa059be7308ee89ae2e83f440f011bfd0ce621a
+  (MP3, 44.1 kHz mono, 3.55 s).
+  Transformation: 48 kHz, 16-bit PCM; -4 dB; 0.8 s fade-out from 2.4 s;
+  trimmed to 3.2 s.
+  SHA-256 0ccc73e1dc85c0986fc39c3ade106e093638c3ab717f7d9fec75a8677720c15f
+
+sonar_pulse.wav — played when you tap your picture to pulse while visible.
+  Source: Pixabay item 183436 by VoiceBosch ("Sonar", 28 s)
+  https://pixabay.com/sound-effects/film-special-effects-sonar-183436/
+  Excerpt supplied by the project owner as "second pulse.wav" on 2026-10-06;
+  the original download and its hash were not retained.
+  Original SHA-256 5279410e78a8718521fabf57acab927f42eaf99ed6ce64700d33356e209328fb
+  (WAV, 48 kHz stereo, 1.47 s).
+  Transformation: mono, 48 kHz, 16-bit PCM.
+  SHA-256 64d6bb20da5abd67d8c0553c7eee298003ec3df6b0de83d5da88654e0d380a84
+
+Doorlight Sonar combat sounds
+
+The combat sounds are the project owner's edits and mixes, made in Sound
+Forge, of the Pixabay sounds listed below, downloaded and acquired
+2026-10-08 and used under the Pixabay Content License
+(https://pixabay.com/service/license-summary/). Attribution is not required;
+it is given here as appreciation. The owner supplied the 11 results on
+2026-10-08 as WAV, 48 kHz stereo 16-bit PCM. Which sources went into which
+result was not recorded.
+
+Sources:
+
+  Pixabay item 506132 by black_kumizhi
+    Downloaded as black_kumizhi-huge-cinematic-reverb-impact-506132.mp3
+    Original SHA-256 6ca7937436f400c603ec6eae5269af22047fa6d91ded01dc6dc6fc03de0e6fc7
+
+  Pixabay item 190270 by daviddumaisaudio
+    Downloaded as daviddumaisaudio-large-underwater-explosion-190270.mp3
+    Original SHA-256 d985d283337bbb61a4ef07d1146e38efda022acdf0ff51c95e6051ac69bbba56
+
+  Pixabay item 284809 by dobcommunications
+    Downloaded as dobcommunications-metal-clang-284809.mp3
+    Original SHA-256 14fce7505a56e27599f18006d496de56e2c4c411a154aaf801e9da6aa248196b
+
+  Pixabay item 499658 by dragon-studio
+    Downloaded as dragon-studio-gentle-underwater-swish-499658.mp3
+    Original SHA-256 ea473913cda8a0256fdea6a50465e858f50e65ed350a7a55dbfcb68c08aa4358
+
+  Pixabay item 454253 by dragon-studio
+    Downloaded as dragon-studio-large-underwater-explosion-454253.mp3
+    Original SHA-256 27ffe29f4257b2d1acd36feb21867c2aeef46bddcdfba4e614a010c633464d19
+
+  Pixabay item 450455 by dragon-studio
+    Downloaded as dragon-studio-large-underwater-explosion-sfx-450455.mp3
+    Original SHA-256 fae49bf3daeaa8f5c607dea864c4f016cc3a92488d18829758ac39b2d0ef2c30
+
+  Pixabay item 376890 by dragon-studio
+    Downloaded as dragon-studio-underwater-ambience-376890.mp3
+    Original SHA-256 4c07f3f11fd3eed836e58be5f2d3ac95790e22dbc8155590d3f17002201c38ed
+
+  Pixabay item 376891 by dragon-studio
+    Downloaded as dragon-studio-underwater-sounds-376891.mp3
+    Original SHA-256 09a64f9d97d8f491296a34630956c3ba6d679ec9ea7b69e816ad7dea98972eb1
+
+  Pixabay item 333826 by epic_stock_media
+    Downloaded as epic_stock_media-ui-button-heavy-button-press-metallic-333826.mp3
+    Original SHA-256 06da233e553f7af08eb4a27cd62bb38d99415186519a4aa051d3e183666b3b54
+
+  Pixabay item 47977 by freesound_community (Pixabay's account for sounds contributed from the Freesound community)
+    Downloaded as freesound_community-air-release-47977.mp3
+    Original SHA-256 b8f025769e4ed7f3c26be9a5930a612d1ad2520eb10edd33f6b7b6d6f6b4485d
+
+  Pixabay item 6212 by freesound_community (Pixabay's account for sounds contributed from the Freesound community)
+    Downloaded as freesound_community-metal-impact-6212.mp3
+    Original SHA-256 f559a0f9628ea9615432075d30039fa662279b6e8fd6fbbd666907475c329331
+
+  Pixabay item 30681 by freesound_community (Pixabay's account for sounds contributed from the Freesound community)
+    Downloaded as freesound_community-old-style-depth-charge-30681.mp3
+    Original SHA-256 b03d9cef4c87aaae01be26d3146bac0ea59b12d576516c6909fbcf0e02331d09
+
+  Pixabay item 6798 by freesound_community (Pixabay's account for sounds contributed from the Freesound community)
+    Downloaded as freesound_community-power-charge-6798.mp3
+    Original SHA-256 3ed7ffa2d9f44f69a727b02b02abe472ca358dbee2fac9780994b1a401dd79e1
+
+  Pixabay item 14807 by freesound_community (Pixabay's account for sounds contributed from the Freesound community)
+    Downloaded as freesound_community-school-fire-alarm-loud-beepflac-14807.mp3
+    Original SHA-256 92f0b3282e4b1f3ccbce96375c62a108526b4c4dcb86a49f4ab75b24d4ba14c9
+
+  Pixabay item 230091 by lucadialessandro
+    Downloaded as lucadialessandro-alert-sound-230091.mp3
+    Original SHA-256 195a093ff06d214d043ecc669a3961cc284400c34a4ab5f44ccec0dd3b5850ae
+
+  Pixabay item 442670 by soundreality
+    Downloaded as soundreality-cinematic-hit-underwater-442670.mp3
+    Original SHA-256 1e956dbe18e95282402dd2c3e81bfbfd17b11c83ed1b6006042f30fc9ddb3a0a
+
+  Pixabay item 441395 by soundreality
+    Downloaded as soundreality-cinematic-sub-hit-441395.mp3
+    Original SHA-256 0f2935a7b9695877cdf81ce6b78f407221ca90baaf54aa61f2eb59bc9ac76e0e
+
+  Pixabay item 294435 by universfield
+    Downloaded as universfield-cinematic-impact-boom-03-294435.mp3
+    Original SHA-256 49349264a9f457834d85afcafa18c7bf230a34773afef638afbcd54c2eea3a6a
+
+  Pixabay item 352465 by universfield
+    Downloaded as universfield-cinematic-impact-boom-05-352465.mp3
+    Original SHA-256 824993119db92d61141199500533294aac3ea01b83e3410396a4c5f65aa54183
+
+  Pixabay item 129258 by universfield
+    Downloaded as universfield-error-notification-129258.mp3
+    Original SHA-256 c148e77b9fefe3cf958bcc0b795515e7ed789c4dc7008a4fe36666738c7b37d8
+
+Results:
+
+sonar_charge.wav — each tap while charging a missile, pitched up as the charge builds.
+  Edited and mixed by the project owner from the sources above; per-file
+  source mapping not recorded.
+  Supplied WAV SHA-256 cb1d3bc534b775f6cdb0c6844317bb46aac1e16ecd775cfae2ec7c2317c61068
+  Transformation: mono, 48 kHz, 16-bit PCM with ffmpeg; no trimming.
+  SHA-256 6a757af42f23108f8b30ed0e27d1cdd645428472f874b1dd69f8944ede237209
+
+sonar_missileShot.wav — your missile launches.
+  Edited and mixed by the project owner from the sources above; per-file
+  source mapping not recorded.
+  Supplied WAV SHA-256 9734a281187f5d57ab90ea30055289d7d8ba0830ef675c9246c61dfb522c204c
+  Transformation: mono, 48 kHz, 16-bit PCM with ffmpeg; no trimming.
+  SHA-256 122b7170223033a5fa261f1e3fe2a14211398c649ae45ed41302c1e75d276b6c
+
+sonar_missileEnRoute.wav — looped while your missile is in flight.
+  Edited and mixed by the project owner from the sources above; per-file
+  source mapping not recorded.
+  Supplied WAV SHA-256 d1202137b4505518483643ce8ef242c56cf9881411f1a72f885a4f02040550b3
+  Transformation: mono, 48 kHz, 16-bit PCM with ffmpeg; no trimming.
+  SHA-256 b4bf950efdc13e854bc451231d97dc34a2bc89485790c7f91a9e2356c22174ea
+
+sonar_hit.wav — your missile reaches its target.
+  Edited and mixed by the project owner from the sources above; per-file
+  source mapping not recorded.
+  Supplied WAV SHA-256 8b1d7cdcc226af51b8d0d140df3537b20604b5cef03632dc7e8dce56da2c9496
+  Transformation: mono, 48 kHz, 16-bit PCM with ffmpeg; no trimming.
+  SHA-256 6d24dafb1a7796a7cb5c96a8131c0b29873445ace6e9872ad43b532ec7f925d6
+
+sonar_enemy_sunk.wav — your target goes dark right after your hit.
+  Edited and mixed by the project owner from the sources above; per-file
+  source mapping not recorded.
+  Supplied WAV SHA-256 b4237b77573c1890c06d4e00c5086b1550a651303ac00d2442715171ce7253b7
+  Transformation: mono, 48 kHz, 16-bit PCM with ffmpeg; no trimming.
+  SHA-256 049cd149283196addc3532459329633853268deebd4269c1820c1c88fc9d637f
+
+sonar_IncomingMissile.wav — a missile is on its way to you.
+  Edited and mixed by the project owner from the sources above; per-file
+  source mapping not recorded.
+  Supplied WAV SHA-256 8db4366b74508e2cd23682757acfb1b0969cf3af3afdced65744d56c024e4bc2
+  Transformation: mono, 48 kHz, 16-bit PCM with ffmpeg; no trimming.
+  SHA-256 272264790912b2d773189afd10571280870b97cc2c41cf681243080dccb718a8
+
+sonar_IncomingMissileClose.wav — the incoming missile is about to land.
+  Edited and mixed by the project owner from the sources above; per-file
+  source mapping not recorded.
+  Supplied WAV SHA-256 82eb6a39304fbcca320c0c6c187b2e8154303b17daf9bb7d152bb2aa3cd1e173
+  Transformation: mono, 48 kHz, 16-bit PCM with ffmpeg; no trimming.
+  SHA-256 b970213cd61e79527248972d4ca35977acfa9647745ca4f7849ba8f1eab353ae
+
+sonar_IncomingMissileHit.wav — a missile hits you.
+  Edited and mixed by the project owner from the sources above; per-file
+  source mapping not recorded.
+  Supplied WAV SHA-256 6385a85a682a3e034d758810b256fca67f5ddf30edd37064a74d2b747c5c4920
+  Transformation: mono, 48 kHz, 16-bit PCM with ffmpeg; no trimming.
+  SHA-256 769916ce5330ccd860fa745cf6e87bb11e7bf08213fb957422a240aeba770d43
+
+sonar_warning_lowhealth.wav — a hit leaves a quarter of the window or less.
+  Edited and mixed by the project owner from the sources above; per-file
+  source mapping not recorded.
+  Supplied WAV SHA-256 35c82388c5910b199b2c1a5ae71157da10fd2abe8cdf38001af78a7cad9789a9
+  Transformation: mono, 48 kHz, 16-bit PCM with ffmpeg; no trimming.
+  SHA-256 404c8304893e60bbb019c26baafb67fd411e25f76712db06f0381fdfd0ef86e5
+
+sonar_off.wav — a hit ends your visibility.
+  Edited and mixed by the project owner from the sources above; per-file
+  source mapping not recorded.
+  Supplied WAV SHA-256 78a5654937599eb8348ce38b67cf155d9b82e422920b209bad492d7dfefd45c0
+  Transformation: mono, 48 kHz, 16-bit PCM with ffmpeg; no trimming.
+  SHA-256 56fc33738216adce3011b23e751609d3b067eb74593ebb329dec2a7d64e42622
+
+sonar_underwater_ambience.wav — looped while you and someone are trading missiles.
+  Edited and mixed by the project owner from the sources above; per-file
+  source mapping not recorded.
+  Supplied WAV SHA-256 af4528efc745b084bbf5b7071ad5b8af358c70a0fc3ff1678fc88836825cab03
+  Transformation: mono, 48 kHz, 16-bit PCM with ffmpeg; no trimming.
+  SHA-256 9f6580617b309db3241bd748b404ff6cc574793a09042d6c10c92206e594bef1
+
+This notice does not establish a license for the application or its other
+assets.
+
+Additional owner-supplied sounds
+
+The project owner supplied these WAVs from a local sound-effects folder. Their
+per-file source and license mapping were not supplied, so no source or license
+is asserted here. Original SHA-256 values are recorded for provenance.
+
+sonar_IncomingMissileKill.wav — owner-supplied `sonar_IncomingMissileKill.wav`.
+  Original SHA-256 d7a62ed4c2b720d36378ebde977fa4552d9a443a42b3968466f9d902bca542c0
+  Transformation: mono, 48 kHz, 16-bit PCM; no trimming.
+  SHA-256 d4830e097f7ea5dd1bd308eec2b83a061eb1203d082ea783358111be405227e3
+
+sonar_missileTargetLost.wav — owner-supplied `sonar_missileTargetLost.wav`.
+  Original SHA-256 9d3d2fa2d5c83099fbe86ae89879aa0e7d465e6ae057d27dcd863ac413693e2c
+  Transformation: mono, 48 kHz, 16-bit PCM; no trimming.
+  SHA-256 2364592a576cd58e9f9cf2fd9c5fafdf9fb0b194203b9fc237891de44f40ee0f
+
+sonar_missileHitEachOther.wav — owner-supplied `sonar_missileHitEachOther.wav`.
+  Original SHA-256 ad8cd04cad386743ec7466e65b27b814b795c5e92175d3e5f2866586c5198cd6
+  Transformation: mono, 48 kHz, 16-bit PCM; no trimming.
+  SHA-256 9956e2633f65e75cf5018ca218ea4d37534669d1b8ca23d65a2f1d8a5d4fefad
+
+sonar_targetTick.wav — a quiet short tick derived from the existing owner-supplied
+sonar_missileShot.wav mix. Its underlying per-file sources are undocumented.
+  Source SHA-256 122b7170223033a5fa261f1e3fe2a14211398c649ae45ed41302c1e75d276b6c
+  Transformation: first 75 ms; 900 Hz low-pass, -18 dB, fade over final 40 ms;
+  mono, 48 kHz, 16-bit PCM.
+  SHA-256 3bb86fa79ccff4088d7f59621ecd0ca8f45f243ae31f6aa61a61707f5715e190
+
+sonar_targetLock.wav — a quiet short lock cue derived from the existing owner-
+supplied sonar_pulse.wav mix. Its underlying per-file sources are undocumented.
+  Source SHA-256 64d6bb20da5abd67d8c0553c7eee298003ec3df6b0de83d5da88654e0d380a84
+  Transformation: 220 ms excerpt from 200 ms; 600 Hz low-pass, -12 dB, fade
+  over final 100 ms; mono, 48 kHz, 16-bit PCM.
+  SHA-256 f88ab1663f22e3bfe03e6823d0bd48e6974fbd1095c57036a32130faf1ed8fd7

@@ -1,0 +1,173 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+    <!-- Networking for the DHT / ICE / TURN paths. -->
+    <uses-permission android:name="android.permission.INTERNET"/>
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
+    <uses-permission android:name="android.permission.WAKE_LOCK"/>
+    <!-- Nearby: receive Doorlight's own LAN multicast announcements (normal permission). -->
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE"/>
+    <!-- Sonar radio discovery; runtime permissions requested on explicit reveal. -->
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE"/>
+    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE"/>
+    <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30"/>
+    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30"/>
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" android:maxSdkVersion="32"/>
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" android:maxSdkVersion="32"/>
+    <uses-permission android:name="android.permission.BLUETOOTH_SCAN" android:usesPermissionFlags="neverForLocation"/>
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT"/>
+    <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE"/>
+    <uses-permission android:name="android.permission.NEARBY_WIFI_DEVICES" android:usesPermissionFlags="neverForLocation"/>
+    <uses-feature android:name="android.hardware.bluetooth_le" android:required="false"/>
+    <!-- Voice: the daemon (AAudioLayer) opens the mic/speaker; we just hold the perms + route audio. -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO"/>
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS"/>
+    <!-- Keep the call (mic + daemon) alive when backgrounded. FOREGROUND_SERVICE_MICROPHONE is API 34+. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+    <!-- Keep the serverless peer daemon registered while the user explicitly remains online. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE"/>
+    <!-- Video (M2): camera capture. Requested lazily at first "camera on", not at launch. FGS_CAMERA is API 34+. -->
+    <uses-permission android:name="android.permission.CAMERA"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION"/>
+    <uses-feature android:name="android.hardware.camera.any" android:required="false"/>
+    <!-- Show the incoming-ring notification on API 33+. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+    <!-- Incoming calls may wake/cover a locked screen. Android 14+ can revoke this special access; the same
+         notification then remains a high-priority lock-screen heads-up alert instead. -->
+    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT"/>
+    <!-- M11 app lock: first-party Flutter local_auth delegates to Android's enrolled biometric/device credential. -->
+    <uses-permission android:name="android.permission.USE_BIOMETRIC"/>
+
+    <application
+        android:label="Doorlight"
+        android:name="${applicationName}"
+        android:icon="@mipmap/ic_launcher"
+        android:allowBackup="false"
+        android:fullBackupContent="@xml/backup_rules"
+        android:dataExtractionRules="@xml/data_extraction_rules"><!-- Identity material must never leave through
+        platform backup or migration. Android 12+ may ignore allowBackup=false for OEM device-to-device transfer,
+        so explicit all-domain rules cover cloud and D2D. Syb-L's user-initiated encrypted archive is the only
+        supported migration path. -->
+        <meta-data
+            android:name="firebase_messaging_auto_init_enabled"
+            android:value="false" />
+        <meta-data
+            android:name="firebase_analytics_collection_enabled"
+            android:value="false" />
+        <!-- Initialize only through the consent-gated wake token adapter. A
+             persisted SDK auto-init choice must not run ahead of app consent. -->
+        <provider
+            android:name="com.google.firebase.provider.FirebaseInitProvider"
+            android:authorities="${applicationId}.firebaseinitprovider"
+            tools:node="remove" />
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:taskAffinity=""
+            android:theme="@style/LaunchTheme"
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
+            android:hardwareAccelerated="true"
+            android:windowSoftInputMode="adjustResize">
+            <!-- Specifies an Android theme to apply to this Activity as soon as
+                 the Android process has started. This theme is visible to the user
+                 while the Flutter UI initializes. After that, this theme continues
+                 to determine the Window background behind the Flutter UI. -->
+            <meta-data
+              android:name="io.flutter.embedding.android.NormalTheme"
+              android:resource="@style/NormalTheme"
+              />
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN"/>
+                <category android:name="android.intent.category.LAUNCHER"/>
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW"/>
+                <category android:name="android.intent.category.DEFAULT"/>
+                <category android:name="android.intent.category.BROWSABLE"/>
+                <data android:scheme="sybl" android:host="add"/>
+                <data android:scheme="doorlight" android:host="add"/>
+            </intent-filter>
+            <!-- Doorlight configured App Links -->
+        </activity>
+        <!-- DUMP is a platform privileged/development permission held by ADB's
+             shell. Ordinary installed apps cannot invoke diagnostic controls. -->
+        <receiver
+            android:name=".StressControlReceiver"
+            android:exported="true"
+            android:permission="android.permission.DUMP" />
+        <!-- Foreground service: keeps online registration alive, then adds mic/camera ownership during a call. -->
+        <service
+            android:name=".CallForegroundService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse|microphone|camera|mediaProjection">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Maintains private peer-to-peer registration for incoming calls and messages without a push server" />
+        </service>
+        <service
+            android:name=".PushForegroundService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Temporarily reconnects the private peer daemon after an opaque push wake" />
+        </service>
+        <service
+            android:name=".SybLFirebaseMessagingService"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.google.firebase.MESSAGING_EVENT" />
+            </intent-filter>
+        </service>
+        <receiver
+            android:name=".IncomingCallActionReceiver"
+            android:exported="false" />
+        <receiver
+            android:name=".MessageNotificationActionReceiver"
+            android:exported="false" />
+        <!-- User-enabled Android controllee. Android requires an accessibility
+             service to be exported for the system to bind it; the signature
+             BIND_ACCESSIBILITY_SERVICE permission limits that binding to the
+             OS, and no separate production input command is exported. -->
+        <service
+            android:name=".AndroidRemoteControlAccessibilityService"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
+            android:exported="true"
+            android:label="@string/remote_control_accessibility_label">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService"/>
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/remote_control_accessibility_service"/>
+        </service>
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths"/>
+        </provider>
+
+        <!-- Don't delete the meta-data below.
+             This is used by the Flutter tool to generate GeneratedPluginRegistrant.java -->
+        <meta-data
+            android:name="flutterEmbedding"
+            android:value="2" />
+    </application>
+    <!-- Required to query activities that can process text, see:
+         https://developer.android.com/training/package-visibility and
+         https://developer.android.com/reference/android/content/Intent#ACTION_PROCESS_TEXT.
+
+         In particular, this is used by the Flutter engine in io.flutter.plugin.text.ProcessTextPlugin. -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.PROCESS_TEXT"/>
+            <data android:mimeType="text/plain"/>
+        </intent>
+    </queries>
+</manifest>

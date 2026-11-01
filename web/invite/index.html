@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <meta name="robots" content="noindex,nofollow">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; font-src 'self'; connect-src 'none'; base-uri 'none'; form-action 'none'; object-src 'none'">
+  <title>Your invitation · Doorlight</title>
+  <link rel="stylesheet" href="./style.css">
+  <script type="module" src="./app.mjs"></script>
+</head>
+<body>
+  <header><img src="./assets/mark.png" width="32" height="32" alt=""><span>Doorlight</span></header>
+  <main>
+    <img class="hero" src="./assets/hero.png" width="112" height="112" alt="">
+    <h1 id="heading">Your invitation to Doorlight</h1>
+    <p id="status" role="status">Checking this invitation…</p>
+    <section id="invitation" hidden aria-label="Continue your invitation">
+      <p>A warm, private messenger for people who already know each other.</p>
+      <a id="continue" class="primary">Open Doorlight &amp; continue</a>
+      <p class="hint">You’ll choose whether to add this person in the app. Opening this link does not add a friend.</p>
+      <details><summary>Check Friend ID</summary><p id="friend-id" class="fingerprint"></p><p class="hint">The name in this invitation is supplied by its sender. It is not a verified identity.</p></details>
+      <section class="install" aria-labelledby="install-heading">
+        <h2 id="install-heading">Need to install Doorlight?</h2>
+        <p>Install the app, then return to this page and choose <strong>Open Doorlight &amp; continue</strong>.</p>
+        <div class="downloads">
+          <a id="windows-download" hidden target="_blank" rel="noopener noreferrer">Download for Windows</a>
+          <a id="android-download" hidden target="_blank" rel="noopener noreferrer">Download for Android</a>
+        </div>
+        <p id="download-unavailable" class="hint" hidden>Downloads are not configured here. Ask the person who invited you for the application, then return to this page.</p>
+        <p class="hint">Keep this page open while you install. Everyone receives the same application; your invitation stays in this page’s address.</p>
+      </section>
+    </section>
+    <noscript><p>Enable JavaScript to read this invitation on your device. The invitation is not sent to this website’s server.</p></noscript>
+  </main>
+  <footer>No account or tracking on this page. Invitation details are read only in your browser.</footer>
+</body>
+</html>

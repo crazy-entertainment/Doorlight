@@ -1,0 +1,636 @@
+/*
+ *  Copyright (C) 2004-2026 Savoir-faire Linux Inc.
+ *
+ *  This program is free software: you can redistribute it and/or modify
+ *  it under the terms of the GNU General Public License as published by
+ *  the Free Software Foundation, either version 3 of the License, or
+ *  (at your option) any later version.
+ *
+ *  This program is distributed in the hope that it will be useful,
+ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ *  GNU General Public License for more details.
+ *
+ *  You should have received a copy of the GNU General Public License
+ *  along with this program. If not, see <https://www.gnu.org/licenses/>.
+ */
+
+#include <cstdio>
+#include <cstring>
+#include <cerrno>
+#include <ctime>
+
+#include "client/jami_signal.h"
+
+#include <fmt/core.h>
+#include <fmt/format.h>
+#include <fmt/compile.h>
+
+#ifdef _MSC_VER
+#include <sys_time.h>
+#else
+#include <sys/time.h>
+#endif
+
+#include <atomic>
+#include <condition_variable>
+#include <fstream>
+#include <string>
+#include <mutex>
+#include <thread>
+#include <list>
+
+#include "logger.h"
+
+#include <stdio.h>
+#ifdef __linux__
+#include <unistd.h>
+#include <syslog.h>
+#include <sys/syscall.h>
+#endif // __linux__
+
+#ifdef __ANDROID__
+#ifndef APP_NAME
+#define APP_NAME "libjami"
+#endif /* APP_NAME */
+#endif
+
+#define END_COLOR "\033[0m"
+
+#ifndef _WIN32
+#define RED    "\033[22;31m"
+#define YELLOW "\033[01;33m"
+#define CYAN   "\033[22;36m"
+#else
+#define FOREGROUND_WHITE 0x000f
+#define RED              FOREGROUND_RED + 0x0008
+#define YELLOW           FOREGROUND_RED + FOREGROUND_GREEN + 0x0008
+#define CYAN             FOREGROUND_BLUE + FOREGROUND_GREEN + 0x0008
+#define LIGHT_GREEN      FOREGROUND_GREEN + 0x0008
+#endif // _WIN32
+
+#define LOGFILE "jami"
+
+namespace jami {
+
+static constexpr auto ENDL = '\n';
+
+#ifndef __GLIBC__
+static const char*
+check_error(int result, char* buffer)
+{
+    switch (result) {
+    case 0:
+        return buffer;
+
+    case ERANGE: /* should never happen */
+        return "unknown (too big to display)";
+
+    default:
+        return "unknown (invalid error number)";
+    }
+}
+
+static const char*
+check_error(char* result, char*)
+{
+    return result;
+}
+#endif
+
+void
+strErr()
+{
+#ifdef __GLIBC__
+    JAMI_ERROR("{}", strerror(errno));
+#else
+    char buf[1000];
+    JAMI_ERROR("{}", check_error(strerror_r(errno, buf, sizeof(buf)), buf));
+#endif
+}
+
+// extract the last component of a pathname (extract a filename from its dirname)
+static constexpr std::string_view
+stripDirName(std::string_view path)
+{
+    if (!path.empty()) {
+        size_t pos = path.find_last_of("/\\");
+        if (pos != std::string_view::npos)
+            return path.substr(pos + 1);
+    }
+    return path;
+}
+
+static std::string
+formatHeader(std::string_view file, unsigned line)
+{
+#ifdef __linux__
+    auto tid = syscall(__NR_gettid) & 0xffff;
+#else
+    auto tid = std::this_thread::get_id();
+#endif // __linux__
+
+    unsigned int secs, milli;
+    struct timeval tv;
+    if (!gettimeofday(&tv, NULL)) {
+        secs = tv.tv_sec;
+        milli = tv.tv_usec / 1000; // suppose that milli < 1000
+    } else {
+        secs = time(NULL);
+        milli = 0;
+    }
+
+    if (!file.empty()) {
+        return fmt::format(FMT_COMPILE("[{: >3d}.{:0<3d}|{: >4}|{: <24s}:{: <4d}] "),
+                           secs,
+                           milli,
+                           tid,
+                           stripDirName(file),
+                           line);
+    } else {
+        return fmt::format(FMT_COMPILE("[{: >3d}.{:0<3d}|{: >4}] "), secs, milli, tid);
+    }
+}
+
+static std::string
+formatPrintfArgs(const char* format, va_list ap)
+{
+    std::string ret;
+    /* A good guess of what we might encounter. */
+    static constexpr size_t default_buf_size = 80;
+
+    ret.resize(default_buf_size);
+
+    /* Necessary if we don't have enough space in buf. */
+    va_list cp;
+    va_copy(cp, ap);
+
+    int size = vsnprintf(ret.data(), ret.size(), format, ap);
+
+    /* Not enough space?  Well try again. */
+    if ((size_t) size >= ret.size()) {
+        ret.resize(size + 1);
+        vsnprintf((char*) ret.data(), ret.size(), format, cp);
+    }
+
+    ret.resize(size);
+
+    va_end(cp);
+
+    return ret;
+}
+
+namespace Logger {
+
+struct Msg
+{
+    Msg() = delete;
+
+    Msg(int level, std::string_view file, unsigned line, bool linefeed, std::string_view tag, std::string&& message)
+        : file_(stripDirName(file))
+        , line_(line)
+        , tag_(tag)
+        , payload_(std::move(message))
+        , level_(level)
+        , linefeed_(linefeed)
+        , header_(formatHeader(file_, line_))
+    {}
+
+    Msg(int level, std::string_view file, unsigned line, bool linefeed, std::string_view tag, const char* fmt, va_list ap)
+        : file_(stripDirName(file))
+        , line_(line)
+        , tag_(tag)
+        , payload_(formatPrintfArgs(fmt, ap))
+        , level_(level)
+        , linefeed_(linefeed)
+        , header_(formatHeader(file_, line_))
+    {}
+
+    Msg(Msg&& other) = default;
+    Msg& operator=(Msg&& other) = default;
+
+    std::string_view file_;
+    unsigned line_;
+    std::string tag_;
+    std::string payload_;
+    int level_;
+    bool linefeed_;
+    std::string header_;
+};
+
+class Handler
+{
+public:
+    virtual ~Handler() = default;
+
+    virtual void consume(const Msg& msg) = 0;
+
+    virtual void enable(bool en) { enabled_.store(en, std::memory_order_relaxed); }
+    bool isEnable() { return enabled_.load(std::memory_order_relaxed); }
+
+protected:
+    std::atomic_bool enabled_ {false};
+};
+
+class ConsoleLog final : public Handler
+{
+public:
+    ConsoleLog() = default;
+
+#ifdef _WIN32
+    void printLogImpl(const Msg& msg, bool with_color)
+    {
+        // If we are using Visual Studio, we can use OutputDebugString to print
+        // to the "Output" window. Otherwise, we just use fputs to stderr.
+        static std::function<void(const char* str)> fputsFunc = [](const char* str) {
+            fputs(str, stderr);
+        };
+        static std::function<void(const char* str)> outputDebugStringFunc = [](const char* str) {
+            OutputDebugStringA(str);
+        };
+        static std::function<void()> putcFunc = []() {
+            putc(ENDL, stderr);
+        };
+        // These next two functions will be used to print the message and line ending.
+        static auto printFunc = IsDebuggerPresent() ? outputDebugStringFunc : fputsFunc;
+        static auto endlFunc = IsDebuggerPresent() ? []() { OutputDebugStringA("\n"); } : putcFunc;
+
+        WORD saved_attributes;
+        static HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
+        auto& header = msg.header_;
+        if (with_color) {
+            static WORD color_header = CYAN;
+            WORD color_prefix = LIGHT_GREEN;
+            CONSOLE_SCREEN_BUFFER_INFO consoleInfo;
+
+            switch (msg.level_) {
+            case LOG_ERR:
+                color_prefix = RED;
+                break;
+
+            case LOG_WARNING:
+                color_prefix = YELLOW;
+                break;
+            }
+
+            GetConsoleScreenBufferInfo(hConsole, &consoleInfo);
+            saved_attributes = consoleInfo.wAttributes;
+            SetConsoleTextAttribute(hConsole, color_header);
+
+            printFunc(header.c_str());
+
+            SetConsoleTextAttribute(hConsole, saved_attributes);
+            SetConsoleTextAttribute(hConsole, color_prefix);
+        } else {
+            printFunc(header.c_str());
+        }
+
+        if (!msg.tag_.empty())
+            printFunc(msg.tag_.data());
+        printFunc(msg.payload_.c_str());
+
+        if (msg.linefeed_) {
+            endlFunc();
+        }
+
+        if (with_color) {
+            SetConsoleTextAttribute(hConsole, saved_attributes);
+        }
+    }
+#else
+    void printLogImpl(const Msg& msg, bool with_color)
+    {
+        if (with_color) {
+            constexpr const char* color_header = CYAN;
+            const char* color_prefix = "";
+
+            switch (msg.level_) {
+            case LOG_ERR:
+                color_prefix = RED;
+                break;
+
+            case LOG_WARNING:
+                color_prefix = YELLOW;
+                break;
+            }
+
+            fputs(color_header, stderr);
+            fwrite(msg.header_.c_str(), 1, msg.header_.size(), stderr);
+            fputs(END_COLOR, stderr);
+            fputs(color_prefix, stderr);
+        } else {
+            fwrite(msg.header_.c_str(), 1, msg.header_.size(), stderr);
+        }
+
+        if (!msg.tag_.empty())
+            fwrite(msg.tag_.data(), 1, msg.tag_.size(), stderr);
+        fputs(msg.payload_.c_str(), stderr);
+
+        if (with_color) {
+            fputs(END_COLOR, stderr);
+        }
+        if (msg.linefeed_) {
+            putc(ENDL, stderr);
+        }
+    }
+#endif /* _WIN32 */
+
+    bool withColor_ = !(getenv("NO_COLOR") || getenv("NO_COLORS") || getenv("NO_COLOUR") || getenv("NO_COLOURS"));
+
+    void consume(const Msg& msg) override { printLogImpl(msg, withColor_); }
+};
+
+class SysLog final : public Handler
+{
+public:
+    SysLog()
+    {
+#ifdef _WIN32
+        ::openlog(LOGFILE, WINLOG_PID, WINLOG_MAIL);
+#else
+#ifndef __ANDROID__
+        ::openlog(LOGFILE, LOG_NDELAY, LOG_USER);
+#endif
+#endif /* _WIN32 */
+    }
+
+    void consume(const Msg& msg) override
+    {
+#ifdef __ANDROID__
+        __android_log_write(msg.level_, msg.file_.data(), msg.payload_.c_str());
+#else
+        ::syslog(msg.level_,
+                 "%.*s%.*s",
+                 (int) msg.tag_.size(),
+                 msg.tag_.data(),
+                 (int) msg.payload_.size(),
+                 msg.payload_.data());
+#endif
+    }
+};
+
+class MonitorLog final : public Handler
+{
+public:
+    MonitorLog() = default;
+
+    void consume(const Msg& msg) override
+    {
+        auto message = msg.header_ + msg.payload_;
+        emitSignal<libjami::ConfigurationSignal::MessageSend>(message);
+    }
+};
+
+class FileLog final : public Handler
+{
+public:
+    FileLog() = default;
+
+    void setFile(const std::string& path)
+    {
+        std::lock_guard lk(mtx_);
+        if (file_.is_open())
+            file_.close();
+
+        if (not path.empty()) {
+            file_.open(path, std::ofstream::out | std::ofstream::app);
+            if (file_)
+                enable(true);
+            else
+                enable(false);
+        } else {
+            enable(false);
+        }
+    }
+
+    void consume(const Msg& msg) override
+    {
+        std::lock_guard lk(mtx_);
+        if (file_.is_open()) {
+            file_ << msg.header_ << msg.tag_ << msg.payload_;
+            if (msg.linefeed_)
+                file_ << ENDL;
+            file_.flush();
+        }
+    }
+
+private:
+    std::mutex mtx_;
+    std::ofstream file_;
+};
+
+class LogDispatcher final
+{
+public:
+    static LogDispatcher& instance()
+    {
+        static LogDispatcher* self = new LogDispatcher();
+        return *self;
+    }
+
+    void log(Msg&& msg)
+    {
+        {
+            std::lock_guard lk(mtx_);
+            if (!running_)
+                return;
+            if (!recycleQueue_.empty()) {
+                msgQueue_.splice(msgQueue_.end(), recycleQueue_, recycleQueue_.begin());
+                msgQueue_.back() = std::move(msg);
+            } else {
+                msgQueue_.emplace_back(std::move(msg));
+            }
+        }
+        cv_.notify_one();
+    }
+
+    void stop()
+    {
+        {
+            std::lock_guard lk(mtx_);
+            if (!running_)
+                return;
+            running_ = false;
+        }
+        cv_.notify_all();
+        if (thread_.joinable())
+            thread_.join();
+        recycleQueue_.splice(recycleQueue_.end(), std::move(msgQueue_));
+    }
+
+    ConsoleLog consoleLog;
+    SysLog sysLog;
+    MonitorLog monitorLog;
+    FileLog fileLog;
+
+    void enableFileLog(const std::string& path)
+    {
+        fileLog.setFile(path);
+        checkStatus();
+    }
+
+    void enableConsoleLog(bool en)
+    {
+        consoleLog.enable(en);
+        checkStatus();
+#ifdef _WIN32
+        static WORD original_attributes;
+        if (en) {
+            if (AttachConsole(ATTACH_PARENT_PROCESS) || AllocConsole()) {
+                FILE *fpstdout = stdout, *fpstderr = stderr;
+                freopen_s(&fpstdout, "CONOUT$", "w", stdout);
+                freopen_s(&fpstderr, "CONOUT$", "w", stderr);
+                // Save the original state of the console window(in case AttachConsole worked).
+                CONSOLE_SCREEN_BUFFER_INFO consoleInfo;
+                GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &consoleInfo);
+                original_attributes = consoleInfo.wAttributes;
+                SetConsoleCP(CP_UTF8);
+                SetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), ENABLE_QUICK_EDIT_MODE | ENABLE_EXTENDED_FLAGS);
+            }
+        } else {
+            // Restore the original state of the console window in case we attached.
+            SetConsoleTextAttribute(GetStdHandle(STD_OUTPUT_HANDLE), original_attributes);
+            FreeConsole();
+        }
+#endif
+    }
+
+    void enableSysLog(bool en)
+    {
+        sysLog.enable(en);
+        checkStatus();
+    }
+
+    void enableMonitorLog(bool en)
+    {
+        monitorLog.enable(en);
+        checkStatus();
+    }
+
+    bool isEnabled()
+    {
+        return consoleLog.isEnable() || sysLog.isEnable() || monitorLog.isEnable() || fileLog.isEnable();
+    }
+
+private:
+    LogDispatcher() = default;
+
+    void checkStatus()
+    {
+        bool en = isEnabled();
+        std::thread t;
+        {
+            std::lock_guard lk(mtx_);
+            if (en && !running_) {
+                running_ = true;
+                thread_ = std::thread(&LogDispatcher::loop, this);
+            } else if (!en && running_) {
+                running_ = false;
+                t = std::move(thread_);
+            }
+        }
+        if (t.joinable()) {
+            cv_.notify_all();
+            t.join();
+            std::lock_guard lk(mtx_);
+            recycleQueue_.splice(recycleQueue_.end(), std::move(msgQueue_));
+        }
+    }
+
+    void loop()
+    {
+        std::unique_lock lk(mtx_);
+        while (running_) {
+            cv_.wait(lk, [this] { return not msgQueue_.empty() or not running_; });
+            auto local = std::move(msgQueue_);
+            lk.unlock();
+            for (auto& msg : local) {
+                if (sysLog.isEnable())
+                    sysLog.consume(msg);
+                if (monitorLog.isEnable())
+                    monitorLog.consume(msg);
+                if (consoleLog.isEnable())
+                    consoleLog.consume(msg);
+                if (fileLog.isEnable())
+                    fileLog.consume(msg);
+
+                msg.payload_ = {};
+                msg.header_ = {};
+            }
+            lk.lock();
+            if (recycleQueue_.size() < 128)
+                recycleQueue_.splice(recycleQueue_.end(), local);
+        }
+    }
+
+    std::mutex mtx_;
+    std::condition_variable cv_;
+    std::list<Msg> msgQueue_;
+    std::list<Msg> recycleQueue_;
+    bool running_ {false};
+    std::thread thread_;
+};
+
+void
+setConsoleLog(bool en)
+{
+    LogDispatcher::instance().enableConsoleLog(en);
+}
+
+void
+setSysLog(bool en)
+{
+    LogDispatcher::instance().enableSysLog(en);
+}
+
+void
+setMonitorLog(bool en)
+{
+    LogDispatcher::instance().enableMonitorLog(en);
+}
+
+void
+setFileLog(const std::string& path)
+{
+    LogDispatcher::instance().enableFileLog(path);
+}
+
+static std::atomic_bool debugEnabled_ {false};
+
+void
+setDebugMode(bool enable)
+{
+    debugEnabled_.store(enable, std::memory_order_relaxed);
+}
+
+bool
+debugEnabled()
+{
+    return debugEnabled_.load(std::memory_order_relaxed);
+}
+
+void
+write(int level, std::string_view file, unsigned line, bool linefeed, std::string_view tag, std::string&& message)
+{
+    if (!LogDispatcher::instance().isEnabled()) {
+        return;
+    }
+    /* Timestamp is generated here. */
+    Msg msg(level, file, line, linefeed, tag, std::move(message));
+    LogDispatcher::instance().log(std::move(msg));
+}
+
+void
+fini()
+{
+    // Force close on file and join thread
+    LogDispatcher::instance().enableFileLog({});
+    LogDispatcher::instance().stop();
+
+#ifdef _WIN32
+    setConsoleLog(false);
+#endif /* _WIN32 */
+}
+
+} // namespace Logger
+} // namespace jami

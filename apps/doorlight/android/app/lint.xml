@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<lint>
+    <!-- Flutter rewrites this ignored, machine-local file on every build using
+         java.util.Properties-compatible Windows paths. Keep PropertyEscape
+         active for repository property files while excluding that generated
+         SDK locator only. -->
+    <issue id="PropertyEscape">
+        <ignore regexp=".*[\\/]android[\\/]local\.properties" />
+    </issue>
+</lint>

@@ -1,0 +1,338 @@
+/*
+ *  Copyright (C) 2004-2026 Savoir-faire Linux Inc.
+ *
+ *  This program is free software: you can redistribute it and/or modify
+ *  it under the terms of the GNU General Public License as published by
+ *  the Free Software Foundation, either version 3 of the License, or
+ *  (at your option) any later version.
+ *
+ *  This program is distributed in the hope that it will be useful,
+ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ *  GNU General Public License for more details.
+ *
+ *  You should have received a copy of the GNU General Public License
+ *  along with this program. If not, see <https://www.gnu.org/licenses/>.
+ */
+#pragma once
+
+#include "libav_deps.h"
+#include "media_buffer.h"
+
+#include <opendht/utils.h>
+#include <fmt/color.h>
+
+#include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <ratio>
+#include <string_view>
+
+#include "logger.h"
+
+#warning Debug utilities included in build
+
+using Clock = std::chrono::steady_clock;
+using namespace std::literals;
+
+namespace jami {
+namespace debug {
+
+/**
+ * Ex:
+ * Timer t;
+ * std::this_thread::sleep_for(std::chrono::milliseconds(10));
+ * JAMI_LOG("Task took {} ns", t.getDuration<std::chrono::nanoseconds>());
+ * // Timer also automatically prints duration on destruction
+ */
+class Timer
+{
+public:
+    Timer(std::string_view name)
+        : name_(name)
+        , start_(Clock::now())
+    {}
+
+    ~Timer() { print("end"sv); }
+
+    template<class Period = std::ratio<1>>
+    uint64_t getDuration() const
+    {
+        auto diff = std::chrono::duration_cast<Period>(Clock::now() - start_);
+        return diff.count();
+    }
+
+    void print(std::string_view action) const
+    {
+        JAMI_LOG("{}: {} after {}", name_, action, dht::print_duration(Clock::now() - start_));
+    }
+
+private:
+    std::string_view name_;
+    std::chrono::time_point<Clock> start_;
+};
+
+template<size_t N>
+struct StringLiteral
+{
+    consteval StringLiteral(const char (&str)[N]) { std::copy_n(str, N, value); }
+    char value[N];
+};
+
+/*
+ * Ex:
+ * StatsTimer<"TaskName"> timer;
+ * std::this_thread::sleep_for(std::chrono::milliseconds(10));
+ * // Timer automatically prints stats on destruction
+ */
+template<StringLiteral Tag>
+class StatsTimer
+{
+    using time_point = std::chrono::time_point<Clock>;
+    using duration = Clock::duration;
+
+public:
+    StatsTimer()
+        : start_(Clock::now())
+    {}
+
+    ~StatsTimer()
+    {
+        auto dt = Clock::now() - start_;
+        auto stats = inc(dt);
+        if (stats.count > 1) {
+            JAMI_LOG("{}: end after {} - Average duration: {} ({}) Total: {} Min: {} Max: {}",
+                     Tag.value,
+                     dht::print_duration(dt),
+                     fmt::styled(dht::print_duration(stats.total_duration / stats.count), fmt::emphasis::bold),
+                     stats.count,
+                     dht::print_duration(stats.total_duration),
+                     dht::print_duration(stats.min_duration),
+                     dht::print_duration(stats.max_duration));
+        } else {
+            JAMI_LOG("{}: end after {}", Tag.value, dht::print_duration(dt));
+        }
+    }
+
+private:
+    struct Stats
+    {
+        duration total_duration {};
+        duration min_duration {duration::max()};
+        duration max_duration {duration::min()};
+        duration::rep count {0};
+    };
+
+    time_point start_;
+    static inline std::mutex mutex_;
+    static inline Stats stats_;
+
+    Stats inc(duration dt)
+    {
+        std::lock_guard lock(mutex_);
+        stats_.total_duration += dt;
+        stats_.count++;
+        if (dt < stats_.min_duration)
+            stats_.min_duration = dt;
+        if (dt > stats_.max_duration)
+            stats_.max_duration = dt;
+        return stats_;
+    }
+};
+
+/**
+ * Audio logger. Writes a wav file from raw PCM or AVFrame. Helps debug what goes wrong with audio.
+ */
+class WavWriter
+{
+public:
+    WavWriter(const char* filename, AVFrame* frame)
+    {
+        JAMI_WARNING("WavWriter(): {} ({}, {})",
+                     filename,
+                     av_get_sample_fmt_name((AVSampleFormat) frame->format),
+                     frame->sample_rate);
+        avformat_alloc_output_context2(&format_ctx_, nullptr, "wav", filename);
+        if (!format_ctx_)
+            throw std::runtime_error("Failed to allocate output format context");
+
+        AVCodecID codec_id = AV_CODEC_ID_NONE;
+        switch (frame->format) {
+        case AV_SAMPLE_FMT_U8:
+            codec_id = AV_CODEC_ID_PCM_U8;
+            break;
+        case AV_SAMPLE_FMT_S16:
+        case AV_SAMPLE_FMT_S16P:
+            codec_id = AV_CODEC_ID_PCM_S16LE;
+            break;
+        case AV_SAMPLE_FMT_S32:
+        case AV_SAMPLE_FMT_S32P:
+            codec_id = AV_CODEC_ID_PCM_S32LE;
+            break;
+        case AV_SAMPLE_FMT_S64:
+        case AV_SAMPLE_FMT_S64P:
+            codec_id = AV_CODEC_ID_PCM_S64LE;
+            break;
+        case AV_SAMPLE_FMT_FLT:
+        case AV_SAMPLE_FMT_FLTP:
+            codec_id = AV_CODEC_ID_PCM_F32LE;
+            break;
+        case AV_SAMPLE_FMT_DBL:
+            codec_id = AV_CODEC_ID_PCM_F64LE;
+            break;
+        default:
+            throw std::runtime_error("Unsupported audio format");
+        }
+
+        const auto* codec = avcodec_find_encoder(codec_id);
+        if (!codec)
+            throw std::runtime_error("Failed to find audio codec");
+
+        codec_ctx_ = avcodec_alloc_context3(codec);
+        if (!codec_ctx_)
+            throw std::runtime_error("Failed to allocate audio codec context");
+
+        codec_ctx_->sample_fmt = (AVSampleFormat) frame->format;
+        codec_ctx_->ch_layout = frame->ch_layout;
+        codec_ctx_->sample_rate = frame->sample_rate;
+        if (format_ctx_->oformat->flags & AVFMT_GLOBALHEADER)
+            codec_ctx_->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+
+        if (avcodec_open2(codec_ctx_, codec, nullptr) < 0)
+            throw std::runtime_error("Failed to open audio codec");
+
+        stream_ = avformat_new_stream(format_ctx_, codec);
+        if (!stream_)
+            throw std::runtime_error("Failed to create audio stream");
+
+        if (avcodec_parameters_from_context(stream_->codecpar, codec_ctx_) < 0)
+            throw std::runtime_error("Failed to copy codec parameters to stream");
+
+        if (!(format_ctx_->oformat->flags & AVFMT_NOFILE)) {
+            if (avio_open(&format_ctx_->pb, filename, AVIO_FLAG_WRITE) < 0) {
+                throw std::runtime_error("Failed to open output file for writing");
+            }
+        }
+        if (avformat_write_header(format_ctx_, nullptr) < 0)
+            throw std::runtime_error("Failed to write header to output file");
+    }
+
+    void write(AVFrame* frame)
+    {
+        int ret = avcodec_send_frame(codec_ctx_, frame);
+        if (ret < 0)
+            JAMI_ERROR("Error sending a frame to the encoder");
+        while (ret >= 0) {
+            AVPacket* pkt = av_packet_alloc();
+            ret = avcodec_receive_packet(codec_ctx_, pkt);
+            if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
+                break;
+            else if (ret < 0) {
+                JAMI_ERROR("Error encoding a frame");
+                break;
+            }
+            pkt->stream_index = stream_->index;
+            pkt->pts = lastPts;
+            pkt->dts = lastPts;
+            lastPts += frame->nb_samples * (int64_t) stream_->time_base.den
+                       / (stream_->time_base.num * (int64_t) frame->sample_rate);
+            ret = av_write_frame(format_ctx_, pkt);
+            if (ret < 0) {
+                JAMI_ERROR("Error while writing output packet");
+                break;
+            }
+            av_packet_free(&pkt);
+        }
+    }
+
+    ~WavWriter()
+    {
+        if (codec_ctx_) {
+            avcodec_close(codec_ctx_);
+            avcodec_free_context(&codec_ctx_);
+        }
+        if (format_ctx_) {
+            av_write_trailer(format_ctx_);
+            if (!(format_ctx_->oformat->flags & AVFMT_NOFILE))
+                avio_closep(&format_ctx_->pb);
+            avformat_free_context(format_ctx_);
+        }
+    }
+
+private:
+    AVFormatContext* format_ctx_ {nullptr};
+    AVCodecContext* codec_ctx_ {nullptr};
+    AVStream* stream_ {nullptr};
+    int64_t lastPts {0};
+};
+
+/**
+ * Minimally invasive video writer. Writes raw frames. Helps debug what goes wrong with video.
+ */
+class VideoWriter
+{
+public:
+    VideoWriter(const std::string& filename, AVPixelFormat format, int width, int height)
+        : filename_(filename)
+        , format_(format)
+        , width_(width)
+        , height_(height)
+    {
+        f_ = fopen(filename.c_str(), "wb");
+    }
+
+    // so an int (VideoFrame.format()) can be passed without casting
+    VideoWriter(const std::string& filename, int format, int width, int height)
+        : VideoWriter(filename, static_cast<AVPixelFormat>(format), width, height)
+    {}
+
+    ~VideoWriter()
+    {
+        fclose(f_);
+        JAMI_LOG("Play video file with: ffplay -f rawvideo -pixel_format {} -video_size {}x{} {}",
+                 av_get_pix_fmt_name(format_),
+                 width_,
+                 height_,
+                 filename_);
+    }
+
+    void write(VideoFrame& frame)
+    {
+        int ret = 0;
+        uint8_t* buffer = nullptr;
+        auto* f = frame.pointer();
+
+        if (format_ != f->format || width_ != f->width || height_ != f->height)
+            return;
+
+        int size = av_image_get_buffer_size(format_, width_, height_, 1);
+        buffer = reinterpret_cast<uint8_t*>(av_malloc(size));
+        if (!buffer) {
+            return;
+        }
+        if ((ret = av_image_copy_to_buffer(buffer,
+                                           size,
+                                           reinterpret_cast<const uint8_t* const*>(f->data),
+                                           reinterpret_cast<const int*>(f->linesize),
+                                           format_,
+                                           width_,
+                                           height_,
+                                           1))
+            < 0) {
+            av_freep((void*) &buffer);
+            return;
+        }
+
+        fwrite(buffer, 1, size, f_);
+        av_freep((void*) &buffer);
+    }
+
+private:
+    FILE* f_;
+    std::string filename_;
+    AVPixelFormat format_;
+    int width_, height_;
+};
+
+} // namespace debug
+} // namespace jami

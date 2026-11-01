@@ -1,0 +1,13 @@
+Doorlight Widget — data use
+
+Clock, timer, crosshair and weather utilities can run without the Doorlight desktop app. An optional connection to Doorlight on this Windows user account provides chat, calls, desktop shortcuts, cursor/aim reactions and settings sync. The desktop app manages chat, calls, microphone access, input and identity.
+
+Chat displayed in Xbox Game Bar is visible to screenshots, recordings and streams. Doorlight requires the installation's Show choice before sharing chat with the widget. Lock, trust loss, account changes and disconnect retire that access.
+
+Weather
+Typing a city or postal code sends that search text to geocoding-api.open-meteo.com after a short pause. Selecting a result stores that place in the widget's local settings and syncs it with Doorlight when connected. An open weather widget sends the selected coordinates to api.open-meteo.com for current conditions, normally every 15 minutes. No Windows location-sensor permission is used.
+
+These HTTPS services receive the request, IP address and ordinary connection metadata. Open-Meteo's own handling and retention are described at https://open-meteo.com/en/terms . The widget cannot delete provider logs.
+
+Local data
+Widget preferences, offline merge baselines and selected image/audio files use package-local storage. A connected desktop app also retains widget settings. Removing a weather widget updates its local settings and syncs that change when connected. Merge baselines may retain prior settings until that sync completes; uninstalling only this package does not remove desktop-app data. Package-local diagnostics record connection/error details and have no implemented automatic retention limit. No automatic diagnostic upload is implemented in this widget.

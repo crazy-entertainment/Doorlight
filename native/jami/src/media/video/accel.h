@@ -1,0 +1,174 @@
+/*
+ *  Copyright (C) 2004-2026 Savoir-faire Linux Inc.
+ *
+ *  This program is free software: you can redistribute it and/or modify
+ *  it under the terms of the GNU General Public License as published by
+ *  the Free Software Foundation, either version 3 of the License, or
+ *  (at your option) any later version.
+ *
+ *  This program is distributed in the hope that it will be useful,
+ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ *  GNU General Public License for more details.
+ *
+ *  You should have received a copy of the GNU General Public License
+ *  along with this program. If not, see <https://www.gnu.org/licenses/>.
+ */
+#pragma once
+
+#include "libav_deps.h"
+#include "media_codec.h"
+#include "video/video_base.h"
+
+#include <memory>
+#include <string>
+#include <list>
+
+extern "C" {
+#include <libavutil/hwcontext.h>
+}
+
+namespace jami {
+namespace video {
+
+enum class DeviceState : uint8_t { NOT_TESTED, USABLE, NOT_USABLE };
+
+/**
+ * @brief Provides an abstraction layer to the hardware acceleration APIs in FFmpeg.
+ */
+class HardwareAccel
+{
+public:
+    /**
+     * @brief Transfers hardware frame to main memory.
+     *
+     * Transfers a hardware decoded frame back to main memory. Should be called after
+     * the frame is decoded using avcodec_send_packet/avcodec_receive_frame.
+     *
+     * If @frame is software, this is a no-op.
+     *
+     * @param frame Refrerence to the decoded hardware frame.
+     * @param desiredFormat Software pixel format that the hardware outputs.
+     * @returns Software frame.
+     */
+    static std::unique_ptr<VideoFrame> transferToMainMemory(const VideoFrame& frame, AVPixelFormat desiredFormat);
+
+    /**
+     * @brief Constructs a HardwareAccel object
+     *
+     * Made public so std::unique_ptr can access it. Should not be called.
+     */
+    HardwareAccel(AVCodecID id,
+                  const std::string& name,
+                  AVHWDeviceType hwType,
+                  AVPixelFormat format,
+                  AVPixelFormat swFormat,
+                  CodecType type,
+                  bool dynBitrate);
+
+    /**
+     * @brief Dereferences hardware contexts.
+     */
+    ~HardwareAccel();
+
+    /**
+     * @brief Codec that is being accelerated.
+     */
+    AVCodecID getCodecId() const { return id_; };
+
+    /**
+     * @brief Name of the hardware layer/API being used.
+     */
+    const std::string& getName() const { return name_; };
+
+    /**
+     * @brief Hardware format.
+     */
+    AVPixelFormat getFormat() const { return format_; };
+
+    /**
+     * @brief Software format.
+     *
+     * For encoding it is the format expected by the hardware. For decoding
+     * it is the format output by the hardware.
+     */
+    AVPixelFormat getSoftwareFormat() const { return swFormat_; }
+
+    /**
+     * @brief Gets the name of the codec.
+     *
+     * Decoding: avcodec_get_name(id_)
+     * Encoding: avcodec_get_name(id_) + '_' + name_
+     */
+    std::string getCodecName() const;
+
+    /**
+     * @brief If hardware decoder can feed hardware encoder directly.
+     *
+     * Returns whether or not the decoder is linked to an encoder or vice-versa. Being linked
+     * means an encoder can directly use the decoder's hardware frame, without first
+     * transferring it to main memory.
+     */
+    bool isLinked() const { return linked_; }
+
+    /**
+     * @brief Set some extra details in the codec context.
+     *
+     * Should be called after a successful
+     * setup (setupDecoder or setupEncoder).
+     * For decoding, sets the hw_device_ctx and get_format callback. If the decoder has
+     * a frames context, mark as linked.
+     * For encoding, sets hw_device_ctx and hw_frames_ctx, and may set some hardware
+     * codec options.
+     */
+    void setDetails(AVCodecContext* codecCtx);
+
+    /**
+     * @brief Transfers a frame to/from the GPU memory.
+     *
+     * Transfers a hardware decoded frame back to main memory. Should be called after
+     * the frame is decoded using avcodec_send_packet/avcodec_receive_frame or before
+     * the frame is encoded using avcodec_send_frame/avcodec_receive_packet.
+     *
+     * @param frame Hardware frame when decoding, software frame when encoding.
+     * @returns Software frame when decoding, hardware frame when encoding.
+     */
+    std::unique_ptr<VideoFrame> transfer(const VideoFrame& frame);
+
+    /**
+     * @brief Links this HardwareAccel's frames context with the passed in context.
+     *
+     * This serves to skip transferring a decoded frame back to main memory before encoding.
+     */
+    bool linkHardware(AVBufferRef* framesCtx);
+
+    static std::list<HardwareAccel> getCompatibleAccel(AVCodecID id, int width, int height, CodecType type);
+    int initAPI(bool linkable, AVBufferRef* framesCtx);
+    bool dynBitrate() { return dynBitrate_; }
+
+private:
+    bool initDevice(const std::string& device);
+    bool initFrame();
+
+    AVCodecID id_ {AV_CODEC_ID_NONE};
+    std::string name_;
+    AVHWDeviceType hwType_ {AV_HWDEVICE_TYPE_NONE};
+    AVPixelFormat format_ {AV_PIX_FMT_NONE};
+    AVPixelFormat swFormat_ {AV_PIX_FMT_NONE};
+    CodecType type_ {CODEC_NONE};
+    bool linked_ {false};
+    int width_ {0};
+    int height_ {0};
+    bool dynBitrate_ {false};
+
+    AVBufferRef* deviceCtx_ {nullptr};
+    AVBufferRef* framesCtx_ {nullptr};
+
+    int init_device(const char* name, const char* device, int flags);
+    int init_device_type(std::string& dev);
+
+    std::list<std::pair<std::string, DeviceState>>* possible_devices_;
+};
+
+} // namespace video
+} // namespace jami

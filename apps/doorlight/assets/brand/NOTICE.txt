@@ -1,0 +1,26 @@
+Doorlight artwork provenance
+
+mark.png is the deterministic glowing open-door icon rendered by
+tools/generate_brand_assets.py, following DoorlightDoorMark's open geometry.
+The owner approved this replacement for the disc-and-door app icon.
+hero.png is an exact copy of design/logo2.png (1254 x 1254 RGB).
+SHA-256: f7f20bf94c016673219ce1600ae73f0ec6d88ac585e0f3b95039c6e1a9173d64
+about.png uses the 256 px Windows icon frame generated from the owner's
+design/windows-icon.png artwork, including a size override when supplied.
+The About dialog uses this current icon instead of the older hero.png artwork.
+
+These source PNGs were supplied in the application's repository. The owner
+previously assigned the disc-and-door artwork to icons and the detailed doorway
+artwork to welcome/About surfaces. The original design/logo.png remains intact:
+SHA-256: 1aa63e1b05a8611a5a6853f797f0ed0914c1b8197332d09835bc3a0a7cc319c4
+
+tools/generate_brand_assets.py (Pillow 12.3.0) renders the open doorway with
+warm floor light for Android launcher/adaptive icons and multi-resolution
+Windows ICO images. Small icons omit the glow to preserve the door silhouette.
+Notification and themed icons use white geometry with a transparent interior.
+The original source PNG bytes are hash-checked and preserved. No artwork is
+traced and no external fonts, network access or runtime dependency is needed.
+
+Repository presence and the owner's role assignment are not proof of public
+redistribution clearance. Authorship, license and third-party-rights clearance
+remain release-maintainer requirements; no new asset license is asserted here.

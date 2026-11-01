@@ -1,0 +1,1041 @@
+/*
+ *  Copyright (C) 2004-2026 Savoir-faire Linux Inc.
+ *
+ *  This program is free software: you can redistribute it and/or modify
+ *  it under the terms of the GNU General Public License as published by
+ *  the Free Software Foundation, either version 3 of the License, or
+ *  (at your option) any later version.
+ *
+ *  This program is distributed in the hope that it will be useful,
+ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ *  GNU General Public License for more details.
+ *
+ *  You should have received a copy of the GNU General Public License
+ *  along with this program. If not, see <https://www.gnu.org/licenses/>.
+ */
+
+#ifdef HAVE_CONFIG_H
+#include "config.h"
+#endif
+
+#include "fileutils.h"
+#include "logger.h"
+#include "archiver.h"
+#include "compiler_intrinsics.h"
+#include "base64.h"
+#include "string_utils.h"
+
+#include <opendht/crypto.h>
+
+#ifdef __APPLE__
+#include <TargetConditionals.h>
+#endif
+
+#if defined(__ANDROID__) || (defined(TARGET_OS_IOS) && TARGET_OS_IOS)
+#include "client/jami_signal.h"
+#endif
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include "string_utils.h"
+#endif
+
+#include <sys/types.h>
+#include <sys/stat.h>
+
+#ifndef _MSC_VER
+#include <libgen.h>
+#endif
+
+#ifdef _MSC_VER
+#include "windirent.h"
+#else
+#include <dirent.h>
+#endif
+
+#include <signal.h>
+#include <unistd.h>
+#include <fcntl.h>
+#ifndef _WIN32
+#include <pwd.h>
+#else
+#include <shlobj.h>
+#define NAME_MAX 255
+#endif
+#if !defined __ANDROID__ && !defined _WIN32
+#include <wordexp.h>
+#endif
+
+#include <nettle/sha3.h>
+#include <nettle/version.h>
+
+#include <sstream>
+#include <fstream>
+#include <iostream>
+#include <stdexcept>
+#include <limits>
+#include <array>
+#include <atomic>
+#include <algorithm>
+
+#include <cstdlib>
+#include <cstring>
+#include <cerrno>
+#include <cstddef>
+
+#include <pj/ctype.h>
+#include <pjlib-util/md5.h>
+
+#ifndef _MSC_VER
+#define PROTECTED_GETENV(str) \
+    ({ \
+        char* envvar_ = getenv((str)); \
+        envvar_ ? envvar_ : ""; \
+    })
+
+#define XDG_DATA_HOME   (PROTECTED_GETENV("XDG_DATA_HOME"))
+#define XDG_CONFIG_HOME (PROTECTED_GETENV("XDG_CONFIG_HOME"))
+#define XDG_CACHE_HOME  (PROTECTED_GETENV("XDG_CACHE_HOME"))
+#else
+const wchar_t*
+winGetEnv(const wchar_t* name)
+{
+    const DWORD buffSize = 65535;
+    static wchar_t buffer[buffSize];
+    if (GetEnvironmentVariable(name, buffer, buffSize)) {
+        return buffer;
+    } else {
+        return L"";
+    }
+}
+
+#define PROTECTED_GETENV(str) winGetEnv(str)
+
+#define JAMI_DATA_HOME   PROTECTED_GETENV(L"JAMI_DATA_HOME")
+#define JAMI_CONFIG_HOME PROTECTED_GETENV(L"JAMI_CONFIG_HOME")
+#define JAMI_CACHE_HOME  PROTECTED_GETENV(L"JAMI_CACHE_HOME")
+#endif
+
+#define PIDFILE     ".ring.pid"
+#define ERASE_BLOCK 4096
+
+namespace {
+
+std::atomic<uint64_t> archiveTempCounter {0};
+std::atomic<jami::fileutils::ArchiveWriteFailpoint> archiveWriteFailpoint {jami::fileutils::ArchiveWriteFailpoint::None};
+
+uint64_t
+processId()
+{
+#ifdef _WIN32
+    return GetCurrentProcessId();
+#else
+    return static_cast<uint64_t>(getpid());
+#endif
+}
+
+std::filesystem::path
+archiveTemporaryPath(const std::filesystem::path& path)
+{
+    auto temporary = path;
+    temporary += ".tmp.";
+    temporary += std::to_string(processId());
+    temporary += ".";
+    temporary += std::to_string(archiveTempCounter.fetch_add(1, std::memory_order_relaxed));
+    return temporary;
+}
+
+enum class DurableWriteResult { Success, Exists, Error };
+
+DurableWriteResult
+writeFileDurably(const std::filesystem::path& path, const uint8_t* data, size_t dataSize, mode_t mode)
+{
+#ifdef _WIN32
+    (void) mode;
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        const auto error = GetLastError();
+        return error == ERROR_FILE_EXISTS || error == ERROR_ALREADY_EXISTS ? DurableWriteResult::Exists
+                                                                           : DurableWriteResult::Error;
+    }
+
+    bool success = true;
+    size_t offset = 0;
+    while (offset < dataSize) {
+        const auto chunk = static_cast<DWORD>(std::min<size_t>(dataSize - offset, std::numeric_limits<DWORD>::max()));
+        DWORD written = 0;
+        if (!WriteFile(file, data + offset, chunk, &written, nullptr) || written != chunk) {
+            success = false;
+            break;
+        }
+        offset += written;
+    }
+    if (success)
+        success = FlushFileBuffers(file);
+    if (!CloseHandle(file))
+        success = false;
+    return success ? DurableWriteResult::Success : DurableWriteResult::Error;
+#else
+    const int file = open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, mode);
+    if (file < 0)
+        return errno == EEXIST ? DurableWriteResult::Exists : DurableWriteResult::Error;
+
+    bool success = true;
+    size_t offset = 0;
+    while (offset < dataSize) {
+        const auto chunk = std::min<size_t>(dataSize - offset, static_cast<size_t>(std::numeric_limits<ssize_t>::max()));
+        const auto written = write(file, data + offset, chunk);
+        if (written < 0) {
+            if (errno == EINTR)
+                continue;
+            success = false;
+            break;
+        }
+        if (written == 0) {
+            success = false;
+            break;
+        }
+        offset += static_cast<size_t>(written);
+    }
+    if (success && fchmod(file, mode) < 0)
+        success = false;
+    if (success && fsync(file) < 0)
+        success = false;
+    if (close(file) < 0)
+        success = false;
+    return success ? DurableWriteResult::Success : DurableWriteResult::Error;
+#endif
+}
+
+void
+removeTemporaryFile(const std::filesystem::path& path)
+{
+#ifdef _WIN32
+    DeleteFileW(path.c_str());
+#else
+    unlink(path.c_str());
+#endif
+}
+
+bool
+replaceFileAtomically(const std::filesystem::path& temporary, const std::filesystem::path& destination)
+{
+#ifdef _WIN32
+    return MoveFileExW(temporary.c_str(), destination.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+#else
+    if (rename(temporary.c_str(), destination.c_str()) < 0)
+        return false;
+
+    auto parent = destination.parent_path();
+    if (parent.empty())
+        parent = ".";
+#ifdef O_DIRECTORY
+    const int directory = open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+#else
+    const int directory = open(parent.c_str(), O_RDONLY | O_CLOEXEC);
+#endif
+    if (directory < 0)
+        return false;
+    const bool synced = fsync(directory) == 0;
+    const bool closed = close(directory) == 0;
+    return synced && closed;
+#endif
+}
+
+bool
+saveArchiveFile(const std::filesystem::path& path, const std::vector<uint8_t>& data)
+{
+    std::filesystem::path temporary;
+    for (unsigned attempt = 0; attempt < 100; ++attempt) {
+        temporary = archiveTemporaryPath(path);
+        const auto result = writeFileDurably(temporary, data.data(), data.size(), 0600);
+        if (result == DurableWriteResult::Success)
+            break;
+        if (result == DurableWriteResult::Error) {
+            removeTemporaryFile(temporary);
+            return false;
+        }
+        temporary.clear();
+    }
+    if (temporary.empty())
+        return false;
+
+    if (archiveWriteFailpoint.exchange(jami::fileutils::ArchiveWriteFailpoint::None)
+        == jami::fileutils::ArchiveWriteFailpoint::BeforeReplace) {
+        removeTemporaryFile(temporary);
+        return false;
+    }
+
+    if (!replaceFileAtomically(temporary, path)) {
+        removeTemporaryFile(temporary);
+        return false;
+    }
+    return true;
+}
+
+} // namespace
+
+namespace jami {
+namespace fileutils {
+
+static std::filesystem::path resource_dir_path;
+
+void
+set_resource_dir_path(const std::filesystem::path& resourceDirPath)
+{
+    resource_dir_path = resourceDirPath;
+}
+
+const std::filesystem::path&
+get_resource_dir_path()
+{
+    static const std::filesystem::path jami_default_data_dir(JAMI_DATADIR);
+    return resource_dir_path.empty() ? jami_default_data_dir : resource_dir_path;
+}
+
+std::string
+expand_path(const std::string& path)
+{
+#if defined __ANDROID__ || defined _MSC_VER || defined WIN32 || defined __APPLE__
+    JAMI_ERROR("Path expansion not implemented, returning original");
+    return path;
+#else
+
+    std::string result;
+
+    wordexp_t p;
+    int ret = wordexp(path.c_str(), &p, 0);
+
+    switch (ret) {
+    case WRDE_BADCHAR:
+        JAMI_ERROR("Illegal occurrence of newline or one of |, &, ;, <, >, (, ), {{, }}.");
+        return result;
+    case WRDE_BADVAL:
+        JAMI_ERROR("An undefined shell variable was referenced");
+        return result;
+    case WRDE_CMDSUB:
+        JAMI_ERROR("Command substitution occurred");
+        return result;
+    case WRDE_SYNTAX:
+        JAMI_ERROR("Shell syntax error");
+        return result;
+    case WRDE_NOSPACE:
+        JAMI_ERROR("Out of memory.");
+        // This is the only error where we must call wordfree
+        break;
+    default:
+        if (p.we_wordc > 0)
+            result = std::string(p.we_wordv[0]);
+        break;
+    }
+
+    wordfree(&p);
+
+    return result;
+#endif
+}
+
+bool
+isDirectoryWritable(const std::string& directory)
+{
+    return accessFile(directory, W_OK) == 0;
+}
+
+bool
+createSymlink(const std::filesystem::path& linkFile, const std::filesystem::path& target)
+{
+    std::error_code ec;
+    std::filesystem::create_symlink(target, linkFile, ec);
+    if (ec) {
+        JAMI_WARNING("Unable to create soft link from {} to {}: {}", linkFile, target, ec.message());
+        return false;
+    } else {
+        JAMI_LOG("Created soft link from {} to {}", linkFile, target);
+    }
+    return true;
+}
+
+bool
+createHardlink(const std::filesystem::path& linkFile, const std::filesystem::path& target)
+{
+    std::error_code ec;
+    std::filesystem::create_hard_link(target, linkFile, ec);
+    if (ec) {
+        JAMI_WARNING("Unable to create hard link from {} to {}: {}", linkFile, target, ec.message());
+        return false;
+    } else {
+        JAMI_LOG("Created hard link from {} to {}", linkFile, target);
+    }
+    return true;
+}
+
+bool
+createFileLink(const std::filesystem::path& linkFile, const std::filesystem::path& target, bool hard)
+{
+    if (linkFile == target)
+        return true;
+    std::error_code ec;
+    // Use symlink_status() because exists() could return false for broken symlinks
+    auto status = std::filesystem::symlink_status(linkFile, ec);
+    if (status.type() != std::filesystem::file_type::not_found) {
+        if (status.type() == std::filesystem::file_type::symlink
+            && std::filesystem::read_symlink(linkFile, ec) == target) {
+            JAMI_DEBUG("createFileLink: {} symlink already points to target {}", linkFile, target);
+            return true;
+        }
+        // Remove any existing file or symlink before creating a new one, as create_symlink()
+        // will fail with "File exists" error if the linkFile path already exists.
+        if (status.type() == std::filesystem::file_type::regular
+            || status.type() == std::filesystem::file_type::symlink) {
+            std::filesystem::remove(linkFile, ec);
+        }
+    }
+
+    // Try to create a hard link if requested; fall back to symlink on failure
+    if (not hard or not createHardlink(linkFile, target))
+        return createSymlink(linkFile, target);
+    return true;
+}
+
+std::string_view
+getFileExtension(std::string_view filename)
+{
+    std::string_view result;
+    auto sep = filename.find_last_of('.');
+    if (sep != std::string_view::npos && sep != filename.size() - 1)
+        result = filename.substr(sep + 1);
+    if (result.size() >= 8)
+        return {};
+    return result;
+}
+
+bool
+isPathRelative(const std::filesystem::path& path)
+{
+    return not path.empty() and path.is_relative();
+}
+
+std::string
+getCleanPath(const std::string& base, const std::string& path)
+{
+    if (base.empty() or path.size() < base.size())
+        return path;
+    auto base_sep = base + DIR_SEPARATOR_STR;
+    if (path.compare(0, base_sep.size(), base_sep) == 0)
+        return path.substr(base_sep.size());
+    else
+        return path;
+}
+
+std::filesystem::path
+getFullPath(const std::filesystem::path& base, const std::filesystem::path& path)
+{
+    bool isRelative {not base.empty() and isPathRelative(path)};
+    return isRelative ? base / path : path;
+}
+
+std::vector<uint8_t>
+loadFile(const std::filesystem::path& path, const std::filesystem::path& default_dir)
+{
+    return dhtnet::fileutils::loadFile(getFullPath(default_dir, path));
+}
+
+std::string
+loadTextFile(const std::filesystem::path& path, const std::filesystem::path& default_dir)
+{
+    std::string buffer;
+    auto fullPath = getFullPath(default_dir, path);
+
+    // Open with explicit share mode to allow reading even if file is opened elsewhere
+#ifdef _WIN32
+    std::ifstream file(fullPath, std::ios::in | std::ios::binary, _SH_DENYNO);
+#else
+    std::ifstream file(fullPath);
+#endif
+
+    if (!file)
+        throw std::runtime_error("Unable to read file: " + path.string());
+
+    file.seekg(0, std::ios::end);
+    auto size = file.tellg();
+    if (size > std::numeric_limits<unsigned>::max())
+        throw std::runtime_error("File is too big: " + path.string());
+    buffer.resize(size);
+    file.seekg(0, std::ios::beg);
+    if (!file.read((char*) buffer.data(), size))
+        throw std::runtime_error("Unable to load file: " + path.string());
+    return buffer;
+}
+
+void
+saveFile(const std::filesystem::path& path, const uint8_t* data, size_t data_size, mode_t UNUSED mode)
+{
+    std::ofstream file(path, std::ios::trunc | std::ios::binary);
+    if (!file.is_open()) {
+        JAMI_ERROR("Unable to write data to {}", path);
+        return;
+    }
+    file.write((char*) data, data_size);
+#ifndef _WIN32
+    file.close();
+    if (chmod(path.c_str(), mode) < 0)
+        JAMI_WARNING("fileutils::saveFile(): chmod() failed on {}, {}", path, strerror(errno));
+#endif
+}
+
+std::vector<uint8_t>
+loadCacheFile(const std::filesystem::path& path, std::chrono::system_clock::duration maxAge)
+{
+    // last_write_time throws exception if file doesn't exist
+    std::error_code ec;
+    auto writeTime = std::filesystem::last_write_time(path, ec);
+    if (ec)
+        throw std::runtime_error("unable to get last write time of file");
+    auto now = decltype(writeTime)::clock::now();
+    if (now - writeTime > maxAge)
+        throw std::runtime_error("file too old " + dht::print_time_relative(now, writeTime));
+
+    JAMI_LOG("Loading cache file '{}'", path);
+    return dhtnet::fileutils::loadFile(path);
+}
+
+std::string
+loadCacheTextFile(const std::filesystem::path& path, std::chrono::system_clock::duration maxAge)
+{
+    // last_write_time throws exception if file doesn't exist
+    std::error_code ec;
+    auto writeTime = std::filesystem::last_write_time(path, ec);
+    if (ec)
+        throw std::runtime_error("unable to get last write time of file");
+    auto now = decltype(writeTime)::clock::now();
+    if (now - writeTime > maxAge)
+        throw std::runtime_error("file too old " + dht::print_time_relative(now, writeTime));
+
+    JAMI_LOG("Loading cache file '{}'", path);
+    return loadTextFile(path);
+}
+
+ArchiveStorageData
+readArchive(const std::filesystem::path& path, std::string_view scheme, const std::string& pwd)
+{
+    JAMI_LOG("Reading archive from {} with scheme '{}'", path, scheme);
+
+    auto isUnencryptedGzip = [](const std::vector<uint8_t>& data) {
+        // NOTE: some webserver modify gzip files and this can end with a gunzip in a gunzip
+        // file. So, to make the readArchive more robust, we can support this case by detecting
+        // gzip header via 1f8b 08
+        // We don't need to support more than 2 level, else somebody may be able to send
+        // gunzip in loops and abuse.
+        return data.size() > 3 && data[0] == 0x1f && data[1] == 0x8b && data[2] == 0x08;
+    };
+
+    auto decompress = [](std::vector<uint8_t>& data) {
+        try {
+            data = archiver::decompress(data, ARCHIVE_PLAINTEXT_MAX_BYTES);
+        } catch (const std::exception& e) {
+            JAMI_ERROR("Error decrypting archive: {}", e.what());
+            throw;
+        }
+    };
+
+    std::vector<uint8_t> fileContent;
+
+    // Read file
+    try {
+        fileContent = dhtnet::fileutils::loadFile(path);
+    } catch (const std::exception& e) {
+        JAMI_ERROR("Error loading archive: {}", e.what());
+        throw;
+    }
+
+    if (isUnencryptedGzip(fileContent)) {
+        if (!pwd.empty())
+            JAMI_WARNING("A gunzip in a gunzip is detected. A webserver may have a bad config");
+        decompress(fileContent);
+    }
+
+    ArchiveStorageData ret;
+    // ret.data = {fileContent.data(), fileContent.data()+fileContent.size()};
+
+    if (!pwd.empty()) {
+        // Decrypt
+        if (scheme == ARCHIVE_AUTH_SCHEME_KEY) {
+            try {
+                ret.salt = dht::crypto::aesGetSalt(fileContent);
+                fileContent = dht::crypto::aesDecrypt(dht::crypto::aesGetEncrypted(fileContent), base64::decode(pwd));
+            } catch (const std::exception& e) {
+                JAMI_ERROR("Error decrypting archive: {}", e.what());
+                throw;
+            }
+        } else if (scheme == ARCHIVE_AUTH_SCHEME_PASSWORD) {
+            try {
+                ret.salt = dht::crypto::aesGetSalt(fileContent);
+                fileContent = dht::crypto::aesDecrypt(fileContent, pwd);
+            } catch (const std::exception& e) {
+                JAMI_ERROR("Error decrypting archive: {}", e.what());
+                throw;
+            }
+        }
+        decompress(fileContent);
+    } else if (isUnencryptedGzip(fileContent)) {
+        JAMI_WARNING("A gunzip in a gunzip is detected. A webserver may have a bad config");
+        decompress(fileContent);
+    }
+    ret.data = {fileContent.data(), fileContent.data() + fileContent.size()};
+    return ret;
+}
+
+void
+setArchiveWriteFailpointForTesting(ArchiveWriteFailpoint failpoint)
+{
+    archiveWriteFailpoint.store(failpoint);
+}
+
+bool
+writeArchive(const std::string& archive_str,
+             const std::filesystem::path& path,
+             std::string_view scheme,
+             const std::string& password,
+             const std::vector<uint8_t>& password_salt)
+{
+    JAMI_LOG("Writing archive to {} using scheme '{}'", path, scheme);
+
+    try {
+        std::vector<uint8_t> encoded;
+        if (scheme == ARCHIVE_AUTH_SCHEME_KEY) {
+            // Encrypt using provided key
+            auto key = base64::decode(password);
+            auto newArchive = dht::crypto::aesEncrypt(archiver::compress(archive_str), key);
+            encoded = dht::crypto::aesBuildEncrypted(newArchive, password_salt);
+        } else if (scheme == ARCHIVE_AUTH_SCHEME_PASSWORD and not password.empty()) {
+            // Encrypt using provided password
+            encoded = dht::crypto::aesEncrypt(archiver::compress(archive_str), password, password_salt);
+        } else if (scheme == ARCHIVE_AUTH_SCHEME_NONE || (scheme == ARCHIVE_AUTH_SCHEME_PASSWORD && password.empty())) {
+            JAMI_WARNING("Unsecured archiving (no password)");
+            encoded = archiver::compressGzip(archive_str);
+        } else {
+            JAMI_ERROR("Unsupported scheme: {}", scheme);
+            return false;
+        }
+
+        if (!saveArchiveFile(path, encoded)) {
+            JAMI_ERROR("Unable to durably replace archive {}", path);
+            return false;
+        }
+        return true;
+    } catch (const std::exception& ex) {
+        JAMI_ERROR("Export failed: {}", ex.what());
+        return false;
+    } catch (...) {
+        JAMI_ERROR("Export failed with an unknown error");
+        return false;
+    }
+}
+
+std::filesystem::path
+get_cache_dir([[maybe_unused]] const char* pkg)
+{
+#if defined(__ANDROID__) || (defined(TARGET_OS_IOS) && TARGET_OS_IOS)
+    std::vector<std::string> paths;
+    paths.reserve(1);
+    emitSignal<libjami::ConfigurationSignal::GetAppDataPath>("cache", &paths);
+    if (not paths.empty())
+        return paths[0];
+    return {};
+#elif defined(__APPLE__)
+    return get_home_dir() / "Library" / "Caches" / pkg;
+#else
+#ifdef _WIN32
+    const std::wstring cache_home(JAMI_CACHE_HOME);
+    if (not cache_home.empty())
+        return jami::to_string(cache_home);
+#else
+    const std::string cache_home(XDG_CACHE_HOME);
+    if (not cache_home.empty())
+        return cache_home;
+#endif
+    return get_home_dir() / ".cache" / pkg;
+#endif
+}
+
+const std::filesystem::path&
+get_cache_dir()
+{
+    static const std::filesystem::path cache_dir = get_cache_dir(PACKAGE);
+    return cache_dir;
+}
+
+std::filesystem::path
+get_home_dir_impl()
+{
+#if defined(__ANDROID__) || (defined(TARGET_OS_IOS) && TARGET_OS_IOS)
+    std::vector<std::string> paths;
+    paths.reserve(1);
+    emitSignal<libjami::ConfigurationSignal::GetAppDataPath>("files", &paths);
+    if (not paths.empty())
+        return paths[0];
+    return {};
+#elif defined _WIN32
+    TCHAR path[MAX_PATH];
+    if (SUCCEEDED(SHGetFolderPath(nullptr, CSIDL_PROFILE, nullptr, 0, path))) {
+        return jami::to_string(path);
+    }
+    return {};
+#else
+
+    // 1) try getting user's home directory from the environment
+    std::string home(PROTECTED_GETENV("HOME"));
+    if (not home.empty())
+        return home;
+
+    // 2) try getting it from getpwuid_r (i.e. /etc/passwd)
+    const long max = sysconf(_SC_GETPW_R_SIZE_MAX);
+    if (max != -1) {
+        char buf[max];
+        struct passwd pwbuf, *pw;
+        if (getpwuid_r(getuid(), &pwbuf, buf, sizeof(buf), &pw) == 0 and pw != NULL)
+            return pw->pw_dir;
+    }
+
+    return {};
+#endif
+}
+
+const std::filesystem::path&
+get_home_dir()
+{
+    static const std::filesystem::path home_dir = get_home_dir_impl();
+    return home_dir;
+}
+
+std::filesystem::path
+get_data_dir([[maybe_unused]] const char* pkg)
+{
+#if defined(__ANDROID__) || (defined(TARGET_OS_IOS) && TARGET_OS_IOS)
+    std::vector<std::string> paths;
+    paths.reserve(1);
+    emitSignal<libjami::ConfigurationSignal::GetAppDataPath>("files", &paths);
+    if (not paths.empty())
+        return paths[0];
+    return {};
+#elif defined(__APPLE__)
+    return get_home_dir() / "Library" / "Application Support" / pkg;
+#elif defined(_WIN32)
+    std::wstring data_home(JAMI_DATA_HOME);
+    if (not data_home.empty())
+        return std::filesystem::path(data_home) / pkg;
+
+    if (!strcmp(pkg, "ring")) {
+        return get_home_dir() / ".local" / "share" / pkg;
+    } else {
+        return get_home_dir() / "AppData" / "Local" / pkg;
+    }
+#else
+    std::string_view data_home(XDG_DATA_HOME);
+    if (not data_home.empty())
+        return std::filesystem::path(data_home) / pkg;
+    // "If $XDG_DATA_HOME is either not set or empty, a default equal to
+    // $HOME/.local/share should be used."
+    return get_home_dir() / ".local" / "share" / pkg;
+#endif
+}
+
+const std::filesystem::path&
+get_data_dir()
+{
+    static const std::filesystem::path data_dir = get_data_dir(PACKAGE);
+    return data_dir;
+}
+
+std::filesystem::path
+get_config_dir([[maybe_unused]] const char* pkg)
+{
+    std::filesystem::path configdir;
+#if defined(__ANDROID__) || (defined(TARGET_OS_IOS) && TARGET_OS_IOS)
+    std::vector<std::string> paths;
+    emitSignal<libjami::ConfigurationSignal::GetAppDataPath>("config", &paths);
+    if (not paths.empty())
+        configdir = std::filesystem::path(paths[0]);
+#elif defined(__APPLE__)
+    configdir = fileutils::get_home_dir() / "Library" / "Application Support" / pkg;
+#elif defined(_WIN32)
+    std::wstring xdg_env(JAMI_CONFIG_HOME);
+    if (not xdg_env.empty()) {
+        configdir = std::filesystem::path(xdg_env) / pkg;
+    } else if (!strcmp(pkg, "ring")) {
+        configdir = fileutils::get_home_dir() / ".config" / pkg;
+    } else {
+        configdir = fileutils::get_home_dir() / "AppData" / "Local" / pkg;
+    }
+#else
+    std::string xdg_env(XDG_CONFIG_HOME);
+    if (not xdg_env.empty())
+        configdir = std::filesystem::path(xdg_env) / pkg;
+    else
+        configdir = fileutils::get_home_dir() / ".config" / pkg;
+#endif
+    if (!dhtnet::fileutils::recursive_mkdir(configdir, 0700)) {
+        // If directory creation failed
+        if (errno != EEXIST)
+            JAMI_LOG("Unable to create directory: {}!", configdir);
+    }
+    return configdir;
+}
+
+const std::filesystem::path&
+get_config_dir()
+{
+    static const std::filesystem::path config_dir = get_config_dir(PACKAGE);
+    return config_dir;
+}
+
+#ifdef _WIN32
+bool
+eraseFile_win32(const std::string& path, bool dosync)
+{
+    // Note: from
+    // https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-deletefilea#remarks To
+    // delete a read-only file, first you must remove the read-only attribute.
+    SetFileAttributesA(path.c_str(), GetFileAttributesA(path.c_str()) & ~FILE_ATTRIBUTE_READONLY);
+    HANDLE h = CreateFileA(path.c_str(), GENERIC_WRITE, 0, 0, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
+    if (h == INVALID_HANDLE_VALUE) {
+        JAMI_WARNING("Unable to open file {} for erasing.", path);
+        return false;
+    }
+
+    LARGE_INTEGER size;
+    if (!GetFileSizeEx(h, &size)) {
+        JAMI_WARNING("Unable to erase file {}: GetFileSizeEx() failed.", path);
+        CloseHandle(h);
+        return false;
+    }
+    if (size.QuadPart == 0) {
+        CloseHandle(h);
+        return false;
+    }
+
+    uint64_t size_blocks = size.QuadPart / ERASE_BLOCK;
+    if (size.QuadPart % ERASE_BLOCK)
+        size_blocks++;
+
+    char* buffer;
+    try {
+        buffer = new char[ERASE_BLOCK];
+    } catch (std::bad_alloc& ba) {
+        JAMI_WARNING("Unable to allocate buffer for erasing {}.", path);
+        CloseHandle(h);
+        return false;
+    }
+    memset(buffer, 0x00, ERASE_BLOCK);
+
+    OVERLAPPED ovlp;
+    if (size.QuadPart < (1024 - 42)) { // a small file can be stored in the MFT record
+        ovlp.Offset = 0;
+        ovlp.OffsetHigh = 0;
+        WriteFile(h, buffer, (DWORD) size.QuadPart, 0, &ovlp);
+        FlushFileBuffers(h);
+    }
+    for (uint64_t i = 0; i < size_blocks; i++) {
+        uint64_t offset = i * ERASE_BLOCK;
+        ovlp.Offset = offset & 0x00000000FFFFFFFF;
+        ovlp.OffsetHigh = offset >> 32;
+        WriteFile(h, buffer, ERASE_BLOCK, 0, &ovlp);
+    }
+
+    delete[] buffer;
+
+    if (dosync)
+        FlushFileBuffers(h);
+
+    CloseHandle(h);
+    return true;
+}
+
+#else
+
+bool
+eraseFile_posix(const std::string& path, bool dosync)
+{
+    struct stat st;
+    if (stat(path.c_str(), &st) == -1) {
+        JAMI_WARNING("Unable to erase file {}: fstat() failed.", path);
+        return false;
+    }
+    // Remove read-only flag if possible
+    chmod(path.c_str(), st.st_mode | (S_IWGRP + S_IWUSR));
+
+    int fd = open(path.c_str(), O_WRONLY);
+    if (fd == -1) {
+        JAMI_WARNING("Unable to open file {} for erasing.", path);
+        return false;
+    }
+
+    if (st.st_size == 0) {
+        close(fd);
+        return false;
+    }
+
+    lseek(fd, 0, SEEK_SET);
+
+    std::array<char, ERASE_BLOCK> buffer;
+    buffer.fill(0);
+    decltype(st.st_size) written(0);
+    while (written < st.st_size) {
+        auto ret = write(fd, buffer.data(), buffer.size());
+        if (ret < 0) {
+            JAMI_WARNING("Error while overriding file with zeros.");
+            break;
+        } else
+            written += ret;
+    }
+
+    if (dosync)
+        fsync(fd);
+
+    close(fd);
+    return written >= st.st_size;
+}
+#endif
+
+bool
+eraseFile(const std::string& path, bool dosync)
+{
+#ifdef _WIN32
+    return eraseFile_win32(path, dosync);
+#else
+    return eraseFile_posix(path, dosync);
+#endif
+}
+
+int
+remove(const std::filesystem::path& path, bool erase)
+{
+    if (erase and dhtnet::fileutils::isFile(path, false) and !dhtnet::fileutils::hasHardLink(path))
+        eraseFile(path.string(), true);
+
+#ifdef _WIN32
+    // use Win32 api since std::remove will not unlink directory in use
+    if (std::filesystem::is_directory(path))
+        return !RemoveDirectory(path.c_str());
+#endif
+
+    return std::remove(path.string().c_str());
+}
+
+std::string
+sha3File(const std::filesystem::path& path)
+{
+    sha3_512_ctx ctx;
+    sha3_512_init(&ctx);
+
+    try {
+        if (not std::filesystem::is_regular_file(path)) {
+            JAMI_ERROR("File hash refused: not a regular file");
+            return {};
+        }
+        std::ifstream file(path, std::ios::binary | std::ios::in);
+        if (!file) {
+            JAMI_ERROR("File hash failed: open error");
+            return {};
+        }
+        constexpr size_t BUFFER_SIZE = 64 * 1024ul;
+        std::vector<char> buffer(BUFFER_SIZE);
+        while (file) {
+            file.read(buffer.data(), BUFFER_SIZE);
+            const auto bytesRead = file.gcount();
+            if (bytesRead == 0)
+                break;
+            sha3_512_update(&ctx, static_cast<size_t>(bytesRead), (const uint8_t*) buffer.data());
+        }
+    } catch (const std::exception&) {
+        JAMI_ERROR("File hash failed: read error");
+        return {};
+    }
+
+    unsigned char digest[SHA3_512_DIGEST_SIZE];
+#if NETTLE_VERSION_MAJOR >= 4
+    sha3_512_digest(&ctx, digest);
+#else
+    sha3_512_digest(&ctx, SHA3_512_DIGEST_SIZE, digest);
+#endif
+    return dht::toHex(digest, SHA3_512_DIGEST_SIZE);
+}
+
+std::string
+sha3sum(const std::vector<uint8_t>& buffer)
+{
+    sha3_512_ctx ctx;
+    sha3_512_init(&ctx);
+    sha3_512_update(&ctx, buffer.size(), buffer.data());
+    unsigned char digest[SHA3_512_DIGEST_SIZE];
+#if NETTLE_VERSION_MAJOR >= 4
+    sha3_512_digest(&ctx, digest);
+#else
+    sha3_512_digest(&ctx, SHA3_512_DIGEST_SIZE, digest);
+#endif
+    return dht::toHex(digest, SHA3_512_DIGEST_SIZE);
+}
+
+int
+accessFile(const std::string& file, int mode)
+{
+#ifdef _WIN32
+    return _waccess(jami::to_wstring(file).c_str(), mode);
+#else
+    return access(file.c_str(), mode);
+#endif
+}
+
+uint64_t
+lastWriteTimeInSeconds(const std::filesystem::path& filePath)
+{
+    std::error_code ec;
+    auto lastWrite = std::filesystem::last_write_time(filePath, ec);
+    if (ec) {
+        JAMI_WARNING("Unable to get last write time of {}: {}", filePath, ec.message());
+        return 0;
+    }
+    return std::chrono::duration_cast<std::chrono::seconds>(lastWrite.time_since_epoch()).count();
+}
+
+std::string
+getOrCreateLocalDeviceId()
+{
+    const auto& localDir = get_data_dir(); // ~/.local/share/jami/
+    auto fullIdPath = localDir / "local_device_id";
+    std::string localDeviceId;
+
+    if (std::filesystem::exists(fullIdPath)) {
+        // Get the id inside the file
+        std::ifstream inStream(fullIdPath);
+        std::getline(inStream, localDeviceId);
+        inStream.close();
+        if (!localDeviceId.empty())
+            return localDeviceId;
+    }
+
+    // Generate a random hex string
+    {
+        std::random_device randomDevice;
+        localDeviceId = to_hex_string(std::uniform_int_distribution<uint64_t>()(randomDevice));
+    }
+
+    // Create a new file and write the id in it
+    std::error_code ec;
+    std::filesystem::create_directories(localDir, ec);
+    std::ofstream outStream(fullIdPath);
+    if (outStream) {
+        outStream << localDeviceId << '\n';
+        outStream.close();
+    } else {
+        JAMI_ERROR("Unable to create local device id file: {}", fullIdPath);
+    }
+    return localDeviceId;
+}
+
+} // namespace fileutils
+} // namespace jami

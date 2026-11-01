@@ -1,0 +1,103 @@
+/*
+ * Copyright (C) 2004-2026 Savoir-faire Linux Inc.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program. If not, see <https://www.gnu.org/licenses/>.
+ */
+
+#include "logger.h"
+extern "C" {
+#include "libavcodec/jni.h"
+}
+#include "media/audio/aaudio/aaudiolayer.h"
+
+JavaVM *gJavaVM;
+const char *kjamiservicePath = "net/jami/daemon/JamiServiceJNI";
+
+void deinitClassHelper(JNIEnv *env, jobject obj) {
+	JAMI_DEBUG("deinitClassHelper");
+
+	/* delete cached object instances */
+    env->DeleteGlobalRef(obj);
+	JAMI_DEBUG("deinitClassHelper: object {} deleted", fmt::ptr(obj));
+}
+
+JNIEXPORT jint JNI_OnLoad(JavaVM *vm, void *reserved) {
+	JNIEnv *env;
+	jclass clazz;
+	jint r;
+
+    JAMI_DEBUG("JNI_OnLoad");
+
+	if (av_jni_set_java_vm(vm, reserved)) {
+        JAMI_ERROR("JNI_OnLoad: av_jni_set_java_vm failed");
+	}
+
+	//Assume it is c++
+	r = vm->GetEnv ((void **) &env, JNI_VERSION_1_6);
+    if (r != JNI_OK) {
+		JAMI_ERROR("JNI_OnLoad: failed to get the environment using GetEnv()");
+        return -1;
+    }
+	JAMI_DEBUG("JNI_Onload: GetEnv {}", fmt::ptr(env));
+
+	clazz = env->FindClass (kjamiservicePath);
+	if (!clazz) {
+		JAMI_ERROR("JNI_Onload: whoops, %s class not found!", kjamiservicePath);
+	}
+	gJavaVM = vm;
+	JAMI_DEBUG("JNI_Onload: JavaVM {}", fmt::ptr(gJavaVM));
+
+	// Provide the JVM to AAudioLayer so it can create a Java AudioTrack with
+	// STREAM_RING for the ringtone stream on Android API < 28, where
+	// AAudioStreamBuilder_setUsage is not available.
+	jami::AAudioLayer::setJavaVM(vm);
+
+	/* put instances of class object we need into cache */
+    //initClassHelper(env, kManagerPath, &gManagerObject);
+
+	JNINativeMethod methods[] = {
+
+	$defs
+
+	};
+
+	r = env->RegisterNatives (clazz, methods, (int) (sizeof(methods) / sizeof(methods[0])));
+	return JNI_VERSION_1_6;
+}
+
+void JNI_OnUnLoad(JavaVM* vm, void* reserved) {
+    JNIEnv* env;
+	jclass clazz;
+
+	JAMI_DEBUG("JNI_OnUnLoad");
+
+	/* get env */
+    if (vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) != JNI_OK) {
+		JAMI_ERROR("JNI_OnUnLoad: failed to get the environment using GetEnv()");
+        return;
+    }
+	JAMI_DEBUG("JNI_OnUnLoad: GetEnv {}", fmt::ptr(env));
+
+    /* Get jclass with env->FindClass */
+	clazz = env->FindClass(kjamiservicePath);
+	if (!clazz) {
+		JAMI_ERROR("JNI_OnUnLoad: whoops, {} class not found!", kjamiservicePath);
+	}
+
+	/* remove instances of class object we need into cache */
+    //deinitClassHelper(env, gManagerObject);
+
+	env->UnregisterNatives(clazz);
+	JAMI_DEBUG("JNI_OnUnLoad: Native functions unregistered");
+}

@@ -1,0 +1,47 @@
+diff --git a/include/opendht/dht_proxy_client.h b/include/opendht/dht_proxy_client.h
+index ec4d239..f920cf2 100644
+--- a/include/opendht/dht_proxy_client.h
++++ b/include/opendht/dht_proxy_client.h
+@@ -291,9 +291,16 @@ public:
+     virtual size_t getStorageLimit() const override { return 0; }
+     void setLocalStorageLimit(size_t) override {}
+     virtual size_t getLocalStorageLimit() const override { return STORAGE_LIMIT_UNLIMITED; }
+-    void connectivityChanged(sa_family_t) override { getProxyInfos(); }
++    // A network change can leave the proxy "Connected" while its listen
++    // streams are dead; force listeners to restart once proxy info returns.
++    void connectivityChanged(sa_family_t) override
++    {
++        launchConnectedCbs_ = true;
++        getProxyInfos();
++    }
+     void connectivityChanged() override
+     {
++        launchConnectedCbs_ = true;
+         getProxyInfos();
+         loopSignal_();
+     }
+diff --git a/src/dht_proxy_client.cpp b/src/dht_proxy_client.cpp
+index 96e4d41..3621079 100644
+--- a/src/dht_proxy_client.cpp
++++ b/src/dht_proxy_client.cpp
+@@ -1221,14 +1221,18 @@ DhtProxyClient::restartListeners(const asio::error_code& ec)
+             auto& listener = l.second;
+             if (auto opstate = listener.opstate)
+                 opstate->stop = true;
+-            listener.request->cancel();
+-            listener.request.reset();
++            if (listener.request) {
++                listener.request->cancel();
++                listener.request.reset();
++            }
+         }
+     }
+     for (auto& search : searches_) {
+         for (auto& l : search.second.listeners) {
+             auto& listener = l.second;
+             auto opstate = listener.opstate;
++            if (!opstate)
++                continue;
+             // Redo listen
+             opstate->stop.store(false);
+             opstate->ok.store(true);

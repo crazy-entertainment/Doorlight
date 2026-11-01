@@ -1,0 +1,26 @@
+#ifndef FLUTTER_PLUGIN_RECORD_WINDOWS_PLUGIN_C_API_H_
+#define FLUTTER_PLUGIN_RECORD_WINDOWS_PLUGIN_C_API_H_
+
+#include <flutter_plugin_registrar.h>
+#include <stdint.h>
+#include "sybl_recording_api.h"
+
+#ifdef FLUTTER_PLUGIN_IMPL
+#define FLUTTER_PLUGIN_EXPORT __declspec(dllexport)
+#else
+#define FLUTTER_PLUGIN_EXPORT __declspec(dllimport)
+#endif
+
+#if defined(__cplusplus)
+extern "C" {
+#endif
+
+FLUTTER_PLUGIN_EXPORT void RecordWindowsPluginCApiRegisterWithRegistrar(
+    FlutterDesktopPluginRegistrarRef registrar);
+
+
+#if defined(__cplusplus)
+}  // extern "C"
+#endif
+
+#endif  // FLUTTER_PLUGIN_RECORD_WINDOWS_PLUGIN_C_API_H_

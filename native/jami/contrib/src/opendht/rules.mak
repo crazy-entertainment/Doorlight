@@ -1,0 +1,31 @@
+# OPENDHT
+OPENDHT_VERSION := 7cf3e8b73820a297ddb90b50065294fb11043c1d
+OPENDHT_URL := https://github.com/savoirfairelinux/opendht/archive/$(OPENDHT_VERSION).tar.gz
+
+PKGS += opendht
+ifeq ($(call need_pkg,'opendht >= 4.0.0'),)
+PKGS_FOUND += opendht
+endif
+
+DEPS_opendht += msgpack argon2 libressl restinio jsoncpp gnutls asio fmt simdutf
+
+OPENDHT_CONF = -DCMAKE_CXX_STANDARD=20 \
+	-DBUILD_TESTING=Off \
+	-DOPENDHT_DOCUMENTATION=Off \
+	-DOPENDHT_PROXY_CLIENT=On \
+	-DOPENDHT_PROXY_SERVER=On \
+	-DOPENDHT_PUSH_NOTIFICATIONS=On \
+	-DOPENDHT_IO_URING=Off \
+	-DOPENDHT_TOOLS=Off
+
+$(TARBALLS)/opendht-$(OPENDHT_VERSION).tar.gz:
+	$(call download,$(OPENDHT_URL))
+
+.sum-opendht: opendht-$(OPENDHT_VERSION).tar.gz
+
+opendht: opendht-$(OPENDHT_VERSION).tar.gz
+	$(UNPACK)
+	$(APPLY) $(SRC)/opendht/0002-restart-proxy-listeners-on-connectivity-change.patch
+	$(MOVE)
+
+CMAKE_PKGS += opendht

@@ -1,0 +1,22 @@
+{
+  "package": "shared_preferences_windows",
+  "version": "2.4.1",
+  "source": "https://pub.dev/packages/shared_preferences_windows/versions/2.4.1",
+  "archiveSha256": "94ef0f72b2d71bc3e700e025db3710911bd51a71cefb65cc609dd0d9a982e3c1",
+  "license": "BSD-3-Clause",
+  "upstreamFiles": {
+    "AUTHORS": "e89602d9d136178bcf1e20cbdfe98c236050f7fefcd8e9a03a18fbc4aa771af4",
+    "CHANGELOG.md": "49e341e87a832516d8143cba05c7cd36f523e75a218aceb1c22d60491e4b1f14",
+    "LICENSE": "89519eca6f7b9529b35bdddd623a58c3af06a88c458dbd6531ddb4675acf75a9",
+    "pubspec.yaml": "bfac6c030216a487e6212b2a74cc58c8e29ef628640989015d9b9abf8a92162b",
+    "README.md": "2b2529cbfb637e4ce66add74171792f9427d8d1b0b004b72c5e53407a08a0160",
+    "example/AUTHORS": "627ef55e50a523bb3de7a19a02e9710465e51c8d0a85988660f9f9b66b300718",
+    "example/LICENSE": "89519eca6f7b9529b35bdddd623a58c3af06a88c458dbd6531ddb4675acf75a9",
+    "example/pubspec.yaml": "0d941ec43ff30bf8c2e4daa1594d182ba944450131884482f62018dc51c9bc43",
+    "example/README.md": "dd0bc1ede31e368cfa967ab560215f621f37e5a8f41eee510afcc3e46aee6119",
+    "lib/shared_preferences_windows.dart": "c915eb47d8e9fa20ed23cc846cf7f1c3fe769d7162ed80acfdf07ae918a9c12f",
+    "test/fake_path_provider_windows.dart": "570ff46ab29f8b9c215a18962439bd74d49f367055b9002140b8bf27977dca16",
+    "test/legacy_shared_preferences_windows_test.dart": "7e6052cdd9fb5a7414f3a98aeededd65a6d35f19d0586e53c534602413d099b1",
+    "test/shared_preferences_windows_async_test.dart": "5c41a48cf75733def520d42a482679845958ebc017794178d81050c359d133a2"
+  }
+}

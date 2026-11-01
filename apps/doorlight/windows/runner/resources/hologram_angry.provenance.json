@@ -1,0 +1,11 @@
+{
+  "source": "assets/stickers/chubby_cats/angry.webp",
+  "sourceSha256": "724f416e8d8e63548c981626e1e76600a875350fb2fd51f4d0214e6f873df78d",
+  "derivative": "windows/runner/resources/hologram_angry.png",
+  "derivativeSha256": "a086efe2d3112025ddc63fd2c9f93709a80abe256bae0a30efecbc4428697875",
+  "decodedRgbaSha256": "61b1a6e488022286fbe170b42137361d167f5a187a112c14cf3e2814620c3aa6",
+  "conversion": "FFmpeg 2026-08-09 git-6bbc22dc09; one frame, PNG lossless compression level 9; decoded RGBA SHA-256 compared identical",
+  "width": 512,
+  "height": 512,
+  "frames": 1
+}

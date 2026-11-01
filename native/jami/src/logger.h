@@ -1,0 +1,186 @@
+/*
+ *  Copyright (C) 2004-2026 Savoir-faire Linux Inc.
+ *
+ *  This program is free software: you can redistribute it and/or modify
+ *  it under the terms of the GNU General Public License as published by
+ *  the Free Software Foundation, either version 3 of the License, or
+ *  (at your option) any later version.
+ *
+ *  This program is distributed in the hope that it will be useful,
+ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ *  GNU General Public License for more details.
+ *
+ *  You should have received a copy of the GNU General Public License
+ *  along with this program. If not, see <https://www.gnu.org/licenses/>.
+ */
+#pragma once
+
+#include "jami/def.h"
+
+// #define __STDC_FORMAT_MACROS 1
+#include <fmt/core.h>
+#include <fmt/format.h>
+#include <fmt/chrono.h>
+#include <fmt/compile.h>
+#include <fmt/printf.h>
+#if __has_include(<fmt/std.h>)
+#include <fmt/std.h>
+#else
+#include <fmt/ostream.h>
+#endif
+
+#include <opendht/logger.h>
+#include <cstdarg>
+
+#include <sstream>
+#include <string>
+
+#ifdef __ANDROID__
+
+#include <android/log.h>
+#define LOG_ERR     ANDROID_LOG_ERROR
+#define LOG_WARNING ANDROID_LOG_WARN
+#define LOG_INFO    ANDROID_LOG_INFO
+#define LOG_DEBUG   ANDROID_LOG_DEBUG
+
+#elif defined(_WIN32)
+
+#include "winsyslog.h"
+#define LOG_ERR     EVENTLOG_ERROR_TYPE
+#define LOG_WARNING EVENTLOG_WARNING_TYPE
+#define LOG_INFO    EVENTLOG_INFORMATION_TYPE
+#define LOG_DEBUG   EVENTLOG_SUCCESS
+
+#else
+
+#include <syslog.h> // Defines LOG_XXXX
+
+#endif /* __ANDROID__ / _WIN32 */
+
+#if defined(_WIN32) && !defined(_MSC_VER)
+#define PRINTF_ATTRIBUTE(a, b) __attribute__((format(gnu_printf, a, b)))
+#elif defined(__GNUC__)
+#define PRINTF_ATTRIBUTE(a, b) __attribute__((format(printf, a, b)))
+#else
+#define PRINTF_ATTRIBUTE(a, b)
+#endif
+
+namespace jami {
+
+/**
+ * Thread-safe function to print the stringified contents of errno
+ */
+void strErr();
+
+namespace Logger {
+
+constexpr int
+dhtLevel(dht::log::LogLevel level)
+{
+    switch (level) {
+    case dht::log::LogLevel::debug:
+        return LOG_DEBUG;
+    case dht::log::LogLevel::warning:
+        return LOG_WARNING;
+    case dht::log::LogLevel::error:
+    default:
+        return LOG_ERR;
+    }
+}
+
+LIBJAMI_PUBLIC
+void write(int level, std::string_view file, unsigned line, bool linefeed, std::string_view tag, std::string&& message);
+
+inline void
+writeDht(dht::log::source_loc loc, dht::log::LogLevel level, std::string_view tag, std::string&& message)
+{
+    write(dhtLevel(level), loc.file, loc.line, true, tag, std::move(message));
+}
+
+inline std::shared_ptr<dht::log::Logger>
+dhtLogger(const std::string& tag = {})
+{
+    return std::make_shared<dht::Logger>(&Logger::writeDht, tag);
+}
+
+void setConsoleLog(bool enable);
+void setSysLog(bool enable);
+void setMonitorLog(bool enable);
+void setFileLog(const std::string& path);
+
+void setDebugMode(bool enable);
+bool debugEnabled();
+
+void fini();
+} // namespace Logger
+
+namespace log {
+
+template<typename S, typename... Args>
+void
+info(const char* file, unsigned line, S&& format, Args&&... args)
+{
+    Logger::write(LOG_INFO, file, line, true, {}, fmt::format(std::forward<S>(format), std::forward<Args>(args)...));
+}
+template<typename S, typename... Args>
+void
+dbg(const char* file, unsigned line, S&& format, Args&&... args)
+{
+    Logger::write(LOG_DEBUG, file, line, true, {}, fmt::format(std::forward<S>(format), std::forward<Args>(args)...));
+}
+template<typename S, typename... Args>
+void
+warn(const char* file, unsigned line, S&& format, Args&&... args)
+{
+    Logger::write(LOG_WARNING, file, line, true, {}, fmt::format(std::forward<S>(format), std::forward<Args>(args)...));
+}
+template<typename S, typename... Args>
+void
+error(const char* file, unsigned line, S&& format, Args&&... args)
+{
+    Logger::write(LOG_ERR, file, line, true, {}, fmt::format(std::forward<S>(format), std::forward<Args>(args)...));
+}
+
+template<typename S, typename... Args>
+void
+xinfo(const char* file, unsigned line, S&& format, Args&&... args)
+{
+    Logger::write(LOG_INFO, file, line, false, {}, fmt::format(std::forward<S>(format), std::forward<Args>(args)...));
+}
+template<typename S, typename... Args>
+void
+xdbg(const char* file, unsigned line, S&& format, Args&&... args)
+{
+    Logger::write(LOG_DEBUG, file, line, false, {}, fmt::format(std::forward<S>(format), std::forward<Args>(args)...));
+}
+template<typename S, typename... Args>
+void
+xwarn(const char* file, unsigned line, S&& format, Args&&... args)
+{
+    Logger::write(LOG_WARNING, file, line, false, {}, fmt::format(std::forward<S>(format), std::forward<Args>(args)...));
+}
+template<typename S, typename... Args>
+void
+xerror(const char* file, unsigned line, S&& format, Args&&... args)
+{
+    Logger::write(LOG_ERR, file, line, false, {}, fmt::format(std::forward<S>(format), std::forward<Args>(args)...));
+}
+
+} // namespace log
+
+// We need to use macros for contextual information
+#define JAMI_XINFO(formatstr, ...) ::jami::log::xinfo(__FILE__, __LINE__, FMT_COMPILE(formatstr), ##__VA_ARGS__)
+#define JAMI_XDBG(formatstr, ...)  ::jami::log::xdbg(__FILE__, __LINE__, FMT_COMPILE(formatstr), ##__VA_ARGS__)
+#define JAMI_XWARN(formatstr, ...) ::jami::log::xwarn(__FILE__, __LINE__, FMT_COMPILE(formatstr), ##__VA_ARGS__)
+#define JAMI_XERR(formatstr, ...)  ::jami::log::xerror(__FILE__, __LINE__, FMT_COMPILE(formatstr), ##__VA_ARGS__)
+
+#define JAMI_LOG(formatstr, ...) ::jami::log::info(__FILE__, __LINE__, FMT_STRING(formatstr), ##__VA_ARGS__)
+#define JAMI_DEBUG(formatstr, ...) \
+    if (::jami::Logger::debugEnabled()) { \
+        ::jami::log::dbg(__FILE__, __LINE__, FMT_STRING(formatstr), ##__VA_ARGS__); \
+    }
+#define JAMI_WARNING(formatstr, ...) ::jami::log::warn(__FILE__, __LINE__, FMT_STRING(formatstr), ##__VA_ARGS__)
+#define JAMI_ERROR(formatstr, ...)   ::jami::log::error(__FILE__, __LINE__, FMT_STRING(formatstr), ##__VA_ARGS__)
+
+} // namespace jami

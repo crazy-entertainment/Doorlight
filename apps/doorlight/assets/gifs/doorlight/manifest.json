@@ -1,0 +1,489 @@
+{
+  "version": 1,
+  "license": "CC0-1.0",
+  "source": {
+    "creator": "Kenney Vleugels (Kenney.nl)",
+    "sourceUrl": "https://kenney.nl/assets/emotes-pack",
+    "archiveUrl": "https://kenney.nl/media/pages/assets/emotes-pack/d00a3dcb06-1677578798/kenney_emotes-pack.zip",
+    "archiveSha256": "96ab3f2c92d7acd860942efca1c9f1295184b11d3db5c79c28da82036e496526",
+    "acquired": "2026-09-21",
+    "license": "CC0-1.0",
+    "licenseUrl": "https://creativecommons.org/publicdomain/zero/1.0/",
+    "files": {
+      "emotes_vector.svg": {
+        "archiveEntry": "Vector/emotes_vector.svg",
+        "sha256": "543a65078ca368b77efbae1dd87a2eae28e0f1fa866b96ae142c276fb6d9a74c"
+      },
+      "License.txt": {
+        "archiveEntry": "License.txt",
+        "sha256": "b57743037569a9f7b0c8ff3793a1dd7be5bbf42b14ccb382848539c5c67cb72a"
+      }
+    }
+  },
+  "assets": [
+    {
+      "id": "hello",
+      "name": "Hello",
+      "asset": "assets/gifs/doorlight/hello.gif",
+      "sha256": "02cda0c6cf6c1b9782bca912f2ba4a6f629ff228378fb0708e6d503733eb8e54",
+      "bytes": 118976,
+      "width": 256,
+      "height": 256,
+      "frames": 32,
+      "durationMs": 1920,
+      "sourceCreator": "Kenney Vleugels (Kenney.nl)",
+      "animationCreator": "Doorlight contributors",
+      "sourceUrl": "https://kenney.nl/assets/emotes-pack",
+      "acquired": "2026-09-21",
+      "originalSha256": "543a65078ca368b77efbae1dd87a2eae28e0f1fa866b96ae142c276fb6d9a74c",
+      "sourceIcons": {
+        "happy": [
+          140,
+          60,
+          32,
+          32
+        ]
+      },
+      "transformations": "Balloon background/tail removal; vector-symbol crop; wave and greeting arcs; original stroke caption and background; 256px GIF export",
+      "redistributionLicense": "CC0-1.0"
+    },
+    {
+      "id": "yes",
+      "name": "Yes",
+      "asset": "assets/gifs/doorlight/yes.gif",
+      "sha256": "4fc98656cb718a363073fd5fa12af3d922607d37e31c795a22c56bbcd438d420",
+      "bytes": 108301,
+      "width": 256,
+      "height": 256,
+      "frames": 32,
+      "durationMs": 1920,
+      "sourceCreator": "Kenney Vleugels (Kenney.nl)",
+      "animationCreator": "Doorlight contributors",
+      "sourceUrl": "https://kenney.nl/assets/emotes-pack",
+      "acquired": "2026-09-21",
+      "originalSha256": "543a65078ca368b77efbae1dd87a2eae28e0f1fa866b96ae142c276fb6d9a74c",
+      "sourceIcons": {
+        "happy": [
+          140,
+          60,
+          32,
+          32
+        ]
+      },
+      "transformations": "Balloon background/tail removal; vector-symbol crop; nod and drawn check; original stroke caption and background; 256px GIF export",
+      "redistributionLicense": "CC0-1.0"
+    },
+    {
+      "id": "thanks",
+      "name": "Thank you",
+      "asset": "assets/gifs/doorlight/thanks.gif",
+      "sha256": "b9df67ecf23c57b7521e82baf431ce06d5107dcb2fa687fe20ad7a788dada21b",
+      "bytes": 120368,
+      "width": 256,
+      "height": 256,
+      "frames": 32,
+      "durationMs": 1920,
+      "sourceCreator": "Kenney Vleugels (Kenney.nl)",
+      "animationCreator": "Doorlight contributors",
+      "sourceUrl": "https://kenney.nl/assets/emotes-pack",
+      "acquired": "2026-09-21",
+      "originalSha256": "543a65078ca368b77efbae1dd87a2eae28e0f1fa866b96ae142c276fb6d9a74c",
+      "sourceIcons": {
+        "happy": [
+          140,
+          60,
+          32,
+          32
+        ],
+        "heart": [
+          220,
+          20,
+          32,
+          32
+        ]
+      },
+      "transformations": "Balloon background/tail removal; vector-symbol crop; bow and rising heart; original stroke caption and background; 256px GIF export",
+      "redistributionLicense": "CC0-1.0"
+    },
+    {
+      "id": "love",
+      "name": "Love",
+      "asset": "assets/gifs/doorlight/love.gif",
+      "sha256": "c2d1e65cd60b54c66ee027a65feedaac84e174fa5224eee4f0ec8cbfcff2fd77",
+      "bytes": 112056,
+      "width": 256,
+      "height": 256,
+      "frames": 32,
+      "durationMs": 1920,
+      "sourceCreator": "Kenney Vleugels (Kenney.nl)",
+      "animationCreator": "Doorlight contributors",
+      "sourceUrl": "https://kenney.nl/assets/emotes-pack",
+      "acquired": "2026-09-21",
+      "originalSha256": "543a65078ca368b77efbae1dd87a2eae28e0f1fa866b96ae142c276fb6d9a74c",
+      "sourceIcons": {
+        "heart": [
+          220,
+          20,
+          32,
+          32
+        ],
+        "hearts": [
+          260,
+          20,
+          32,
+          32
+        ]
+      },
+      "transformations": "Balloon background/tail removal; vector-symbol crop; double heartbeat and orbiting hearts; original stroke caption and background; 256px GIF export",
+      "redistributionLicense": "CC0-1.0"
+    },
+    {
+      "id": "laugh",
+      "name": "Haha",
+      "asset": "assets/gifs/doorlight/laugh.gif",
+      "sha256": "624a2ad0c0fa80c9a5f8b31c3219a19117aecdbec1a00b5547d43bc749c8a673",
+      "bytes": 119698,
+      "width": 256,
+      "height": 256,
+      "frames": 32,
+      "durationMs": 1920,
+      "sourceCreator": "Kenney Vleugels (Kenney.nl)",
+      "animationCreator": "Doorlight contributors",
+      "sourceUrl": "https://kenney.nl/assets/emotes-pack",
+      "acquired": "2026-09-21",
+      "originalSha256": "543a65078ca368b77efbae1dd87a2eae28e0f1fa866b96ae142c276fb6d9a74c",
+      "sourceIcons": {
+        "laugh": [
+          340,
+          100,
+          32,
+          32
+        ],
+        "drop": [
+          20,
+          100,
+          32,
+          32
+        ]
+      },
+      "transformations": "Balloon background/tail removal; vector-symbol crop; laughing shake and happy tears; original stroke caption and background; 256px GIF export",
+      "redistributionLicense": "CC0-1.0"
+    },
+    {
+      "id": "wow",
+      "name": "Wow",
+      "asset": "assets/gifs/doorlight/wow.gif",
+      "sha256": "734a35d30d586f2178bb809d5909709b4c3dabfa8271e8adaf84fba0f71433ca",
+      "bytes": 122326,
+      "width": 256,
+      "height": 256,
+      "frames": 32,
+      "durationMs": 1920,
+      "sourceCreator": "Kenney Vleugels (Kenney.nl)",
+      "animationCreator": "Doorlight contributors",
+      "sourceUrl": "https://kenney.nl/assets/emotes-pack",
+      "acquired": "2026-09-21",
+      "originalSha256": "543a65078ca368b77efbae1dd87a2eae28e0f1fa866b96ae142c276fb6d9a74c",
+      "sourceIcons": {
+        "surprise": [
+          300,
+          20,
+          32,
+          32
+        ]
+      },
+      "transformations": "Balloon background/tail removal; vector-symbol crop; springing surprise and expanding rays; original stroke caption and background; 256px GIF export",
+      "redistributionLicense": "CC0-1.0"
+    },
+    {
+      "id": "sympathy",
+      "name": "Here for you",
+      "asset": "assets/gifs/doorlight/sympathy.gif",
+      "sha256": "5be5f652e52e55380893869350429815d1fb4093e998e5751a3f17121c32316a",
+      "bytes": 124265,
+      "width": 256,
+      "height": 256,
+      "frames": 32,
+      "durationMs": 1920,
+      "sourceCreator": "Kenney Vleugels (Kenney.nl)",
+      "animationCreator": "Doorlight contributors",
+      "sourceUrl": "https://kenney.nl/assets/emotes-pack",
+      "acquired": "2026-09-21",
+      "originalSha256": "543a65078ca368b77efbae1dd87a2eae28e0f1fa866b96ae142c276fb6d9a74c",
+      "sourceIcons": {
+        "sad": [
+          180,
+          60,
+          32,
+          32
+        ],
+        "heart": [
+          220,
+          20,
+          32,
+          32
+        ]
+      },
+      "transformations": "Balloon background/tail removal; vector-symbol crop; gentle tilt and supportive heart; original stroke caption and background; 256px GIF export",
+      "redistributionLicense": "CC0-1.0"
+    },
+    {
+      "id": "celebrate",
+      "name": "Yay",
+      "asset": "assets/gifs/doorlight/celebrate.gif",
+      "sha256": "8428cf2f67a05dd39b28d64264b3b16772588b22a80cc0f679310630c1462034",
+      "bytes": 122265,
+      "width": 256,
+      "height": 256,
+      "frames": 32,
+      "durationMs": 1920,
+      "sourceCreator": "Kenney Vleugels (Kenney.nl)",
+      "animationCreator": "Doorlight contributors",
+      "sourceUrl": "https://kenney.nl/assets/emotes-pack",
+      "acquired": "2026-09-21",
+      "originalSha256": "543a65078ca368b77efbae1dd87a2eae28e0f1fa866b96ae142c276fb6d9a74c",
+      "sourceIcons": {
+        "star": [
+          300,
+          60,
+          32,
+          32
+        ]
+      },
+      "transformations": "Balloon background/tail removal; vector-symbol crop; turning star and falling confetti; original stroke caption and background; 256px GIF export",
+      "redistributionLicense": "CC0-1.0"
+    },
+    {
+      "id": "waiting",
+      "name": "One sec",
+      "asset": "assets/gifs/doorlight/waiting.gif",
+      "sha256": "e8420a3f6505df74763248e088f256bb6b139932e2b509307005a2d3a68514a8",
+      "bytes": 90322,
+      "width": 256,
+      "height": 256,
+      "frames": 27,
+      "durationMs": 1920,
+      "sourceCreator": "Kenney Vleugels (Kenney.nl)",
+      "animationCreator": "Doorlight contributors",
+      "sourceUrl": "https://kenney.nl/assets/emotes-pack",
+      "acquired": "2026-09-21",
+      "originalSha256": "543a65078ca368b77efbae1dd87a2eae28e0f1fa866b96ae142c276fb6d9a74c",
+      "sourceIcons": {
+        "dot": [
+          60,
+          20,
+          32,
+          32
+        ]
+      },
+      "transformations": "Balloon background/tail removal; vector-symbol crop; three staggered bouncing dots; original stroke caption and background; 256px GIF export",
+      "redistributionLicense": "CC0-1.0"
+    },
+    {
+      "id": "thinking",
+      "name": "Hmm",
+      "asset": "assets/gifs/doorlight/thinking.gif",
+      "sha256": "0e6a3609a5d83d483eb65284455d376f1f55a2736594164e13c95d43c551fbf1",
+      "bytes": 104546,
+      "width": 256,
+      "height": 256,
+      "frames": 32,
+      "durationMs": 1920,
+      "sourceCreator": "Kenney Vleugels (Kenney.nl)",
+      "animationCreator": "Doorlight contributors",
+      "sourceUrl": "https://kenney.nl/assets/emotes-pack",
+      "acquired": "2026-09-21",
+      "originalSha256": "543a65078ca368b77efbae1dd87a2eae28e0f1fa866b96ae142c276fb6d9a74c",
+      "sourceIcons": {
+        "question": [
+          380,
+          20,
+          32,
+          32
+        ],
+        "dot": [
+          60,
+          20,
+          32,
+          32
+        ]
+      },
+      "transformations": "Balloon background/tail removal; vector-symbol crop; tilting question and circling thought dots; original stroke caption and background; 256px GIF export",
+      "redistributionLicense": "CC0-1.0"
+    },
+    {
+      "id": "night",
+      "name": "Good night",
+      "asset": "assets/gifs/doorlight/night.gif",
+      "sha256": "d2138daa010a9b03f98f04ecbaa3544fc5bdfb30466d3309a7e8c132815105c7",
+      "bytes": 113089,
+      "width": 256,
+      "height": 256,
+      "frames": 32,
+      "durationMs": 1920,
+      "sourceCreator": "Kenney Vleugels (Kenney.nl)",
+      "animationCreator": "Doorlight contributors",
+      "sourceUrl": "https://kenney.nl/assets/emotes-pack",
+      "acquired": "2026-09-21",
+      "originalSha256": "543a65078ca368b77efbae1dd87a2eae28e0f1fa866b96ae142c276fb6d9a74c",
+      "sourceIcons": {
+        "sleep": [
+          20,
+          60,
+          32,
+          32
+        ]
+      },
+      "transformations": "Balloon background/tail removal; vector-symbol crop; rising sleep marks on a night background; original stroke caption and background; cream recolor of dark sleep marks; 256px GIF export",
+      "redistributionLicense": "CC0-1.0"
+    },
+    {
+      "id": "idea",
+      "name": "Great idea",
+      "asset": "assets/gifs/doorlight/idea.gif",
+      "sha256": "5e50a7dd663117ba45afac84316fca6e64c39a6f52a6dfee354760436bb3a16b",
+      "bytes": 153123,
+      "width": 256,
+      "height": 256,
+      "frames": 32,
+      "durationMs": 1920,
+      "sourceCreator": "Kenney Vleugels (Kenney.nl)",
+      "animationCreator": "Doorlight contributors",
+      "sourceUrl": "https://kenney.nl/assets/emotes-pack",
+      "acquired": "2026-09-21",
+      "originalSha256": "543a65078ca368b77efbae1dd87a2eae28e0f1fa866b96ae142c276fb6d9a74c",
+      "sourceIcons": {
+        "idea": [
+          300,
+          100,
+          32,
+          32
+        ]
+      },
+      "transformations": "Balloon background/tail removal; vector-symbol crop; lightbulb glow and staggered rays; original stroke caption and background; 256px GIF export",
+      "redistributionLicense": "CC0-1.0"
+    },
+    {
+      "id": "music",
+      "name": "Good vibes",
+      "asset": "assets/gifs/doorlight/music.gif",
+      "sha256": "39a46580e8efb717eb141d55f463216ed4ceaacbe93aa141987312bb48c6e8dd",
+      "bytes": 146329,
+      "width": 256,
+      "height": 256,
+      "frames": 32,
+      "durationMs": 1920,
+      "sourceCreator": "Kenney Vleugels (Kenney.nl)",
+      "animationCreator": "Doorlight contributors",
+      "sourceUrl": "https://kenney.nl/assets/emotes-pack",
+      "acquired": "2026-09-21",
+      "originalSha256": "543a65078ca368b77efbae1dd87a2eae28e0f1fa866b96ae142c276fb6d9a74c",
+      "sourceIcons": {
+        "music": [
+          380,
+          60,
+          32,
+          32
+        ]
+      },
+      "transformations": "Balloon background/tail removal; vector-symbol crop; swaying note and rising music trail; original stroke caption and background; 256px GIF export",
+      "redistributionLicense": "CC0-1.0"
+    },
+    {
+      "id": "oops",
+      "name": "Oops",
+      "asset": "assets/gifs/doorlight/oops.gif",
+      "sha256": "049f1eff73da6e495fc6c5459b690764f4a414a4a7f432e5b5ae432497ae3464",
+      "bytes": 105916,
+      "width": 256,
+      "height": 256,
+      "frames": 32,
+      "durationMs": 1920,
+      "sourceCreator": "Kenney Vleugels (Kenney.nl)",
+      "animationCreator": "Doorlight contributors",
+      "sourceUrl": "https://kenney.nl/assets/emotes-pack",
+      "acquired": "2026-09-21",
+      "originalSha256": "543a65078ca368b77efbae1dd87a2eae28e0f1fa866b96ae142c276fb6d9a74c",
+      "sourceIcons": {
+        "sad": [
+          180,
+          60,
+          32,
+          32
+        ],
+        "drop": [
+          20,
+          100,
+          32,
+          32
+        ]
+      },
+      "transformations": "Balloon background/tail removal; vector-symbol crop; surprised dip and sliding sweat drop; original stroke caption and background; 256px GIF export",
+      "redistributionLicense": "CC0-1.0"
+    },
+    {
+      "id": "hug",
+      "name": "Big hug",
+      "asset": "assets/gifs/doorlight/hug.gif",
+      "sha256": "81c2d36076b08afd75e669627396a40518075a67e3a8113f13d99732112efeb1",
+      "bytes": 120013,
+      "width": 256,
+      "height": 256,
+      "frames": 32,
+      "durationMs": 1920,
+      "sourceCreator": "Kenney Vleugels (Kenney.nl)",
+      "animationCreator": "Doorlight contributors",
+      "sourceUrl": "https://kenney.nl/assets/emotes-pack",
+      "acquired": "2026-09-21",
+      "originalSha256": "543a65078ca368b77efbae1dd87a2eae28e0f1fa866b96ae142c276fb6d9a74c",
+      "sourceIcons": {
+        "happy": [
+          140,
+          60,
+          32,
+          32
+        ],
+        "heart": [
+          220,
+          20,
+          32,
+          32
+        ]
+      },
+      "transformations": "Balloon background/tail removal; vector-symbol crop; hearts closing around a happy face; original stroke caption and background; 256px GIF export",
+      "redistributionLicense": "CC0-1.0"
+    },
+    {
+      "id": "encourage",
+      "name": "You got this",
+      "asset": "assets/gifs/doorlight/encourage.gif",
+      "sha256": "16ee1c9fd16d3e4ed3ff2993aa664985ac07a1b3461dafef0c270442135391f4",
+      "bytes": 141147,
+      "width": 256,
+      "height": 256,
+      "frames": 32,
+      "durationMs": 1920,
+      "sourceCreator": "Kenney Vleugels (Kenney.nl)",
+      "animationCreator": "Doorlight contributors",
+      "sourceUrl": "https://kenney.nl/assets/emotes-pack",
+      "acquired": "2026-09-21",
+      "originalSha256": "543a65078ca368b77efbae1dd87a2eae28e0f1fa866b96ae142c276fb6d9a74c",
+      "sourceIcons": {
+        "stars": [
+          340,
+          60,
+          32,
+          32
+        ],
+        "star": [
+          300,
+          60,
+          32,
+          32
+        ]
+      },
+      "transformations": "Balloon background/tail removal; vector-symbol crop; rising stars and cheering underline; original stroke caption and background; 256px GIF export",
+      "redistributionLicense": "CC0-1.0"
+    }
+  ]
+}

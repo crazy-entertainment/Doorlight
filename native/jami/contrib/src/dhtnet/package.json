@@ -1,0 +1,35 @@
+{
+    "name": "dhtnet",
+    "version": "b2487f2040cf8301f9576b34c6b7e8fc11b01dd1",
+    "url": "https://git.jami.net/savoirfairelinux/dhtnet/-/archive/__VERSION__/dhtnet.tar.gz",
+    "deps": [
+        "opendht",
+        "pjproject",
+        "msgpack",
+        "asio",
+        "upnp",
+        "natpmp"
+    ],
+    "use_cmake": true,
+    "defines": [
+        "BUILD_SHARED_LIBS=0",
+        "BUILD_TESTING=0",
+        "BUILD_BENCHMARKS=0",
+        "BUILD_EXAMPLE=0",
+        "CMAKE_CXX_STANDARD=20"
+    ],
+    "patches": [],
+    "win_patches": [],
+    "project_paths": [],
+    "with_env": "",
+    "custom_scripts": {
+        "pre_build": [
+            "IF exist \"%DAEMON_DIR%\\contrib\\msvc\\include\\dhtnet\" ( rmdir /S /Q \"%DAEMON_DIR%\\contrib\\msvc\\include\\dhtnet\" )"
+        ],
+        "build": [],
+        "post_build": [
+            "mkdir \"%DAEMON_DIR%\\contrib\\msvc\\include\\dhtnet\"",
+            "xcopy /S /Y \"include\" \"%DAEMON_DIR%\\contrib\\msvc\\include\\dhtnet\""
+        ]
+    }
+}

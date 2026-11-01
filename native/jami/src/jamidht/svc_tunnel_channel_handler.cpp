@@ -1,0 +1,591 @@
+/*
+ *  Copyright (C) 2004-2026 Savoir-faire Linux Inc.
+ *
+ *  This program is free software: you can redistribute it and/or modify
+ *  it under the terms of the GNU General Public License as published by
+ *  the Free Software Foundation, either version 3 of the License, or
+ *  (at your option) any later version.
+ *
+ *  This program is distributed in the hope that it will be useful,
+ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ *  GNU General Public License for more details.
+ *
+ *  You should have received a copy of the GNU General Public License
+ *  along with this program. If not, see <https://www.gnu.org/licenses/>.
+ */
+#include "jamidht/svc_tunnel_channel_handler.h"
+
+#include "jamidht/account_manager.h"
+#include "jamidht/contact_list.h"
+#include "jamidht/service_manager.h"
+#include "jamidht/svc_protocol.h"
+#include "logger.h"
+#include "manager.h"
+
+#include <asio/connect.hpp>
+#include <asio/post.hpp>
+#include <asio/read.hpp>
+#include <asio/write.hpp>
+
+#include <atomic>
+
+namespace jami {
+
+namespace {
+constexpr size_t kRelayBufSize = 16 * 1024;
+}
+
+struct SvcTunnelChannelHandler::ClientTunnel
+{
+    std::string id;
+    std::string peerUri;
+    DeviceId peerDevice;
+    std::string serviceId;
+    std::string serviceName;
+    std::shared_ptr<asio::ip::tcp::acceptor> acceptor;
+    OnTunnelClosed onClosed;
+    std::atomic_bool closed {false};
+    /// Per-tunnel mutex protecting the active-connection list.
+    std::mutex connsMtx;
+    struct Conn
+    {
+        std::weak_ptr<dhtnet::ChannelSocket> channel;
+        std::weak_ptr<asio::ip::tcp::socket> tcp;
+    };
+    std::vector<Conn> activeConns;
+};
+
+SvcTunnelChannelHandler::SvcTunnelChannelHandler(const std::shared_ptr<JamiAccount>& acc,
+                                                 dhtnet::ConnectionManager& cm,
+                                                 std::shared_ptr<asio::io_context> io)
+    : ChannelHandlerInterface()
+    , account_(acc)
+    , connectionManager_(cm)
+    , io_(std::move(io))
+    , rng_(dht::crypto::getDerivedRandomEngine(acc->rand))
+{}
+
+SvcTunnelChannelHandler::~SvcTunnelChannelHandler()
+{
+    std::vector<std::shared_ptr<ClientTunnel>> snapshot;
+    {
+        std::lock_guard lk(mtx_);
+        for (auto& [_id, t] : tunnels_)
+            snapshot.push_back(t);
+        tunnels_.clear();
+    }
+    for (auto& t : snapshot) {
+        t->closed = true;
+        std::error_code ec;
+        if (t->acceptor)
+            t->acceptor->close(ec);
+    }
+}
+
+std::string
+SvcTunnelChannelHandler::parseServiceId(const std::string& channelName)
+{
+    constexpr std::string_view prefix = "svc://";
+    if (channelName.size() <= prefix.size())
+        return {};
+    if (channelName.compare(0, prefix.size(), prefix) != 0)
+        return {};
+    return channelName.substr(prefix.size());
+}
+
+void
+SvcTunnelChannelHandler::connect(const DeviceId& deviceId,
+                                 const std::string& /*name*/,
+                                 ConnectCb&& cb,
+                                 const std::string& /*connectionType*/,
+                                 bool /*forceNewConnection*/)
+{
+    // Tunnels are managed at a higher level via openTunnel(); the generic
+    // channel-handler entry-point is unused but must not block. Just signal
+    // back asynchronously with a null socket so callers can fall through.
+    if (cb && io_)
+        asio::post(*io_, [cb = std::move(cb), deviceId]() mutable { cb(nullptr, deviceId); });
+}
+
+bool
+SvcTunnelChannelHandler::onRequest(const std::shared_ptr<dht::crypto::Certificate>& peer, const std::string& name)
+{
+    if (!peer || !peer->issuer)
+        return false;
+    auto serviceId = parseServiceId(name);
+    if (serviceId.empty())
+        return false;
+    auto acc = account_.lock();
+    if (!acc)
+        return false;
+    const auto peerUri = peer->issuer->getId().toString();
+    auto checker = [&acc](const std::string& uri) {
+        return acc->isContact(uri);
+    };
+    return acc->serviceManager().isAuthorized(serviceId, peerUri, checker);
+}
+
+void
+SvcTunnelChannelHandler::onReady(const std::shared_ptr<dht::crypto::Certificate>& peer,
+                                 const std::string& name,
+                                 std::shared_ptr<dhtnet::ChannelSocket> channel)
+{
+    if (!channel)
+        return;
+    // The initiator side wires its own onClientChannelReady callback via
+    // connectDevice(). Only the receiving (server) side performs the local
+    // TCP connect here.
+    if (channel->isInitiator())
+        return;
+    auto serviceId = parseServiceId(name);
+    auto acc = account_.lock();
+    if (!acc || serviceId.empty()) {
+        channel->shutdown();
+        return;
+    }
+    auto rec = acc->serviceManager().getService(serviceId);
+    if (!rec || !rec->enabled) {
+        channel->shutdown();
+        return;
+    }
+    if (!io_) {
+        channel->shutdown();
+        return;
+    }
+    JAMI_LOG("[SvcTunnel] peer {} opened tunnel to service \"{}\" -> {}:{}",
+             peer && peer->issuer ? peer->issuer->getId().toString() : std::string("<unknown>"),
+             rec->name,
+             rec->localHost,
+             rec->localPort);
+
+    auto tcp = std::make_shared<asio::ip::tcp::socket>(*io_);
+    asio::ip::tcp::resolver resolver(*io_);
+    std::error_code ec;
+    auto endpoints = resolver.resolve(rec->localHost, std::to_string(rec->localPort), ec);
+    if (ec) {
+        JAMI_WARNING("[SvcTunnel] resolve {}:{} failed: {}", rec->localHost, rec->localPort, ec.message());
+        channel->shutdown();
+        return;
+    }
+
+    // Buffer any bytes received from the remote peer before we have a local
+    // TCP connection up; flush them through once async_connect succeeds.
+    struct PreConnectBuf
+    {
+        std::mutex m;
+        std::vector<uint8_t> bytes;
+        bool tcpReady {false};
+        std::shared_ptr<asio::ip::tcp::socket> tcp;
+    };
+    auto pre = std::make_shared<PreConnectBuf>();
+    pre->tcp = tcp;
+    auto channelKeep = channel;
+    channel->setOnRecv([pre, channelKeep](const uint8_t* data, size_t size) -> ssize_t {
+        std::lock_guard lk(pre->m);
+        if (pre->tcpReady) {
+            auto buf = std::make_shared<std::vector<uint8_t>>(data, data + size);
+            asio::async_write(*pre->tcp,
+                              asio::buffer(*buf),
+                              [buf, pre, channelKeep](const std::error_code& ec, std::size_t) {
+                                  if (ec) {
+                                      JAMI_DEBUG("[SvcTunnel] write to TCP failed: {}", ec.message());
+                                      channelKeep->shutdown();
+                                      std::error_code ig;
+                                      pre->tcp->close(ig);
+                                  }
+                              });
+        } else {
+            pre->bytes.insert(pre->bytes.end(), data, data + size);
+        }
+        return static_cast<ssize_t>(size);
+    });
+
+    asio::async_connect(*tcp,
+                        endpoints,
+                        [this, channel = channelKeep, tcp, pre, serviceId](const std::error_code& cec,
+                                                                           const asio::ip::tcp::endpoint&) {
+                            if (cec) {
+                                JAMI_WARNING("[SvcTunnel] connect failed: {}", cec.message());
+                                channel->shutdown();
+                                return;
+                            }
+                            trackServerChannel(serviceId, channel, tcp);
+                            std::vector<uint8_t> drained;
+                            {
+                                std::lock_guard lk(pre->m);
+                                pre->tcpReady = true;
+                                drained.swap(pre->bytes);
+                            }
+                            if (!drained.empty()) {
+                                auto buf = std::make_shared<std::vector<uint8_t>>(std::move(drained));
+                                asio::async_write(*tcp,
+                                                  asio::buffer(*buf),
+                                                  [buf, channel, tcp](const std::error_code& ec, std::size_t) {
+                                                      if (ec) {
+                                                          JAMI_DEBUG("[SvcTunnel] flush failed: {}", ec.message());
+                                                          channel->shutdown();
+                                                          std::error_code ig;
+                                                          tcp->close(ig);
+                                                      }
+                                                  });
+                            }
+                            // Switch to a hot-path setOnRecv now that tcp is up.
+                            channel->setOnRecv([tcp, channel](const uint8_t* data, size_t n) -> ssize_t {
+                                auto buf = std::make_shared<std::vector<uint8_t>>(data, data + n);
+                                asio::async_write(*tcp,
+                                                  asio::buffer(*buf),
+                                                  [buf, channel, tcp](const std::error_code& ec, std::size_t) {
+                                                      if (ec) {
+                                                          JAMI_DEBUG("[SvcTunnel] write to TCP failed: {}",
+                                                                     ec.message());
+                                                          channel->shutdown();
+                                                          std::error_code ig;
+                                                          tcp->close(ig);
+                                                      }
+                                                  });
+                                return static_cast<ssize_t>(n);
+                            });
+                            relayTcpToChannel(channel, tcp);
+                        });
+}
+
+void
+SvcTunnelChannelHandler::relay(std::shared_ptr<dhtnet::ChannelSocket> channel,
+                               std::shared_ptr<asio::ip::tcp::socket> tcp)
+{
+    // ChannelSocket -> TCP
+    auto channelHold = channel;
+    channel->setOnRecv([tcp, channelHold](const uint8_t* data, size_t size) -> ssize_t {
+        auto buf = std::make_shared<std::vector<uint8_t>>(data, data + size);
+        asio::async_write(*tcp,
+                          asio::buffer(*buf),
+                          [buf, channelHold, tcp](const std::error_code& ec, std::size_t /*n*/) {
+                              if (ec) {
+                                  JAMI_DEBUG("[SvcTunnel] write to TCP failed: {}", ec.message());
+                                  channelHold->shutdown();
+                                  std::error_code ig;
+                                  tcp->close(ig);
+                              }
+                          });
+        return static_cast<ssize_t>(size);
+    });
+
+    // TCP -> ChannelSocket
+    relayTcpToChannel(channel, tcp);
+}
+
+void
+SvcTunnelChannelHandler::relayTcpToChannel(std::shared_ptr<dhtnet::ChannelSocket> channel,
+                                           std::shared_ptr<asio::ip::tcp::socket> tcp)
+{
+    auto buf = std::make_shared<std::vector<uint8_t>>(kRelayBufSize);
+    auto channelKeep = channel;
+    auto tcpKeep = tcp;
+    auto reader = std::make_shared<std::function<void()>>();
+    *reader = [channelKeep, tcpKeep, buf, reader]() {
+        tcpKeep->async_read_some(asio::buffer(*buf),
+                                 [channelKeep, tcpKeep, buf, reader](const std::error_code& ec, std::size_t n) {
+                                     if (ec || n == 0) {
+                                         channelKeep->shutdown();
+                                         std::error_code ig;
+                                         tcpKeep->close(ig);
+                                         *reader = nullptr; // break the cycle
+                                         return;
+                                     }
+                                     std::error_code wec;
+                                     channelKeep->write(buf->data(), n, wec);
+                                     if (wec) {
+                                         channelKeep->shutdown();
+                                         std::error_code ig;
+                                         tcpKeep->close(ig);
+                                         *reader = nullptr; // break the cycle
+                                         return;
+                                     }
+                                     (*reader)();
+                                 });
+    };
+    (*reader)();
+
+    channel->onShutdown([tcp = tcpKeep](const std::error_code&) {
+        std::error_code ig;
+        tcp->close(ig);
+    });
+}
+
+std::string
+SvcTunnelChannelHandler::openTunnel(std::string peerUri,
+                                    DeviceId peerDevice,
+                                    std::string serviceId,
+                                    std::string serviceName,
+                                    uint16_t localPort,
+                                    OnTunnelOpened onOpened,
+                                    OnTunnelClosed onClosed)
+{
+    if (!io_ || serviceId.empty() || peerUri.empty())
+        return {};
+
+    auto t = std::make_shared<ClientTunnel>();
+    t->id = generateServiceUuid(rng_);
+    t->peerUri = std::move(peerUri);
+    t->peerDevice = peerDevice;
+    t->serviceId = std::move(serviceId);
+    t->serviceName = std::move(serviceName);
+    t->onClosed = std::move(onClosed);
+    try {
+        // Try dual-stack loopback: prefer IPv4 loopback but fallback to IPv6
+        // for IPv6-only systems where 127.0.0.1 may not be available.
+        asio::ip::tcp::endpoint ep(asio::ip::address_v4::loopback(), localPort);
+        t->acceptor = std::make_shared<asio::ip::tcp::acceptor>(*io_);
+        t->acceptor->open(ep.protocol());
+        t->acceptor->set_option(asio::socket_base::reuse_address(true));
+        t->acceptor->bind(ep);
+        t->acceptor->listen();
+    } catch (const std::exception&) {
+        // IPv4 loopback failed, try IPv6 loopback
+        try {
+            asio::ip::tcp::endpoint ep6(asio::ip::address_v6::loopback(), localPort);
+            t->acceptor = std::make_shared<asio::ip::tcp::acceptor>(*io_);
+            t->acceptor->open(ep6.protocol());
+            t->acceptor->set_option(asio::socket_base::reuse_address(true));
+            t->acceptor->bind(ep6);
+            t->acceptor->listen();
+        } catch (const std::exception& e) {
+            JAMI_WARNING("[SvcTunnel] cannot bind loopback:{}: {}", localPort, e.what());
+            return {};
+        }
+    }
+
+    auto bound = static_cast<uint16_t>(t->acceptor->local_endpoint().port());
+
+    {
+        std::lock_guard lk(mtx_);
+        tunnels_[t->id] = t;
+    }
+    JAMI_LOG("[SvcTunnel] opened tunnel id={} listening on {}:{} -> peer={} service=\"{}\"",
+             t->id,
+             t->acceptor->local_endpoint().address().to_string(),
+             bound,
+             t->peerUri,
+             t->serviceName);
+    if (onOpened)
+        onOpened(t->id, bound);
+
+    acceptLoop(t);
+    return t->id;
+}
+
+void
+SvcTunnelChannelHandler::acceptLoop(const std::shared_ptr<ClientTunnel>& tunnel)
+{
+    auto self = tunnel;
+    auto sock = std::make_shared<asio::ip::tcp::socket>(*io_);
+    self->acceptor->async_accept(*sock, [this, self, sock](const std::error_code& ec) {
+        if (self->closed) {
+            return;
+        }
+        if (ec) {
+            if (ec == asio::error::operation_aborted)
+                return;
+            JAMI_DEBUG("[SvcTunnel] accept error: {}", ec.message());
+            return;
+        }
+        // Open a fresh dhtnet channel for this TCP connection.
+        std::string channelName = std::string(svc_protocol::TunnelChannelPrefix) + self->serviceId;
+        connectionManager_.connectDevice(self->peerDevice,
+                                         channelName,
+                                         [this, self, sock](std::shared_ptr<dhtnet::ChannelSocket> channel,
+                                                            const DeviceId&) {
+                                             if (!channel) {
+                                                 JAMI_WARNING("[SvcTunnel] tunnel id={}: connectDevice to peer "
+                                                              "returned null; closing tunnel",
+                                                              self->id);
+                                                 std::error_code ig;
+                                                 sock->close(ig);
+                                                 closeTunnelInternal(self->id, "connect-failed");
+                                                 return;
+                                             }
+                                             onClientChannelReady(self, sock, std::move(channel));
+                                         });
+        // Continue accepting.
+        acceptLoop(self);
+    });
+}
+
+void
+SvcTunnelChannelHandler::onClientChannelReady(const std::shared_ptr<ClientTunnel>& tunnel,
+                                              std::shared_ptr<asio::ip::tcp::socket> tcp,
+                                              std::shared_ptr<dhtnet::ChannelSocket> channel)
+{
+    if (tunnel->closed) {
+        // The tunnel was torn down while connectDevice was in flight; drop
+        // this late connection instead of wiring up a dangling relay.
+        channel->shutdown();
+        std::error_code ig;
+        tcp->close(ig);
+        return;
+    }
+    trackClientConnection(tunnel, channel, tcp);
+    relay(std::move(channel), std::move(tcp));
+}
+
+void
+SvcTunnelChannelHandler::trackClientConnection(const std::shared_ptr<ClientTunnel>& tunnel,
+                                               const std::shared_ptr<dhtnet::ChannelSocket>& channel,
+                                               const std::shared_ptr<asio::ip::tcp::socket>& tcp)
+{
+    {
+        std::lock_guard lk(tunnel->connsMtx);
+        // Compact dead entries opportunistically.
+        tunnel->activeConns.erase(std::remove_if(tunnel->activeConns.begin(),
+                                                 tunnel->activeConns.end(),
+                                                 [](const ClientTunnel::Conn& c) {
+                                                     return !c.channel.lock() && !c.tcp.lock();
+                                                 }),
+                                  tunnel->activeConns.end());
+        tunnel->activeConns.push_back({channel, tcp});
+    }
+    std::weak_ptr<ClientTunnel> wt = tunnel;
+    std::weak_ptr<dhtnet::ChannelSocket> wc = channel;
+    channel->onShutdown([wt, wc](const std::error_code&) {
+        auto t = wt.lock();
+        if (!t)
+            return;
+        auto c = wc.lock();
+        std::lock_guard lk(t->connsMtx);
+        t->activeConns.erase(std::remove_if(t->activeConns.begin(),
+                                            t->activeConns.end(),
+                                            [&](const ClientTunnel::Conn& cn) {
+                                                return cn.channel.lock() == c || !cn.channel.lock();
+                                            }),
+                             t->activeConns.end());
+    });
+}
+
+bool
+SvcTunnelChannelHandler::closeTunnel(const std::string& tunnelId)
+{
+    return closeTunnelInternal(tunnelId, "closed");
+}
+
+bool
+SvcTunnelChannelHandler::closeTunnelInternal(const std::string& tunnelId, const std::string& reason)
+{
+    std::shared_ptr<ClientTunnel> t;
+    {
+        std::lock_guard lk(mtx_);
+        auto it = tunnels_.find(tunnelId);
+        if (it == tunnels_.end())
+            return false;
+        t = it->second;
+        tunnels_.erase(it);
+    }
+    t->closed = true;
+    std::error_code ec;
+    if (t->acceptor)
+        t->acceptor->close(ec);
+    // Tear down every per-connection relay (channel + local TCP) currently
+    // serving this tunnel so that close actually severs the byte streams.
+    std::vector<ClientTunnel::Conn> conns;
+    {
+        std::lock_guard lk(t->connsMtx);
+        conns.swap(t->activeConns);
+    }
+    for (auto& c : conns) {
+        if (auto ch = c.channel.lock())
+            ch->shutdown();
+        if (auto sock = c.tcp.lock()) {
+            std::error_code ig;
+            sock->close(ig);
+        }
+    }
+    JAMI_LOG("[SvcTunnel] closed tunnel id={} reason={} ({} live connection(s) torn down)",
+             tunnelId,
+             reason,
+             conns.size());
+    if (t->onClosed)
+        t->onClosed(tunnelId, reason);
+    return true;
+}
+
+void
+SvcTunnelChannelHandler::trackServerChannel(const std::string& serviceId,
+                                            const std::shared_ptr<dhtnet::ChannelSocket>& channel,
+                                            const std::shared_ptr<asio::ip::tcp::socket>& tcp)
+{
+    if (!channel)
+        return;
+    {
+        std::lock_guard lk(mtx_);
+        auto& vec = serverChannels_[serviceId];
+        // Drop dead entries opportunistically.
+        vec.erase(std::remove_if(vec.begin(), vec.end(), [](const ServerConn& c) { return !c.channel.lock(); }),
+                  vec.end());
+        vec.push_back({channel, tcp});
+    }
+    std::weak_ptr<dhtnet::ChannelSocket> wc = channel;
+    std::weak_ptr<SvcTunnelChannelHandler> wself; // not needed: handler owns map
+    auto sid = serviceId;
+    channel->onShutdown([this, sid, wc](const std::error_code&) {
+        auto c = wc.lock();
+        std::lock_guard lk(mtx_);
+        auto it = serverChannels_.find(sid);
+        if (it == serverChannels_.end())
+            return;
+        auto& vec = it->second;
+        vec.erase(std::remove_if(vec.begin(),
+                                 vec.end(),
+                                 [&](const ServerConn& sc) {
+                                     auto sch = sc.channel.lock();
+                                     return !sch || sch == c;
+                                 }),
+                  vec.end());
+        if (vec.empty())
+            serverChannels_.erase(it);
+    });
+}
+
+void
+SvcTunnelChannelHandler::closeServerChannelsForService(const std::string& serviceId)
+{
+    std::vector<ServerConn> conns;
+    {
+        std::lock_guard lk(mtx_);
+        auto it = serverChannels_.find(serviceId);
+        if (it == serverChannels_.end())
+            return;
+        conns.swap(it->second);
+        serverChannels_.erase(it);
+    }
+    for (auto& c : conns) {
+        if (auto ch = c.channel.lock())
+            ch->shutdown();
+        if (auto sock = c.tcp.lock()) {
+            std::error_code ig;
+            sock->close(ig);
+        }
+    }
+    if (!conns.empty())
+        JAMI_LOG("[SvcTunnel] closed {} inbound connection(s) for service id={}", conns.size(), serviceId);
+}
+
+std::vector<SvcTunnelChannelHandler::Tunnel>
+SvcTunnelChannelHandler::activeTunnels() const
+{
+    std::lock_guard lk(mtx_);
+    std::vector<Tunnel> out;
+    out.reserve(tunnels_.size());
+    for (const auto& [_id, t] : tunnels_) {
+        Tunnel info;
+        info.id = t->id;
+        info.peerUri = t->peerUri;
+        info.peerDevice = t->peerDevice.toString();
+        info.serviceId = t->serviceId;
+        info.serviceName = t->serviceName;
+        info.localPort = t->acceptor ? static_cast<uint16_t>(t->acceptor->local_endpoint().port()) : 0;
+        out.push_back(std::move(info));
+    }
+    return out;
+}
+
+} // namespace jami

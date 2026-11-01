@@ -1,0 +1,44 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "sybl-wake",
+  "main": "src/index.mjs",
+  "compatibility_date": "2026-08-11",
+  "kv_namespaces": [
+    {
+      "binding": "WAKE_REGISTRATIONS",
+      "id": "1288dae2c26548929d5b7c1dab66bfa2"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      { "name": "WAKE_REGISTRATION_AUTHORITY", "class_name": "WakeRegistration" },
+      { "name": "WAKE_ADMISSION", "class_name": "WakeAdmission" }
+    ]
+  },
+  "migrations": [
+    { "tag": "wake-registration-authority-v1", "new_sqlite_classes": ["WakeRegistration"] },
+    { "tag": "wake-admission-v1", "new_sqlite_classes": ["WakeAdmission"] }
+  ],
+  "vars": {
+    // Do not advance these gates or deploy without an approved migration and provider plan.
+    // blocked: cold handles fail closed; no legacy read can establish ownership.
+    // importing: old KV writers are stopped and a complete live snapshot is validated.
+    // An approved private binding client calls bootstrap(handle, record) with each snapshot record.
+    // Public requests and private GET never import KV values; cold handles still fail closed.
+    // Bootstrap also reserves the bounded admission index. Verify every snapshot
+    // row and its index enrollment via the private binding before advancing.
+    // complete: durable ownership AND index coverage are verified; cold handles are absent.
+    // Existing durable rows require private fixed-object reserve(handle) enrollment.
+    // Never re-enable old KV writers or roll back to the old KV-authoritative Worker.
+    "WAKE_REGISTRATION_MIGRATION": "blocked",
+    // Required operator-approved limits (1..100000); zero intentionally fails closed.
+    // Requests share one durable rolling minute across wakes and registration writes.
+    "WAKE_REQUESTS_PER_MINUTE": "0",
+    "WAKE_SOURCE_REQUESTS_PER_MINUTE": "0",
+    "WAKE_SOURCE_CAPACITY": "0",
+    // Includes reservations, expired registrations and deletion tombstones; never
+    // erase the index to reclaim capacity or infer absence during migration.
+    "WAKE_HANDLE_CAPACITY": "0"
+  },
+  "workers_dev": true
+}

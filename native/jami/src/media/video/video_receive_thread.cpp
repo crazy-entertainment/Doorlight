@@ -1,0 +1,325 @@
+/*
+ *  Copyright (C) 2004-2026 Savoir-faire Linux Inc.
+ *
+ *  This program is free software: you can redistribute it and/or modify
+ *  it under the terms of the GNU General Public License as published by
+ *  the Free Software Foundation, either version 3 of the License, or
+ *  (at your option) any later version.
+ *
+ *  This program is distributed in the hope that it will be useful,
+ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ *  GNU General Public License for more details.
+ *
+ *  You should have received a copy of the GNU General Public License
+ *  along with this program. If not, see <https://www.gnu.org/licenses/>.
+ */
+
+#include "libav_deps.h" // MUST BE INCLUDED FIRST
+#include "video_receive_thread.h"
+#include "media/media_decoder.h"
+#include "socket_pair.h"
+#include "manager.h"
+#include "logger.h"
+
+extern "C" {
+#include <libavutil/display.h>
+}
+
+#include <unistd.h>
+
+namespace jami {
+namespace video {
+
+using std::string;
+
+VideoReceiveThread::VideoReceiveThread(const std::string& id, bool useSink, const std::string& sdp, uint16_t mtu)
+    : VideoGenerator::VideoGenerator()
+    , args_()
+    , id_(id)
+    , useSink_(useSink)
+    , stream_(sdp)
+    , sdpContext_(stream_.str().size(), false, &readFunction, 0, 0, this)
+    , sink_ {Manager::instance().createSinkClient(id)}
+    , mtu_(mtu)
+    , loop_(std::bind(&VideoReceiveThread::setup, this),
+            std::bind(&VideoReceiveThread::decodeFrame, this),
+            std::bind(&VideoReceiveThread::cleanup, this))
+{
+    JAMI_LOG("[{}] Instance created", fmt::ptr(this));
+}
+
+VideoReceiveThread::~VideoReceiveThread()
+{
+    loop_.join();
+    JAMI_LOG("[{}] Instance destroyed", fmt::ptr(this));
+}
+
+void
+VideoReceiveThread::startLoop()
+{
+    JAMI_LOG("[{}] Starting receiver’s loop", fmt::ptr(this));
+    loop_.start();
+}
+
+void
+VideoReceiveThread::stopLoop()
+{
+    if (loop_.isStopping())
+        return;
+    JAMI_LOG("[{}] Stopping receiver’s loop and waiting for the thread to exit…", fmt::ptr(this));
+    loop_.stop();
+    loop_.join();
+    JAMI_LOG("[{}] Receiver’s thread exited", fmt::ptr(this));
+}
+
+// We do this setup here instead of the constructor because we don't want the
+// main thread to block while this executes, so it happens in the video thread.
+bool
+VideoReceiveThread::setup()
+{
+    JAMI_LOG("[{}] Setting up video receiver", fmt::ptr(this));
+
+    videoDecoder_.reset(new MediaDecoder([this](const std::shared_ptr<MediaFrame>& frame) mutable {
+        libav_utils::AVBufferPtr displayMatrix;
+        {
+            std::lock_guard l(rotationMtx_);
+            if (displayMatrix_)
+                displayMatrix.reset(av_buffer_ref(displayMatrix_.get()));
+        }
+        if (displayMatrix)
+            av_frame_new_side_data_from_buf(frame->pointer(), AV_FRAME_DATA_DISPLAYMATRIX, displayMatrix.release());
+        publishFrame(std::static_pointer_cast<VideoFrame>(frame));
+    }));
+    videoDecoder_->setContextCallback([this]() {
+        if (recorderCallback_)
+            recorderCallback_(getInfo());
+    });
+    videoDecoder_->setResolutionChangedCallback([this](int width, int height) {
+        dstWidth_ = width;
+        dstHeight_ = height;
+        sink_->setFrameSize(dstWidth_, dstHeight_);
+    });
+
+    dstWidth_ = static_cast<int>(args_.width);
+    dstHeight_ = static_cast<int>(args_.height);
+
+    static const std::string SDP_FILENAME = "dummyFilename";
+    if (args_.input.empty()) {
+        args_.format = "sdp";
+        args_.input = SDP_FILENAME;
+    } else if (args_.input.substr(0, strlen("/dev/video")) == "/dev/video") {
+        // it's a v4l device if starting with /dev/video
+        // FIXME: This is not a robust way of checking if we mean to use a
+        // v4l2 device
+        args_.format = "video4linux2";
+    }
+
+    videoDecoder_->setInterruptCallback(interruptCb, this);
+
+    if (args_.input == SDP_FILENAME) {
+        // Force custom_io so the SDP demuxer will not open any UDP connections
+        // We need it to use ICE transport.
+        args_.sdp_flags = "custom_io";
+
+        if (stream_.str().empty()) {
+            JAMI_ERROR("No SDP loaded");
+            return false;
+        }
+
+        videoDecoder_->setIOContext(&sdpContext_);
+    }
+
+    args_.disable_dts_probe_delay = true;
+
+    if (videoDecoder_->openInput(args_)) {
+        JAMI_ERROR("Unable to open input \"{}\"", args_.input);
+        return false;
+    }
+
+    videoDecoder_->setKeyFrameRequestCb(keyFrameRequestCallback_);
+
+    if (args_.input == SDP_FILENAME) {
+        // Now replace our custom AVIOContext with one that will read packets
+        videoDecoder_->setIOContext(demuxContext_.get());
+    }
+    return true;
+}
+
+void
+VideoReceiveThread::cleanup()
+{
+    JAMI_LOG("[{}] Stopping receiver", fmt::ptr(this));
+
+    detach(sink_.get());
+    sink_->stop();
+
+    videoDecoder_.reset();
+}
+
+// This callback is used by libav internally to break out of blocking calls
+int
+VideoReceiveThread::interruptCb(void* data)
+{
+    auto* const context = static_cast<VideoReceiveThread*>(data);
+    return not context->loop_.isRunning();
+}
+
+int
+VideoReceiveThread::readFunction(void* opaque, uint8_t* buf, int buf_size)
+{
+    std::istream& is = static_cast<VideoReceiveThread*>(opaque)->stream_;
+    is.read(reinterpret_cast<char*>(buf), buf_size);
+
+    auto count = is.gcount();
+    if (count != 0)
+        return static_cast<int>(count);
+    else
+        return AVERROR_EOF;
+}
+
+void
+VideoReceiveThread::addIOContext(SocketPair& socketPair)
+{
+    demuxContext_.reset(socketPair.createIOContext(mtu_));
+}
+
+void
+VideoReceiveThread::setRecorderCallback(const std::function<void(const MediaStream& ms)>& cb)
+{
+    recorderCallback_ = cb;
+    if (videoDecoder_)
+        videoDecoder_->setContextCallback([this]() {
+            if (recorderCallback_)
+                recorderCallback_(getInfo());
+        });
+}
+
+void
+VideoReceiveThread::decodeFrame()
+{
+    if (not loop_.isRunning())
+        return;
+
+    if (not isVideoConfigured_) {
+        if (!configureVideoOutput()) {
+            JAMI_ERROR("[{:p}] Failed to configure video output", fmt::ptr(this));
+            return;
+        } else {
+            JAMI_LOG("[{:p}] Decoder configured, starting decoding", fmt::ptr(this));
+        }
+    }
+    auto status = videoDecoder_->decode();
+    if (status == MediaDemuxer::Status::EndOfFile) {
+        JAMI_LOG("[{:p}] End of file", fmt::ptr(this));
+        loop_.stop();
+    } else if (status == MediaDemuxer::Status::ReadError) {
+        JAMI_ERROR("[{:p}] Decoding error: %s", fmt::ptr(this), MediaDemuxer::getStatusStr(status));
+    } else if (status == MediaDemuxer::Status::FallBack) {
+        if (keyFrameRequestCallback_)
+            keyFrameRequestCallback_();
+    }
+}
+
+bool
+VideoReceiveThread::configureVideoOutput()
+{
+    assert(not isVideoConfigured_);
+
+    JAMI_LOG("[{}] Configuring video output", fmt::ptr(this));
+
+    if (not loop_.isRunning()) {
+        JAMI_WARNING("[{}] Unable to configure video output, the loop is not running!", fmt::ptr(this));
+        return false;
+    }
+
+    if (videoDecoder_->setupVideo() < 0) {
+        JAMI_ERROR("Decoder IO startup failed");
+        stopLoop();
+        return false;
+    }
+
+    // Default size from input video
+    if (dstWidth_ == 0 and dstHeight_ == 0) {
+        dstWidth_ = videoDecoder_->getWidth();
+        dstHeight_ = videoDecoder_->getHeight();
+    }
+
+    if (not sink_->start()) {
+        JAMI_ERROR("RX: sink startup failed");
+        stopLoop();
+        return false;
+    }
+
+    if (useSink_)
+        startSink();
+
+    if (onSuccessfulSetup_)
+        onSuccessfulSetup_(MEDIA_VIDEO, 1);
+
+    return isVideoConfigured_ = true;
+}
+
+void
+VideoReceiveThread::stopSink()
+{
+    JAMI_LOG("[{}] Stopping sink", fmt::ptr(this));
+
+    if (!loop_.isRunning())
+        return;
+
+    detach(sink_.get());
+    sink_->setFrameSize(0, 0);
+}
+
+void
+VideoReceiveThread::startSink()
+{
+    JAMI_LOG("[{}] Starting sink", fmt::ptr(this));
+
+    if (!loop_.isRunning())
+        return;
+
+    if (dstWidth_ > 0 and dstHeight_ > 0 and attach(sink_.get()))
+        sink_->setFrameSize(dstWidth_, dstHeight_);
+}
+
+int
+VideoReceiveThread::getWidth() const
+{
+    return dstWidth_;
+}
+
+int
+VideoReceiveThread::getHeight() const
+{
+    return dstHeight_;
+}
+
+AVPixelFormat
+VideoReceiveThread::getPixelFormat() const
+{
+    if (videoDecoder_)
+        return videoDecoder_->getPixelFormat();
+    return {};
+}
+
+MediaStream
+VideoReceiveThread::getInfo() const
+{
+    if (videoDecoder_)
+        return videoDecoder_->getStream("v:remote");
+    return {};
+}
+
+void
+VideoReceiveThread::setRotation(int angle)
+{
+    libav_utils::AVBufferPtr displayMatrix(av_buffer_alloc(sizeof(int32_t) * 9));
+    av_display_rotation_set(reinterpret_cast<int32_t*>(displayMatrix->data), angle);
+    std::lock_guard l(rotationMtx_);
+    displayMatrix_ = std::move(displayMatrix);
+}
+
+} // namespace video
+} // namespace jami

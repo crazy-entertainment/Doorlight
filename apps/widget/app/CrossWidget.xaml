@@ -1,0 +1,32 @@
+<Page
+    x:Class="WidgetSampleCS.CrossWidget"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    Background="Transparent" RequestedTheme="Dark" Foreground="{ThemeResource WidgetInk}"
+    FontFamily="ms-appx:///Assets/Fonts/HankenGrotesk-Variable.ttf#Hanken Grotesk">
+<Grid x:Name="Root" MinWidth="200" MinHeight="160">
+        <Border x:Name="SetupBackground" IsHitTestVisible="False" Background="{ThemeResource WidgetBackground}"/>
+        <Grid x:Name="Holder">
+            <Canvas x:Name="Draw" HorizontalAlignment="Center" VerticalAlignment="Center" />
+            <Image x:Name="Picture" HorizontalAlignment="Center" VerticalAlignment="Center" Stretch="Uniform" Visibility="Collapsed" />
+        </Grid>
+        <Grid x:Name="Setup" Margin="16,0,16,12">
+            <StackPanel VerticalAlignment="Center" HorizontalAlignment="Center" Spacing="2" Margin="0,12,0,0">
+                <Grid x:Name="ShapeNavigation" ColumnSpacing="4">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="32"/><ColumnDefinition Width="88"/><ColumnDefinition Width="32"/>
+                    </Grid.ColumnDefinitions>
+                    <Button Click="Previous_Click" Width="32" Height="32" MinWidth="32" MinHeight="32" Padding="0" Background="Transparent" BorderThickness="0" Foreground="{ThemeResource WidgetMuted}" AutomationProperties.Name="Previous crosshair">
+                        <FontIcon FontFamily="Segoe MDL2 Assets" Glyph="&#xE76B;" FontSize="10"/>
+                    </Button>
+                    <Button Grid.Column="2" Click="Next_Click" Width="32" Height="32" MinWidth="32" MinHeight="32" Padding="0" Background="Transparent" BorderThickness="0" Foreground="{ThemeResource WidgetMuted}" AutomationProperties.Name="Next crosshair">
+                        <FontIcon FontFamily="Segoe MDL2 Assets" Glyph="&#xE76C;" FontSize="10"/>
+                    </Button>
+                </Grid>
+
+            </StackPanel>
+            <Button Click="Center_Click" Content="Center" VerticalAlignment="Bottom" HorizontalAlignment="Center" Background="{ThemeResource WidgetAccent}" Foreground="{ThemeResource WidgetOnAccent}" Padding="20,4" AutomationProperties.Name="Center crosshair on screen"/>
+        </Grid>
+
+    </Grid>
+</Page>

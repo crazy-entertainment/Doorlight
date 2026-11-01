@@ -1,0 +1,25 @@
+﻿<Page
+    x:Class="WidgetSampleCS.MainPage"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+    xmlns:local="using:WidgetSampleCS"
+    xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+    Background="{ThemeResource WidgetBackground}"
+    mc:Ignorable="d">
+
+    <ScrollViewer HorizontalScrollMode="Disabled" HorizontalScrollBarVisibility="Disabled">
+        <StackPanel MaxWidth="540" Margin="24" Spacing="16" HorizontalAlignment="Center" VerticalAlignment="Center">
+            <TextBlock Text="Doorlight Widget" FontSize="30" FontWeight="SemiBold" Foreground="{ThemeResource WidgetInk}" TextWrapping="Wrap" />
+            <TextBlock Text="Open Xbox Game Bar with Win+G, then choose Doorlight Widget." Foreground="{ThemeResource WidgetInk}" TextWrapping="Wrap" />
+            <TextBlock Text="Clock, timer, crosshair and weather work on their own. Chat, voice and desktop shortcuts use the Doorlight app." Foreground="{ThemeResource WidgetMuted}" TextWrapping="Wrap" />
+            <Button Content="Open Game Bar" Click="OpenGameBar" />
+            <TextBlock x:Name="Status" Foreground="{ThemeResource WidgetInk}" TextWrapping="Wrap" AutomationProperties.LiveSetting="Polite" />
+            <StackPanel Orientation="Horizontal" Spacing="12">
+                <HyperlinkButton Content="Privacy" Click="ShowPrivacy" Padding="0" />
+                <HyperlinkButton Content="Licenses" Click="ShowLicenses" Padding="0" />
+            </StackPanel>
+            <TextBlock x:Name="Details" Foreground="{ThemeResource WidgetInk}" TextWrapping="Wrap" IsTextSelectionEnabled="True" />
+        </StackPanel>
+    </ScrollViewer>
+</Page>

@@ -1,0 +1,1441 @@
+/*
+ *  Copyright (C) 2004-2026 Savoir-faire Linux Inc.
+ *
+ *  This program is free software: you can redistribute it and/or modify
+ *  it under the terms of the GNU General Public License as published by
+ *  the Free Software Foundation, either version 3 of the License, or
+ *  (at your option) any later version.
+ *
+ *  This program is distributed in the hope that it will be useful,
+ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ *  GNU General Public License for more details.
+ *
+ *  You should have received a copy of the GNU General Public License
+ *  along with this program. If not, see <https://www.gnu.org/licenses/>.
+ */
+
+#ifdef HAVE_CONFIG_H
+#include "config.h"
+#endif
+
+#include "configurationmanager_interface.h"
+#include "manager.h"
+#include "logger.h"
+#include "fileutils.h"
+#include "sip/sipaccount.h"
+#include "jamidht/jamiaccount.h"
+#include "jamidht/service_manager.h"
+#include "sip/sipaccount_config.h"
+#include "jamidht/jamiaccount_config.h"
+#include "audio/audiolayer.h"
+#include "system_codec_container.h"
+#include "account_const.h"
+#include "security_const.h"
+#include "client/jami_signal.h"
+#include "audio/ringbufferpool.h"
+#include "connectivity/security/tlsvalidator.h"
+
+#include <dhtnet/ip_utils.h>
+#include <dhtnet/upnp/upnp_context.h>
+#include <dhtnet/certstore.h>
+
+#ifdef __APPLE__
+#include <TargetConditionals.h>
+#endif
+
+#ifdef _MSC_VER
+#include "windirent.h"
+#else
+#include <dirent.h>
+#endif
+
+#include <cerrno>
+#include <cstring>
+
+#ifdef _WIN32
+#undef interface
+#endif
+
+namespace libjami {
+
+constexpr unsigned CODECS_NOT_LOADED = 0x1000; /** Codecs not found */
+
+using jami::SIPAccount;
+using jami::JamiAccount;
+using jami::tls::TlsValidator;
+using jami::AudioDeviceType;
+
+void
+registerConfHandlers(const std::map<std::string, std::shared_ptr<CallbackWrapperBase>>& handlers)
+{
+    registerSignalHandlers(handlers);
+}
+
+std::map<std::string, std::string>
+getAccountDetails(const std::string& accountId)
+{
+    return jami::Manager::instance().getAccountDetails(accountId);
+}
+
+std::map<std::string, std::string>
+getVolatileAccountDetails(const std::string& accountId)
+{
+    return jami::Manager::instance().getVolatileAccountDetails(accountId);
+}
+
+std::map<std::string, std::string>
+validateCertificate(const std::string& accountId, const std::string& certificate)
+{
+    try {
+        if (const auto acc = jami::Manager::instance().getAccount<jami::JamiAccount>(accountId))
+            return TlsValidator {acc->certStore(), acc->certStore().getCertificate(certificate)}.getSerializedChecks();
+    } catch (const std::runtime_error& e) {
+        JAMI_WARNING("Certificate loading failed: {}", e.what());
+    }
+    return {{Certificate::ChecksNames::EXIST, Certificate::CheckValuesNames::FAILED}};
+}
+
+std::map<std::string, std::string>
+validateCertificatePath(const std::string& accountId,
+                        const std::string& certificate,
+                        const std::string& privateKey,
+                        const std::string& privateKeyPass,
+                        const std::string& caList)
+{
+    try {
+        if (const auto acc = jami::Manager::instance().getAccount<jami::JamiAccount>(accountId))
+            return TlsValidator {acc->certStore(), certificate, privateKey, privateKeyPass, caList}.getSerializedChecks();
+    } catch (const std::runtime_error& e) {
+        JAMI_WARNING("Certificate loading failed: {}", e.what());
+        return {{Certificate::ChecksNames::EXIST, Certificate::CheckValuesNames::FAILED}};
+    }
+    return {};
+}
+
+std::map<std::string, std::string>
+getCertificateDetails(const std::string& accountId, const std::string& certificate)
+{
+    try {
+        if (const auto acc = jami::Manager::instance().getAccount<jami::JamiAccount>(accountId))
+            return TlsValidator {acc->certStore(), acc->certStore().getCertificate(certificate)}.getSerializedDetails();
+    } catch (const std::runtime_error& e) {
+        JAMI_WARNING("Certificate loading failed: {}", e.what());
+    }
+    return {};
+}
+
+std::map<std::string, std::string>
+getCertificateDetailsPath(const std::string& accountId,
+                          const std::string& certificate,
+                          const std::string& privateKey,
+                          const std::string& privateKeyPassword)
+{
+    try {
+        auto crt = std::make_shared<dht::crypto::Certificate>(jami::fileutils::loadFile(certificate));
+        if (const auto acc = jami::Manager::instance().getAccount<jami::JamiAccount>(accountId)) {
+            TlsValidator validator {acc->certStore(), certificate, privateKey, privateKeyPassword};
+            acc->certStore().pinCertificate(validator.getCertificate(), false);
+            return validator.getSerializedDetails();
+        }
+    } catch (const std::runtime_error& e) {
+        JAMI_WARNING("Certificate loading failed: {}", e.what());
+    }
+    return {};
+}
+
+std::vector<std::string>
+getPinnedCertificates(const std::string& accountId)
+{
+    if (const auto acc = jami::Manager::instance().getAccount<jami::JamiAccount>(accountId))
+        return acc->certStore().getPinnedCertificates();
+    return {};
+}
+
+std::vector<std::string>
+pinCertificate(const std::string& accountId, const std::vector<uint8_t>& certificate, bool local)
+{
+    if (const auto acc = jami::Manager::instance().getAccount<jami::JamiAccount>(accountId))
+        return acc->certStore().pinCertificate(certificate, local);
+    return {};
+}
+
+void
+pinCertificatePath(const std::string& accountId, const std::string& path)
+{
+    if (const auto acc = jami::Manager::instance().getAccount<jami::JamiAccount>(accountId))
+        acc->certStore().pinCertificatePath(path);
+}
+
+bool
+unpinCertificate(const std::string& accountId, const std::string& certId)
+{
+    if (const auto acc = jami::Manager::instance().getAccount<jami::JamiAccount>(accountId))
+        return acc->certStore().unpinCertificate(certId);
+    return {};
+}
+
+unsigned
+unpinCertificatePath(const std::string& accountId, const std::string& path)
+{
+    if (const auto acc = jami::Manager::instance().getAccount<jami::JamiAccount>(accountId))
+        return acc->certStore().unpinCertificatePath(path);
+    return {};
+}
+
+bool
+pinRemoteCertificate(const std::string& accountId, const std::string& certId)
+{
+    if (auto acc = jami::Manager::instance().getAccount<jami::JamiAccount>(accountId)) {
+        acc->dht()->findCertificate(dht::PkId(certId), [](const std::shared_ptr<dht::crypto::Certificate>& /*crt*/) {});
+        return true;
+    }
+    return false;
+}
+
+bool
+setCertificateStatus(const std::string& accountId, const std::string& certId, const std::string& ststr)
+{
+    try {
+        if (auto acc = jami::Manager::instance().getAccount<jami::JamiAccount>(accountId)) {
+            auto status = dhtnet::tls::TrustStore::statusFromStr(ststr.c_str());
+            return acc->setCertificateStatus(certId, status);
+        }
+    } catch (const std::out_of_range& e) {
+        JAMI_WARNING("Argument out of range when setting certificate status: {}", e);
+    }
+    return false;
+}
+
+std::vector<std::string>
+getCertificatesByStatus(const std::string& accountId, const std::string& ststr)
+{
+    auto status = dhtnet::tls::TrustStore::statusFromStr(ststr.c_str());
+    if (auto acc = jami::Manager::instance().getAccount<jami::JamiAccount>(accountId))
+        return acc->getCertificatesByStatus(status);
+    return {};
+}
+
+void
+setAccountDetails(const std::string& accountId, const std::map<std::string, std::string>& details)
+{
+    jami::Manager::instance().setAccountDetails(accountId, details);
+}
+
+void
+setAccountActive(const std::string& accountId, bool enable, bool shutdownConnections)
+{
+    jami::Manager::instance().setAccountActive(accountId, enable, shutdownConnections);
+}
+
+void
+loadAccountAndConversation(const std::string& accountId, bool loadAll, const std::string& convId)
+{
+    jami::Manager::instance().loadAccountAndConversation(accountId, loadAll, convId);
+}
+
+void
+sendRegister(const std::string& accountId, bool enable)
+{
+    jami::Manager::instance().sendRegister(accountId, enable);
+}
+
+bool
+isPasswordValid(const std::string& accountId, const std::string& password)
+{
+    if (auto acc = jami::Manager::instance().getAccount<JamiAccount>(accountId))
+        return acc->isPasswordValid(password);
+    return false;
+}
+
+std::vector<uint8_t>
+getPasswordKey(const std::string& accountID, const std::string& password)
+{
+    if (auto acc = jami::Manager::instance().getAccount<JamiAccount>(accountID))
+        return acc->getPasswordKey(password);
+    return {};
+}
+
+void
+registerAllAccounts()
+{
+    jami::Manager::instance().registerAccounts();
+}
+
+uint64_t
+sendAccountTextMessage(const std::string& accountId,
+                       const std::string& to,
+                       const std::map<std::string, std::string>& payloads,
+                       int32_t flags)
+{
+    bool onlyConnected = flags & 0x1;
+    return jami::Manager::instance().sendTextMessage(accountId, to, payloads, onlyConnected);
+}
+
+std::vector<Message>
+getLastMessages(const std::string& accountId, const uint64_t& base_timestamp)
+{
+    if (const auto acc = jami::Manager::instance().getAccount(accountId))
+        return acc->getLastMessages(base_timestamp);
+    return {};
+}
+
+std::map<std::string, std::string>
+getNearbyPeers(const std::string& accountId)
+{
+    return jami::Manager::instance().getNearbyPeers(accountId);
+}
+
+void
+updateProfile(const std::string& accountId,
+              const std::string& displayName,
+              const std::string& avatar,
+              const std::string& fileType,
+              int32_t flag)
+{
+    if (const auto acc = jami::Manager::instance().getAccount(accountId)) {
+        acc->updateProfile(displayName, avatar, fileType, flag);
+    }
+}
+
+int
+getMessageStatus(uint64_t messageId)
+{
+    return jami::Manager::instance().getMessageStatus(messageId);
+}
+
+int
+getMessageStatus(const std::string& accountId, uint64_t messageId)
+{
+    return jami::Manager::instance().getMessageStatus(accountId, messageId);
+}
+
+void
+setIsComposing(const std::string& accountId, const std::string& conversationUri, bool isWriting)
+{
+    if (const auto acc = jami::Manager::instance().getAccount(accountId))
+        acc->setIsComposing(conversationUri, isWriting);
+}
+
+bool
+setMessageDisplayed(const std::string& accountId,
+                    const std::string& conversationUri,
+                    const std::string& messageId,
+                    int status)
+{
+    if (const auto acc = jami::Manager::instance().getAccount(accountId))
+        return acc->setMessageDisplayed(conversationUri, messageId, status);
+    return false;
+}
+
+int32_t
+addDevice(const std::string& accountId, const std::string& uri)
+{
+    JAMI_DEBUG("[LinkDevice {}] exportToPeer called.", accountId);
+    if (const auto account = jami::Manager::instance().getAccount<jami::JamiAccount>(accountId)) {
+        return account->addDevice(uri);
+    }
+    return static_cast<int32_t>(jami::AccountManager::AddDeviceError::GENERIC);
+}
+
+bool
+confirmAddDevice(const std::string& accountId, uint32_t op_id)
+{
+    if (const auto account = jami::Manager::instance().getAccount<jami::JamiAccount>(accountId)) {
+        return account->confirmAddDevice(op_id);
+    }
+    return false;
+}
+
+bool
+cancelAddDevice(const std::string& accountId, uint32_t op_id)
+{
+    if (const auto account = jami::Manager::instance().getAccount<jami::JamiAccount>(accountId)) {
+        return account->cancelAddDevice(op_id);
+    }
+    return false;
+}
+
+bool
+provideAccountAuthentication(const std::string& accountId,
+                             const std::string& credentialsFromUser,
+                             const std::string& scheme)
+{
+    if (const auto account = jami::Manager::instance().getAccount<jami::JamiAccount>(accountId)) {
+        return account->provideAccountAuthentication(credentialsFromUser, scheme);
+    }
+    return false;
+}
+
+std::string
+confirmAddDeviceWithCode(const std::string& accountId, uint32_t op_id, const std::string& localArchiveSecret)
+{
+    if (const auto account = jami::Manager::instance().getAccount<jami::JamiAccount>(accountId))
+        return account->confirmAddDeviceWithCode(op_id, localArchiveSecret);
+    return {};
+}
+
+bool
+completeDeviceLinkPreparation(const std::string& accountId, uint32_t op_id)
+{
+    if (const auto account = jami::Manager::instance().getAccount<jami::JamiAccount>(accountId))
+        return account->completeDeviceLinkPreparation(op_id);
+    return false;
+}
+
+bool
+exportToFile(const std::string& accountId,
+             const std::string& destinationPath,
+             const std::string& scheme,
+             const std::string& password)
+{
+    if (const auto account = jami::Manager::instance().getAccount<jami::JamiAccount>(accountId)) {
+        return account->exportArchive(destinationPath, scheme, password);
+    }
+    return false;
+}
+
+bool
+exportToFileWithCredentials(const std::string& accountId,
+                            const std::string& destinationPath,
+                            const std::string& inputScheme,
+                            const std::string& inputPassword,
+                            const std::string& outputScheme,
+                            const std::string& outputPassword)
+{
+    if (const auto account = jami::Manager::instance().getAccount<jami::JamiAccount>(accountId)) {
+        return account->exportArchive(destinationPath, inputScheme, inputPassword, outputScheme, outputPassword);
+    }
+    return false;
+}
+
+bool
+revokeDevice(const std::string& accountId,
+             const std::string& deviceId,
+             const std::string& scheme,
+             const std::string& password)
+{
+    if (const auto account = jami::Manager::instance().getAccount<jami::JamiAccount>(accountId)) {
+        return account->revokeDevice(deviceId, scheme, password);
+    }
+    return false;
+}
+
+std::map<std::string, std::string>
+getKnownRingDevices(const std::string& accountId)
+{
+    if (auto acc = jami::Manager::instance().getAccount<jami::JamiAccount>(accountId))
+        return acc->getKnownDevices();
+    return {};
+}
+
+/* Local-service exposure */
+
+namespace {
+std::map<std::string, std::string>
+serviceRecordToMap(const jami::ServiceRecord& r)
+{
+    std::map<std::string, std::string> m;
+    m["id"] = r.id;
+    m["type"] = r.type;
+    m["name"] = r.name;
+    m["description"] = r.description;
+    m["scheme"] = r.scheme;
+    m["localHost"] = r.localHost;
+    m["localPort"] = std::to_string(r.localPort);
+    m["directory"] = r.directory;
+    m["enabled"] = r.enabled ? "true" : "false";
+    switch (r.policy) {
+    case jami::AccessPolicy::PUBLIC:
+        m["policy"] = "public";
+        break;
+    case jami::AccessPolicy::SPECIFIC_CONTACTS:
+        m["policy"] = "specific";
+        break;
+    case jami::AccessPolicy::CONTACTS_ONLY:
+    default:
+        m["policy"] = "contacts";
+        break;
+    }
+    std::string allowed;
+    for (size_t i = 0; i < r.allowedContacts.size(); ++i) {
+        if (i)
+            allowed.push_back(',');
+        allowed += r.allowedContacts[i];
+    }
+    m["allowedContacts"] = std::move(allowed);
+    return m;
+}
+
+jami::ServiceRecord
+mapToServiceRecord(const std::map<std::string, std::string>& m)
+{
+    jami::ServiceRecord r;
+    auto get = [&](const char* k, const std::string& def = {}) {
+        auto it = m.find(k);
+        return it == m.end() ? def : it->second;
+    };
+    r.id = get("id");
+    r.type = get("type", "custom");
+    if (r.type.empty())
+        r.type = "custom";
+    r.name = get("name");
+    r.description = get("description");
+    r.scheme = get("scheme");
+    auto host = get("localHost");
+    if (!host.empty())
+        r.localHost = host;
+    auto portStr = get("localPort");
+    if (!portStr.empty()) {
+        try {
+            r.localPort = static_cast<uint16_t>(std::stoi(portStr));
+        } catch (...) {
+        }
+    }
+    r.directory = get("directory");
+    auto pol = get("policy", "contacts");
+    if (pol == "public")
+        r.policy = jami::AccessPolicy::PUBLIC;
+    else if (pol == "specific")
+        r.policy = jami::AccessPolicy::SPECIFIC_CONTACTS;
+    else
+        r.policy = jami::AccessPolicy::CONTACTS_ONLY;
+    auto allowed = get("allowedContacts");
+    if (!allowed.empty()) {
+        size_t start = 0;
+        while (start <= allowed.size()) {
+            auto end = allowed.find(',', start);
+            auto piece = allowed.substr(start, end - start);
+            if (!piece.empty())
+                r.allowedContacts.push_back(std::move(piece));
+            if (end == std::string::npos)
+                break;
+            start = end + 1;
+        }
+    }
+    auto en = get("enabled", "true");
+    r.enabled = (en == "true" || en == "1");
+    return r;
+}
+} // namespace
+
+std::string
+addExposedService(const std::string& accountId, const std::map<std::string, std::string>& details)
+{
+    if (auto acc = jami::Manager::instance().getAccount<jami::JamiAccount>(accountId); acc && acc->hasServiceManager())
+        return acc->serviceManager().addService(mapToServiceRecord(details), acc->rand);
+    return {};
+}
+
+bool
+updateExposedService(const std::string& accountId, const std::map<std::string, std::string>& details)
+{
+    if (auto acc = jami::Manager::instance().getAccount<jami::JamiAccount>(accountId); acc && acc->hasServiceManager()) {
+        auto rec = mapToServiceRecord(details);
+        // Tear down any active inbound tunnels first; if the update changes
+        // the local target (host/port) or disables the service, existing
+        // peer connections must be severed. A new connection from a peer
+        // will pick up the updated record.
+        acc->closeServerTunnelsForService(rec.id);
+        return acc->serviceManager().updateService(rec);
+    }
+    return false;
+}
+
+bool
+removeExposedService(const std::string& accountId, const std::string& serviceId)
+{
+    if (auto acc = jami::Manager::instance().getAccount<jami::JamiAccount>(accountId); acc && acc->hasServiceManager()) {
+        acc->closeServerTunnelsForService(serviceId);
+        return acc->serviceManager().removeService(serviceId);
+    }
+    return false;
+}
+
+std::vector<std::map<std::string, std::string>>
+getExposedServices(const std::string& accountId)
+{
+    std::vector<std::map<std::string, std::string>> out;
+    if (auto acc = jami::Manager::instance().getAccount<jami::JamiAccount>(accountId); acc && acc->hasServiceManager()) {
+        auto recs = acc->serviceManager().getServices();
+        out.reserve(recs.size());
+        for (auto& r : recs)
+            out.push_back(serviceRecordToMap(r));
+    }
+    return out;
+}
+
+uint32_t
+queryPeerServices(const std::string& accountId, const std::string& peerUri)
+{
+    if (auto acc = jami::Manager::instance().getAccount<jami::JamiAccount>(accountId))
+        return acc->queryPeerServices(peerUri);
+    return 0;
+}
+
+std::string
+openServiceTunnel(const std::string& accountId,
+                  const std::string& peerUri,
+                  const std::string& deviceId,
+                  const std::string& serviceId,
+                  const std::string& serviceName,
+                  uint16_t localPort)
+{
+    if (auto acc = jami::Manager::instance().getAccount<jami::JamiAccount>(accountId))
+        return acc->openServiceTunnel(peerUri, deviceId, serviceId, serviceName, localPort);
+    return {};
+}
+
+bool
+closeServiceTunnel(const std::string& accountId, const std::string& tunnelId)
+{
+    if (auto acc = jami::Manager::instance().getAccount<jami::JamiAccount>(accountId))
+        return acc->closeServiceTunnel(tunnelId);
+    return false;
+}
+
+std::vector<std::map<std::string, std::string>>
+getActiveTunnels(const std::string& accountId)
+{
+    if (auto acc = jami::Manager::instance().getAccount<jami::JamiAccount>(accountId))
+        return acc->getActiveServiceTunnels();
+    return {};
+}
+
+bool
+changeAccountPassword(const std::string& accountId, const std::string& password_old, const std::string& password_new)
+{
+    if (auto acc = jami::Manager::instance().getAccount<jami::JamiAccount>(accountId))
+        return acc->changeArchivePassword(password_old, password_new);
+    return false;
+}
+
+/* contacts */
+
+void
+addContact(const std::string& accountId, const std::string& uri)
+{
+    if (auto acc = jami::Manager::instance().getAccount<jami::JamiAccount>(accountId))
+        return acc->addContact(uri);
+}
+
+void
+removeContact(const std::string& accountId, const std::string& uri, bool ban)
+{
+    if (auto acc = jami::Manager::instance().getAccount<jami::JamiAccount>(accountId))
+        return acc->removeContact(uri, ban);
+}
+
+std::map<std::string, std::string>
+getContactDetails(const std::string& accountId, const std::string& uri)
+{
+    if (auto acc = jami::Manager::instance().getAccount<jami::JamiAccount>(accountId))
+        return acc->getContactDetails(uri);
+    return {};
+}
+
+std::vector<std::map<std::string, std::string>>
+getContacts(const std::string& accountId)
+{
+    if (auto acc = jami::Manager::instance().getAccount<jami::JamiAccount>(accountId))
+        return acc->getContacts();
+    return {};
+}
+
+/* contact requests */
+std::vector<std::map<std::string, std::string>>
+getTrustRequests(const std::string& accountId)
+{
+    if (auto acc = jami::Manager::instance().getAccount<jami::JamiAccount>(accountId))
+        return acc->getTrustRequests();
+    return {};
+}
+
+bool
+acceptTrustRequest(const std::string& accountId, const std::string& from)
+{
+    if (auto acc = jami::Manager::instance().getAccount<jami::JamiAccount>(accountId))
+        return acc->acceptTrustRequest(from);
+    return false;
+}
+
+bool
+discardTrustRequest(const std::string& accountId, const std::string& from)
+{
+    if (auto acc = jami::Manager::instance().getAccount<jami::JamiAccount>(accountId))
+        return acc->discardTrustRequest(from);
+    return false;
+}
+
+void
+sendTrustRequest(const std::string& accountId, const std::string& to, const std::vector<uint8_t>& payload)
+{
+    if (auto acc = jami::Manager::instance().getAccount<jami::JamiAccount>(accountId))
+        acc->sendTrustRequest(to, payload);
+}
+
+/// This function is used as a base for new accounts for clients that support it
+std::map<std::string, std::string>
+getAccountTemplate(const std::string& accountType)
+{
+    if (accountType == Account::ProtocolNames::RING)
+        return jami::JamiAccountConfig().toMap();
+    else if (accountType == Account::ProtocolNames::SIP)
+        return jami::SipAccountConfig().toMap();
+    return {};
+}
+
+std::string
+addAccount(const std::map<std::string, std::string>& details, const std::string& accountId)
+{
+    return jami::Manager::instance().addAccount(details, accountId);
+}
+
+void
+monitor(bool continuous)
+{
+    return jami::Manager::instance().monitor(continuous);
+}
+
+std::vector<std::map<std::string, std::string>>
+getConnectionList(const std::string& accountId, const std::string& conversationId)
+{
+    return jami::Manager::instance().getConnectionList(accountId, conversationId);
+}
+
+std::vector<std::map<std::string, std::string>>
+getConversationConnectivity(const std::string& accountId, const std::string& conversationId)
+{
+    if (auto account = jami::Manager::instance().getAccount<jami::JamiAccount>(accountId)) {
+        return account->getConversationConnectivity(conversationId);
+    }
+    return {};
+}
+
+std::vector<std::map<std::string, std::string>>
+getConversationTrackedMembers(const std::string& accountId, const std::string& conversationId)
+{
+    if (auto account = jami::Manager::instance().getAccount<jami::JamiAccount>(accountId)) {
+        return account->getConversationTrackedMembers(conversationId);
+    }
+    return {};
+}
+
+std::vector<std::map<std::string, std::string>>
+getChannelList(const std::string& accountId, const std::string& connectionId)
+{
+    return jami::Manager::instance().getChannelList(accountId, connectionId);
+}
+
+void
+removeAccount(const std::string& accountId)
+{
+    return jami::Manager::instance().removeAccount(accountId, true); // with 'flush' enabled
+}
+
+std::vector<std::string>
+getAccountList()
+{
+    return jami::Manager::instance().getAccountList();
+}
+
+/**
+ * Send the list of all codecs loaded to the client through DBus.
+ * Can stay global, as only the active codecs will be set per accounts
+ */
+std::vector<unsigned>
+getCodecList()
+{
+    std::vector<unsigned> list {
+        jami::Manager::instance().getSystemCodecContainer()->getSystemCodecInfoIdList(jami::MEDIA_ALL)};
+    if (list.empty())
+        jami::emitSignal<ConfigurationSignal::Error>(CODECS_NOT_LOADED);
+    return list;
+}
+
+std::vector<std::string>
+getSupportedTlsMethod()
+{
+    return SIPAccount::getSupportedTlsProtocols();
+}
+
+std::vector<std::string>
+getSupportedCiphers(const std::string& accountId)
+{
+    if (auto sipaccount = jami::Manager::instance().getAccount<SIPAccount>(accountId))
+        return SIPAccount::getSupportedTlsCiphers();
+    JAMI_ERROR("SIP account {} doesn't exist", accountId);
+    return {};
+}
+
+bool
+setCodecDetails(const std::string& accountId, const unsigned& codecId, const std::map<std::string, std::string>& details)
+{
+    auto acc = jami::Manager::instance().getAccount(accountId);
+    if (!acc) {
+        JAMI_ERROR("Unable to find account {}. Unable to set codec details", accountId);
+        return false;
+    }
+
+    auto codec = acc->searchCodecById(codecId, jami::MEDIA_ALL);
+    if (!codec) {
+        JAMI_ERROR("Unable to find codec {}", codecId);
+        return false;
+    }
+    try {
+        if (codec->mediaType & jami::MEDIA_AUDIO) {
+            if (auto foundCodec = std::static_pointer_cast<jami::SystemAudioCodecInfo>(codec)) {
+                foundCodec->setCodecSpecifications(details);
+                jami::emitSignal<ConfigurationSignal::MediaParametersChanged>(accountId);
+                return true;
+            }
+        }
+
+        if (codec->mediaType & jami::MEDIA_VIDEO) {
+            if (auto foundCodec = std::static_pointer_cast<jami::SystemVideoCodecInfo>(codec)) {
+                foundCodec->setCodecSpecifications(details);
+                JAMI_WARNING("parameters for {} changed ", foundCodec->name);
+                if (auto call = jami::Manager::instance().getCurrentCall()) {
+                    if (call->getVideoCodec() == foundCodec) {
+                        JAMI_WARNING("{} running. Need to restart encoding", foundCodec->name);
+                        call->restartMediaSender();
+                    }
+                }
+                jami::emitSignal<ConfigurationSignal::MediaParametersChanged>(accountId);
+                return true;
+            }
+        }
+    } catch (const std::exception& e) {
+        JAMI_ERROR("Unable to set codec specifications: {}", e.what());
+    }
+
+    return false;
+}
+
+std::map<std::string, std::string>
+getCodecDetails(const std::string& accountId, const unsigned& codecId)
+{
+    auto acc = jami::Manager::instance().getAccount(accountId);
+    if (!acc) {
+        JAMI_ERROR("Unable to find account {} return default codec details", accountId);
+        return jami::Account::getDefaultCodecDetails(codecId);
+    }
+
+    auto codec = acc->searchCodecById(codecId, jami::MEDIA_ALL);
+    if (!codec) {
+        jami::emitSignal<ConfigurationSignal::Error>(CODECS_NOT_LOADED);
+        return {};
+    }
+
+    if (codec->mediaType & jami::MEDIA_AUDIO)
+        if (auto foundCodec = std::static_pointer_cast<jami::SystemAudioCodecInfo>(codec))
+            return foundCodec->getCodecSpecifications();
+
+    if (codec->mediaType & jami::MEDIA_VIDEO)
+        if (auto foundCodec = std::static_pointer_cast<jami::SystemVideoCodecInfo>(codec))
+            return foundCodec->getCodecSpecifications();
+
+    jami::emitSignal<ConfigurationSignal::Error>(CODECS_NOT_LOADED);
+    return {};
+}
+
+std::vector<unsigned>
+getActiveCodecList(const std::string& accountId)
+{
+    if (auto acc = jami::Manager::instance().getAccount(accountId))
+        return acc->getActiveCodecs();
+    JAMI_ERROR("Unable to find account {}, returning default", accountId);
+    return jami::Account::getDefaultCodecsId();
+}
+
+void
+setActiveCodecList(const std::string& accountId, const std::vector<unsigned>& list)
+{
+    if (auto acc = jami::Manager::instance().getAccount(accountId)) {
+        acc->setActiveCodecs(list);
+        jami::Manager::instance().saveConfig(acc);
+    } else {
+        JAMI_ERROR("Unable to find account {}", accountId);
+    }
+}
+
+std::vector<std::string>
+getAudioPluginList()
+{
+    return {PCM_DEFAULT, PCM_DMIX_DSNOOP};
+}
+
+void
+setAudioPlugin(const std::string& audioPlugin)
+{
+    return jami::Manager::instance().setAudioPlugin(audioPlugin);
+}
+
+std::vector<std::string>
+getAudioOutputDeviceList()
+{
+    return jami::Manager::instance().getAudioOutputDeviceList();
+}
+
+std::vector<std::string>
+getAudioInputDeviceList()
+{
+    return jami::Manager::instance().getAudioInputDeviceList();
+}
+
+void
+setAudioOutputDevice(int32_t index)
+{
+    return jami::Manager::instance().setAudioDevice(index, AudioDeviceType::PLAYBACK);
+}
+
+void
+setAudioInputDevice(int32_t index)
+{
+    return jami::Manager::instance().setAudioDevice(index, AudioDeviceType::CAPTURE);
+}
+
+void
+setAudioRingtoneDevice(int32_t index)
+{
+    return jami::Manager::instance().setAudioDevice(index, AudioDeviceType::RINGTONE);
+}
+
+std::vector<std::string>
+getCurrentAudioDevicesIndex()
+{
+    return jami::Manager::instance().getCurrentAudioDevicesIndex();
+}
+
+int32_t
+getAudioInputDeviceIndex(const std::string& name)
+{
+    return jami::Manager::instance().getAudioInputDeviceIndex(name);
+}
+
+int32_t
+getAudioOutputDeviceIndex(const std::string& name)
+{
+    return jami::Manager::instance().getAudioOutputDeviceIndex(name);
+}
+
+std::string
+getCurrentAudioOutputPlugin()
+{
+    auto plugin = jami::Manager::instance().getCurrentAudioOutputPlugin();
+    JAMI_LOG("Get audio plugin {}", plugin);
+    return plugin;
+}
+
+std::string
+getNoiseSuppressState()
+{
+    return jami::Manager::instance().getNoiseSuppressState();
+}
+
+void
+setNoiseSuppressState(const std::string& state)
+{
+    jami::Manager::instance().setNoiseSuppressState(state);
+}
+
+std::string
+getEchoCancellationState()
+{
+    return jami::Manager::instance().getEchoCancellationState();
+}
+
+void
+setEchoCancellationState(const std::string& state)
+{
+    jami::Manager::instance().setEchoCancellationState(state);
+}
+
+bool
+getVoiceActivityDetectionState()
+{
+    return jami::Manager::instance().getVoiceActivityDetectionState();
+}
+
+void
+setVoiceActivityDetectionState(bool state)
+{
+    jami::Manager::instance().setVoiceActivityDetectionState(state);
+}
+
+bool
+isAgcEnabled()
+{
+    return jami::Manager::instance().isAGCEnabled();
+}
+
+void
+setAgcState(bool enabled)
+{
+    jami::Manager::instance().setAGCState(enabled);
+}
+
+std::string
+getRecordPath()
+{
+    return jami::Manager::instance().audioPreference.getRecordPath();
+}
+
+void
+setRecordPath(const std::string& recPath)
+{
+    jami::Manager::instance().audioPreference.setRecordPath(recPath);
+}
+
+bool
+getIsAlwaysRecording()
+{
+    return jami::Manager::instance().getIsAlwaysRecording();
+}
+
+void
+setIsAlwaysRecording(bool rec)
+{
+    jami::Manager::instance().setIsAlwaysRecording(rec);
+}
+
+bool
+getRecordPreview()
+{
+#ifdef ENABLE_VIDEO
+    return jami::Manager::instance().videoPreferences.getRecordPreview();
+#else
+    return false;
+#endif
+}
+
+void
+setRecordPreview(bool rec)
+{
+#ifdef ENABLE_VIDEO
+    jami::Manager::instance().videoPreferences.setRecordPreview(rec);
+    jami::Manager::instance().saveConfig();
+#endif
+}
+
+int32_t
+getRecordQuality()
+{
+#ifdef ENABLE_VIDEO
+    return jami::Manager::instance().videoPreferences.getRecordQuality();
+#else
+    return 0;
+#endif
+}
+
+void
+setRecordQuality(int32_t quality)
+{
+#ifdef ENABLE_VIDEO
+    jami::Manager::instance().videoPreferences.setRecordQuality(quality);
+    jami::Manager::instance().saveConfig();
+#endif
+}
+
+std::string
+getConferenceResolution()
+{
+#ifdef ENABLE_VIDEO
+    return jami::Manager::instance().videoPreferences.getConferenceResolution();
+#else
+    return {};
+#endif
+}
+
+void
+setConferenceResolution(const std::string& resolution)
+{
+#ifdef ENABLE_VIDEO
+    jami::Manager::instance().videoPreferences.setConferenceResolution(resolution);
+    jami::Manager::instance().saveConfig();
+#endif
+}
+
+int32_t
+getHistoryLimit()
+{
+    return jami::Manager::instance().getHistoryLimit();
+}
+
+void
+setHistoryLimit(int32_t days)
+{
+    jami::Manager::instance().setHistoryLimit(days);
+}
+
+int32_t
+getRingingTimeout()
+{
+    return static_cast<int32_t>(jami::Manager::instance().getRingingTimeout().count());
+}
+
+void
+setRingingTimeout(int32_t timeout)
+{
+    jami::Manager::instance().setRingingTimeout(std::chrono::seconds(timeout));
+}
+
+std::vector<std::string>
+getSupportedAudioManagers()
+{
+    return jami::AudioPreference::getSupportedAudioManagers();
+}
+
+bool
+setAudioManager(const std::string& api)
+{
+    return jami::Manager::instance().setAudioManager(api);
+}
+
+std::string
+getAudioManager()
+{
+    return jami::Manager::instance().getAudioManager();
+}
+
+void
+setVolume(const std::string& device, double value)
+{
+    if (auto audiolayer = jami::Manager::instance().getAudioDriver()) {
+        JAMI_LOG("set volume for {}: {}", device, value);
+
+        if (device == "speaker")
+            audiolayer->setPlaybackGain(value);
+        else if (device == "mic")
+            audiolayer->setCaptureGain(value);
+
+        jami::emitSignal<ConfigurationSignal::VolumeChanged>(device, value);
+    } else {
+        JAMI_ERROR("Audio layer not valid while updating volume");
+    }
+}
+
+double
+getVolume(const std::string& device)
+{
+    if (auto audiolayer = jami::Manager::instance().getAudioDriver()) {
+        if (device == "speaker")
+            return audiolayer->getPlaybackGain();
+        if (device == "mic")
+            return audiolayer->getCaptureGain();
+    }
+
+    JAMI_ERROR("Audio layer not valid while updating volume");
+    return 0.0;
+}
+
+// FIXME: we should store "muteDtmf" instead of "playDtmf"
+// in config and avoid negating like this
+bool
+isDtmfMuted()
+{
+    return not jami::Manager::instance().voipPreferences.getPlayDtmf();
+}
+
+void
+muteDtmf(bool mute)
+{
+    jami::Manager::instance().voipPreferences.setPlayDtmf(not mute);
+}
+
+bool
+isCaptureMuted()
+{
+    if (auto audiolayer = jami::Manager::instance().getAudioDriver())
+        return audiolayer->isCaptureMuted();
+
+    JAMI_ERROR("Audio layer not valid");
+    return false;
+}
+
+void
+muteCapture(bool mute)
+{
+    if (auto audiolayer = jami::Manager::instance().getAudioDriver())
+        return audiolayer->muteCapture(mute);
+
+    JAMI_ERROR("Audio layer not valid");
+    return;
+}
+
+bool
+isPlaybackMuted()
+{
+    if (auto audiolayer = jami::Manager::instance().getAudioDriver())
+        return audiolayer->isPlaybackMuted();
+
+    JAMI_ERROR("Audio layer not valid");
+    return false;
+}
+
+void
+mutePlayback(bool mute)
+{
+    if (auto audiolayer = jami::Manager::instance().getAudioDriver())
+        return audiolayer->mutePlayback(mute);
+
+    JAMI_ERROR("Audio layer not valid");
+    return;
+}
+
+bool
+isRingtoneMuted()
+{
+    if (auto audiolayer = jami::Manager::instance().getAudioDriver())
+        return audiolayer->isRingtoneMuted();
+
+    JAMI_ERROR("Audio layer not valid");
+    return false;
+}
+
+void
+muteRingtone(bool mute)
+{
+    if (auto audiolayer = jami::Manager::instance().getAudioDriver())
+        return audiolayer->muteRingtone(mute);
+
+    JAMI_ERROR("Audio layer not valid");
+    return;
+}
+
+void
+setAccountsOrder(const std::string& order)
+{
+    jami::Manager::instance().setAccountsOrder(order);
+}
+
+std::string
+getAddrFromInterfaceName(const std::string& interface)
+{
+    auto addr = dhtnet::ip_utils::getInterfaceAddr(interface, AF_INET);
+    if (not addr)
+        addr = dhtnet::ip_utils::getInterfaceAddr(interface, AF_INET6);
+    return addr;
+}
+
+std::vector<std::string>
+getAllIpInterface()
+{
+    return dhtnet::ip_utils::getAllIpInterface();
+}
+
+std::vector<std::string>
+getAllIpInterfaceByName()
+{
+    return dhtnet::ip_utils::getAllIpInterfaceByName();
+}
+
+std::vector<std::map<std::string, std::string>>
+getCredentials(const std::string& accountId)
+{
+    if (auto sipaccount = jami::Manager::instance().getAccount<SIPAccount>(accountId))
+        return sipaccount->getCredentials();
+    return {};
+}
+
+void
+setCredentials(const std::string& accountId, const std::vector<std::map<std::string, std::string>>& details)
+{
+    if (auto sipaccount = jami::Manager::instance().getAccount<SIPAccount>(accountId)) {
+        sipaccount->doUnregister();
+        sipaccount->editConfig([&](jami::SipAccountConfig& config) { config.setCredentials(details); });
+        sipaccount->loadConfig();
+        if (sipaccount->isEnabled())
+            sipaccount->doRegister();
+        jami::Manager::instance().saveConfig(sipaccount);
+    }
+}
+
+void
+connectivityChanged()
+{
+    JAMI_WARNING("received connectivity changed - attempting to re-connect enabled accounts");
+
+    // reset the UPnP context
+#if !(defined(TARGET_OS_IOS) && TARGET_OS_IOS)
+    try {
+        jami::Manager::instance().upnpContext()->connectivityChanged();
+    } catch (std::runtime_error& e) {
+        JAMI_ERROR("UPnP context error: {}", e.what());
+    }
+#endif
+
+    for (const auto& account : jami::Manager::instance().getAllAccounts()) {
+        account->connectivityChanged();
+    }
+}
+
+bool
+lookupName(const std::string& account, const std::string& nameserver, const std::string& name)
+{
+    if (account.empty()) {
+        auto cb =
+            [name](const std::string& regName, const std::string& address, jami::NameDirectory::Response response) {
+                jami::emitSignal<libjami::ConfigurationSignal::RegisteredNameFound>("",
+                                                                                    name,
+                                                                                    (int) response,
+                                                                                    address,
+                                                                                    regName);
+            };
+        if (nameserver.empty())
+            jami::NameDirectory::lookupUri(name, "", cb);
+        else
+            jami::NameDirectory::instance(nameserver).lookupName(name, cb);
+        return true;
+    } else if (auto acc = jami::Manager::instance().getAccount<JamiAccount>(account)) {
+        acc->lookupName(name);
+        return true;
+    }
+    JAMI_ERROR("lookupName: Unknown account: {}", account);
+    return false;
+}
+
+bool
+lookupAddress(const std::string& account, const std::string& nameserver, const std::string& address)
+{
+    if (account.empty()) {
+        jami::NameDirectory::instance(nameserver)
+            .lookupAddress(address,
+                           [address](const std::string& regName,
+                                     const std::string& addr,
+                                     jami::NameDirectory::Response response) {
+                               jami::emitSignal<libjami::ConfigurationSignal::RegisteredNameFound>("",
+                                                                                                   address,
+                                                                                                   (int) response,
+                                                                                                   addr,
+                                                                                                   regName);
+                           });
+        return true;
+    } else if (auto acc = jami::Manager::instance().getAccount<JamiAccount>(account)) {
+        acc->lookupAddress(address);
+        return true;
+    }
+    JAMI_ERROR("lookupAddress: Unknown account: {}", account);
+    return false;
+}
+
+bool
+searchUser(const std::string& account, const std::string& query)
+{
+    if (auto acc = jami::Manager::instance().getAccount<JamiAccount>(account)) {
+        return acc->searchUser(query);
+    }
+    return false;
+}
+
+bool
+registerName(const std::string& account, const std::string& name, const std::string& scheme, const std::string& password)
+{
+    if (auto acc = jami::Manager::instance().getAccount<JamiAccount>(account)) {
+        acc->registerName(name, scheme, password);
+        return true;
+    }
+    JAMI_ERROR("registerName: Unknown account: {}", account);
+    return false;
+}
+
+void
+setPushNotificationToken(const std::string& token)
+{
+    for (const auto& account : jami::Manager::instance().getAllAccounts()) {
+        account->setPushNotificationToken(token);
+    }
+}
+
+void
+setPushNotificationTopic(const std::string& topic)
+{
+    for (const auto& account : jami::Manager::instance().getAllAccounts()) {
+        account->setPushNotificationTopic(topic);
+    }
+}
+
+void
+setPushNotificationConfig(const std::map<std::string, std::string>& data)
+{
+    for (const auto& account : jami::Manager::instance().getAllAccounts()) {
+        account->setPushNotificationConfig(data);
+    }
+}
+
+void
+pushNotificationReceived(const std::string& from, const std::map<std::string, std::string>& data)
+{
+    try {
+        auto it = data.find("to");
+        if (it != data.end()) {
+            if (auto account = jami::Manager::instance().getAccount<JamiAccount>(it->second))
+                account->pushNotificationReceived(from, data);
+        }
+#if defined(__ANDROID__) || defined(ANDROID) || defined(__Apple__)
+        else {
+            for (const auto& sipAccount : jami::Manager::instance().getAllAccounts<SIPAccount>()) {
+                sipAccount->pushNotificationReceived(from, data);
+            }
+        }
+#endif
+    } catch (const std::exception& e) {
+        JAMI_ERROR("Error processing push notification: {}", e.what());
+    }
+}
+
+bool
+isAudioMeterActive(const std::string& id)
+{
+    return jami::Manager::instance().getRingBufferPool().isAudioMeterActive(id);
+}
+
+void
+setAudioMeterState(const std::string& id, bool state)
+{
+    jami::Manager::instance().getRingBufferPool().setAudioMeterState(id, state);
+}
+
+void
+setDefaultModerator(const std::string& accountId, const std::string& peerURI, bool state)
+{
+    jami::Manager::instance().setDefaultModerator(accountId, peerURI, state);
+}
+
+std::vector<std::string>
+getDefaultModerators(const std::string& accountId)
+{
+    return jami::Manager::instance().getDefaultModerators(accountId);
+}
+
+void
+enableLocalModerators(const std::string& accountId, bool isModEnabled)
+{
+    jami::Manager::instance().enableLocalModerators(accountId, isModEnabled);
+}
+
+bool
+isLocalModeratorsEnabled(const std::string& accountId)
+{
+    return jami::Manager::instance().isLocalModeratorsEnabled(accountId);
+}
+
+void
+setAllModerators(const std::string& accountId, bool allModerators)
+{
+    jami::Manager::instance().setAllModerators(accountId, allModerators);
+}
+
+bool
+isAllModerators(const std::string& accountId)
+{
+    return jami::Manager::instance().isAllModerators(accountId);
+}
+
+void
+setResourceDirPath(const std::string& resourceDir)
+{
+    jami::fileutils::set_resource_dir_path(resourceDir);
+}
+
+} // namespace libjami

@@ -1,0 +1,5 @@
+{
+  "upstream": "https://github.com/savoirfairelinux/jami-daemon",
+  "baseCommit": "ae7bf02add6a9ad7970231522b997f43320aafd0",
+  "importedTree": "0868a2b30d08feabc9597cf49abdff9859a95d21"
+}

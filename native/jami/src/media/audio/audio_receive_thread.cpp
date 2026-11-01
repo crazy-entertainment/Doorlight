@@ -1,0 +1,164 @@
+/*
+ *  Copyright (C) 2004-2026 Savoir-faire Linux Inc.
+ *
+ *  This program is free software: you can redistribute it and/or modify
+ *  it under the terms of the GNU General Public License as published by
+ *  the Free Software Foundation, either version 3 of the License, or
+ *  (at your option) any later version.
+ *
+ *  This program is distributed in the hope that it will be useful,
+ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ *  GNU General Public License for more details.
+ *
+ *  You should have received a copy of the GNU General Public License
+ *  along with this program. If not, see <https://www.gnu.org/licenses/>.
+ */
+
+#include "audio_receive_thread.h"
+#include "libav_deps.h"
+#include "logger.h"
+#include "manager.h"
+#include "media_decoder.h"
+#include "media_io_handle.h"
+#include "ringbufferpool.h"
+
+#include <memory>
+
+namespace jami {
+
+AudioReceiveThread::AudioReceiveThread(const std::string& streamId,
+                                       const AudioFormat& format,
+                                       const std::string& sdp,
+                                       const uint16_t mtu)
+    : streamId_(streamId)
+    , format_(format)
+    , stream_(sdp)
+    , sdpContext_(new MediaIOHandle(sdp.size(), false, &readFunction, 0, 0, this))
+    , mtu_(mtu)
+    , loop_(std::bind(&AudioReceiveThread::setup, this),
+            std::bind(&AudioReceiveThread::process, this),
+            std::bind(&AudioReceiveThread::cleanup, this))
+{}
+
+AudioReceiveThread::~AudioReceiveThread()
+{
+    loop_.join();
+}
+
+bool
+AudioReceiveThread::setup()
+{
+    std::lock_guard lk(mutex_);
+    audioDecoder_.reset(new MediaDecoder([this](std::shared_ptr<MediaFrame>&& frame) mutable {
+        notify(frame);
+        ringbuffer_->put(std::static_pointer_cast<AudioFrame>(frame));
+    }));
+    audioDecoder_->setContextCallback([this]() {
+        if (recorderCallback_)
+            recorderCallback_(getInfo());
+    });
+    audioDecoder_->setInterruptCallback(interruptCb, this);
+
+    // custom_io so the SDP demuxer will not open any UDP connections
+    args_.input = SDP_FILENAME;
+    args_.format = "sdp";
+    args_.sdp_flags = "custom_io";
+
+    if (stream_.str().empty()) {
+        JAMI_ERROR("No SDP loaded");
+        return false;
+    }
+
+    audioDecoder_->setIOContext(sdpContext_.get());
+    audioDecoder_->setFEC(true);
+    if (audioDecoder_->openInput(args_)) {
+        JAMI_ERROR("Unable to open input \"{}\"", SDP_FILENAME);
+        return false;
+    }
+
+    // Now replace our custom AVIOContext with one that will read packets
+    audioDecoder_->setIOContext(demuxContext_.get());
+    if (audioDecoder_->setupAudio()) {
+        JAMI_ERROR("decoder IO startup failed");
+        return false;
+    }
+
+    ringbuffer_ = Manager::instance().getRingBufferPool().createRingBuffer(streamId_);
+
+    if (onSuccessfulSetup_)
+        onSuccessfulSetup_(MEDIA_AUDIO, 1);
+
+    return true;
+}
+
+void
+AudioReceiveThread::process()
+{
+    audioDecoder_->decode();
+}
+
+void
+AudioReceiveThread::cleanup()
+{
+    std::lock_guard lk(mutex_);
+    audioDecoder_.reset();
+    demuxContext_.reset();
+}
+
+int
+AudioReceiveThread::readFunction(void* opaque, uint8_t* buf, int buf_size)
+{
+    std::istream& is = static_cast<AudioReceiveThread*>(opaque)->stream_;
+    is.read(reinterpret_cast<char*>(buf), buf_size);
+
+    auto count = is.gcount();
+    return count ? static_cast<int>(count) : AVERROR_EOF;
+}
+
+// This callback is used by libav internally to break out of blocking calls
+int
+AudioReceiveThread::interruptCb(void* data)
+{
+    auto* context = static_cast<AudioReceiveThread*>(data);
+    return not context->loop_.isRunning();
+}
+
+void
+AudioReceiveThread::addIOContext(SocketPair& socketPair)
+{
+    demuxContext_.reset(socketPair.createIOContext(mtu_));
+}
+
+void
+AudioReceiveThread::setRecorderCallback(const std::function<void(const MediaStream& ms)>& cb)
+{
+    recorderCallback_ = cb;
+    if (audioDecoder_)
+        audioDecoder_->setContextCallback([this]() {
+            if (recorderCallback_)
+                recorderCallback_(getInfo());
+        });
+}
+
+MediaStream
+AudioReceiveThread::getInfo() const
+{
+    if (!audioDecoder_)
+        return {};
+    return audioDecoder_->getStream("a:remote");
+}
+
+void
+AudioReceiveThread::startReceiver()
+{
+    loop_.start();
+}
+
+void
+AudioReceiveThread::stopReceiver()
+{
+    loop_.stop();
+}
+
+}; // namespace jami

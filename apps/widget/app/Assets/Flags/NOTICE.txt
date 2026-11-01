@@ -1,0 +1,4 @@
+Flag assets: lipis/flag-icons v7.3.2
+Source: https://github.com/lipis/flag-icons/tree/v7.3.2/flags/4x3
+License: MIT, retained in LICENSE.txt
+257 two-letter country/territory SVG assets; packaged locally, no runtime flag requests.

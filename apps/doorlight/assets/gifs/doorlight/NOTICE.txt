@@ -1,0 +1,22 @@
+Doorlight offline GIF starter library
+
+Source symbols: Emotes Pack by Kenney Vleugels (Kenney.nl).
+https://kenney.nl/assets/emotes-pack
+Acquired 2026-09-21. The source pack is dedicated to the public domain under
+CC0 1.0 Universal. Its original notice is preserved in Kenney-License.txt.
+
+Animation, captions and background geometry: Doorlight contributors, 2026.
+These original contributions to the 16 GIF assets are also dedicated under
+CC0 1.0 Universal. The complete legal text is in CC0-1.0.txt. This dedication
+applies only to these animation assets, not the application, its branding or
+other artwork. No endorsement by Kenney or Creative Commons is implied.
+
+Manifest.json records each asset's source, transformations, dimensions,
+duration and SHA-256. Editable source and reproducible generation code are in
+design/gif-starter/ and tools/generate_starter_gifs.py in the source repository.
+The original symbols are cropped, their balloon backgrounds and tails omitted,
+then animated with original captions and backgrounds. Sleep marks are recolored
+for contrast. No Kenney logo, external fonts or third-party characters are used.
+
+CC0 does not grant trademark or patent rights, publicity or privacy rights,
+and does not imply legal clearance for unrelated content or the application.
