@@ -29,14 +29,14 @@ $script:InnoInstallerSha256 = 'a549929319f9120716677c685535ca4671e4b937b5fdc87e2
 $script:InnoInstallerUrl = 'https://github.com/jrsoftware/issrc/releases/download/is-6_7_4/innosetup-6.7.4.exe'
 $script:SourceArchivePathspec = @(
     '.github/workflows/windows-release.yml', 'apps', 'native', 'installer', 'web', 'services', 'global.json',
-    'LICENSE', 'README.md', '.gitignore',
+    'LICENSE', 'README.md', '.gitignore', '.gitattributes',
     'tools/windows-native-inputs.ps1', 'tools/windows-native-inputs-test.ps1',
     'tools/windows-native-sources.ps1', 'tools/windows-native-sources-test.ps1'
 )
 $script:RequiredSourceFiles = @(
     '.github/workflows/windows-release.yml', 'apps/doorlight/pubspec.yaml', 'apps/doorlight/pubspec.lock',
     'apps/doorlight/windows/runner/CMakeLists.txt', 'apps/doorlight/windows/runner/jami_bridge.cpp',
-    'native/jami/CMakeLists.txt', 'global.json', 'installer/global.json', 'installer/build.ps1',
+    'native/jami/CMakeLists.txt', 'global.json', '.gitattributes', 'installer/global.json', 'installer/build.ps1',
     'installer/release/build.ps1', 'installer/release/config.json', 'installer/release/bootstrap.root.json',
     'installer/release/native-provenance.py', 'installer/release/native-notices.py',
     'installer/windows/Doorlight.Setup.csproj', 'web/site/index.html', 'services/wake-relay/package.json',

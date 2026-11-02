@@ -148,6 +148,7 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Could not initialize the source archive fixture.' }
     & git -C $fixtureRepo config user.name 'Fixture Builder'
     & git -C $fixtureRepo config user.email 'fixture@example.invalid'
+    & git -C $fixtureRepo config core.autocrlf true
     $fixturePaths = @(
         '.github/workflows/windows-release.yml', 'apps/doorlight/pubspec.yaml', 'apps/doorlight/pubspec.lock',
         'apps/doorlight/windows/runner/CMakeLists.txt', 'apps/doorlight/windows/runner/jami_bridge.cpp',
@@ -156,13 +157,17 @@ try {
         'installer/release/native-provenance.py', 'installer/release/native-notices.py',
         'installer/windows/Doorlight.Setup.csproj', 'web/site/index.html', 'services/wake-relay/package.json',
         'tools/windows-native-inputs.ps1', 'tools/windows-native-inputs-test.ps1',
-        'tools/windows-native-sources.ps1', 'tools/windows-native-sources-test.ps1', 'global.json', 'LICENSE', 'README.md', '.gitignore'
+        'tools/windows-native-sources.ps1', 'tools/windows-native-sources-test.ps1', 'global.json', 'LICENSE', 'README.md', '.gitignore', '.gitattributes',
+        'installer/trust/main.go'
     )
     foreach ($relative in $fixturePaths) {
         $path = Join-Path $fixtureRepo $relative
         New-Item -ItemType Directory -Path (Split-Path -Parent $path) -Force | Out-Null
         [IO.File]::WriteAllText($path,"fixture:$relative",[Text.UTF8Encoding]::new($false))
     }
+    Copy-Item -LiteralPath (Join-Path $repo '.gitattributes') -Destination (Join-Path $fixtureRepo '.gitattributes')
+    $goFixture = "package main`n`nfunc main() {}`n"
+    [IO.File]::WriteAllText((Join-Path $fixtureRepo 'installer/trust/main.go'),$goFixture,[Text.UTF8Encoding]::new($false))
     $privateFixturePaths = @('docs/private-notes.md','design/private-assets.txt','sybl/legacy.dart',
         'widget/legacy.cs','patches/private.patch','tools/old-private-tool.ps1')
     foreach ($relative in $privateFixturePaths) {
@@ -188,6 +193,13 @@ try {
     }
     foreach ($relative in $privateFixturePaths) {
         if ($archivePaths -contains $relative) { throw "Source archive included private historical path: $relative" }
+    }
+    $extractedSource = Join-Path $scratch 'extracted-source'
+    New-Item -ItemType Directory -Path $extractedSource | Out-Null
+    & tar.exe -xf $fixtureArchive -C $extractedSource installer/trust/main.go
+    if ($LASTEXITCODE -ne 0) { throw 'Could not extract verifier source fixture.' }
+    if ([IO.File]::ReadAllText((Join-Path $extractedSource 'installer/trust/main.go')) -cne $goFixture) {
+        throw 'Windows source archive changed hash-pinned Go source bytes.'
     }
     & git -C $fixtureRepo rm --quiet native/jami/CMakeLists.txt
     & git -C $fixtureRepo commit --quiet -m 'remove required source'

@@ -4,3 +4,5 @@ apps/doorlight/assets/sounds/NOTICE-*.txt -text -whitespace
 apps/doorlight/assets/gifs/doorlight/Kenney-License.txt -text -whitespace
 apps/doorlight/assets/gifs/doorlight/manifest.json text eol=lf
 native/jami/** -text -whitespace
+# Keep the hash-pinned Go verifier identical across Windows checkouts/archives.
+installer/trust/** text eol=lf

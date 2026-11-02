@@ -10,6 +10,7 @@ on:
       - 'tools/windows-native-*.ps1'
       - '.github/workflows/windows-release.yml'
       - 'global.json'
+      - '.gitattributes'
       - 'LICENSE'
   workflow_dispatch:
   schedule:
