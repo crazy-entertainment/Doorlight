@@ -1,0 +1,48 @@
+name: Windows diagnostics
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  win32:
+    runs-on: windows-2022
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Record synthetic test environment
+        shell: pwsh
+        run: |
+          Get-CimInstance Win32_OperatingSystem | Select-Object Caption, Version
+          Write-Host "TEMP=$env:TEMP"
+          Write-Host "TMP=$env:TMP"
+      - name: Build focused native diagnostics
+        shell: pwsh
+        run: |
+          cmake -S tools/windows-release-diagnostics -B "$env:RUNNER_TEMP/doorlight-win32-diagnostics" -A x64
+          if ($LASTEXITCODE -ne 0) { throw 'Diagnostic configuration failed.' }
+          cmake --build "$env:RUNNER_TEMP/doorlight-win32-diagnostics" --config Release
+          if ($LASTEXITCODE -ne 0) { throw 'Diagnostic build failed.' }
+      - name: Probe protected synthetic windows
+        shell: pwsh
+        run: |
+          & "$env:RUNNER_TEMP/doorlight-win32-diagnostics/Release/affinity_probe.exe"
+          if ($LASTEXITCODE -ne 0) { throw 'Diagnostic probe failed.' }
+      - name: Run unchanged native test assertions
+        if: success() || failure()
+        shell: pwsh
+        run: |
+          ctest --test-dir "$env:RUNNER_TEMP/doorlight-win32-diagnostics" -C Release --output-on-failure --no-tests=error
+          if ($LASTEXITCODE -ne 0) { throw 'Focused native tests failed.' }
+      - name: Preserve native test diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: windows-native-diagnostics-${{ github.run_id }}
+          path: ${{ runner.temp }}/doorlight-win32-diagnostics/Testing/Temporary/
+          if-no-files-found: ignore
+          retention-days: 14
