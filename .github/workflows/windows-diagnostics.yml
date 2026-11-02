@@ -32,6 +32,16 @@ jobs:
         run: |
           & "$env:RUNNER_TEMP/doorlight-win32-diagnostics/Release/affinity_probe.exe"
           if ($LASTEXITCODE -ne 0) { throw 'Diagnostic probe failed.' }
+      - name: Verify capture of synthetic presentation pixels
+        if: success() || failure()
+        shell: pwsh
+        run: |
+          $probeLog = @(& "$env:RUNNER_TEMP/doorlight-win32-diagnostics/Release/affinity_capture_probe.exe" 2>&1)
+          $probeExit = $LASTEXITCODE
+          $probeLog | ForEach-Object { Write-Host $_ }
+          if ($probeExit -ne 0 -or -not ($probeLog -ccontains 'capture_probe_completed ok=1')) {
+            throw 'Synthetic presentation capture checks did not complete successfully.'
+          }
       - name: Run unchanged native test assertions
         if: success() || failure()
         shell: pwsh

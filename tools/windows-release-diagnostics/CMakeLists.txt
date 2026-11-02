@@ -19,7 +19,11 @@ add_executable(affinity_probe affinity_probe.cpp "${runner}/window_dismiss.cpp")
 target_include_directories(affinity_probe PRIVATE "${runner}")
 target_link_libraries(affinity_probe PRIVATE gdi32 user32 dwmapi ole32 oleaut32 uiautomationcore)
 
-foreach(target picked_file_staging_test window_dismiss_test affinity_probe)
+add_executable(affinity_capture_probe affinity_capture_probe.cpp "${runner}/window_dismiss.cpp")
+target_include_directories(affinity_capture_probe PRIVATE "${runner}")
+target_link_libraries(affinity_capture_probe PRIVATE gdi32 user32 dwmapi ole32 oleaut32 uiautomationcore)
+
+foreach(target picked_file_staging_test window_dismiss_test affinity_probe affinity_capture_probe)
   target_compile_features(${target} PRIVATE cxx_std_17)
   target_compile_definitions(${target} PRIVATE NOMINMAX UNICODE _UNICODE)
 endforeach()
