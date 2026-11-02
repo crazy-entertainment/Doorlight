@@ -262,7 +262,7 @@ Future<AppState> _fixtureState({
         size: 4281958,
         outgoing: false,
         downloaded: true,
-        timestamp: 1774656000,
+        timestamp: DateTime(2026, 3, 28, 1).millisecondsSinceEpoch ~/ 1000,
       ),
       FolderFile(
         peerId: _mara,
@@ -273,7 +273,7 @@ Future<AppState> _fixtureState({
         size: 973112,
         outgoing: true,
         downloaded: true,
-        timestamp: 1774656060,
+        timestamp: DateTime(2026, 3, 28, 1, 1).millisecondsSinceEpoch ~/ 1000,
       ),
     ],
   );

@@ -87,7 +87,8 @@ void main() {
           versionId: 'message',
           authorId: 'friend',
           direction: TimelineDirection.incoming,
-          createdAt: DateTime.utc(2026, 9, 21),
+          // Keep the displayed wall time independent of the runner timezone.
+          createdAt: DateTime(2026, 9, 21, 2),
           fileId: 'gif-file',
           displayName: 'Hello.gif',
           totalBytes: stage!.encodedBytes,
