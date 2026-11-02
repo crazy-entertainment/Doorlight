@@ -437,10 +437,18 @@ $feed = [ordered]@{
 }
 [IO.File]::WriteAllText($feedConfig,($feed | ConvertTo-Json -Depth 4),[Text.UTF8Encoding]::new($false))
 $packageOutput = Join-Path $work 'installer-output'
-$packageArgs = @('-BundleDir',$bundle,'-Version',$version,'-OutputDir',$packageOutput,
-    '-TrustVerifier',(Join-Path $trustOutput 'DoorlightTrust.exe'),'-TrustNoticesDirectory',$noticeRoot,
-    '-DeltaToolsConfig',(Join-Path $deltaRoot 'tools.json'),'-FeedConfig',$feedConfig,'-TrustRoot',$trustedRoot,
-    '-InnoCompiler',$inno,'-VsDevCmd',(& (Join-Path $repo 'installer/windows-toolchain.ps1')))
+$packageArgs = @{
+    BundleDir = $bundle
+    Version = $version
+    OutputDir = $packageOutput
+    TrustVerifier = (Join-Path $trustOutput 'DoorlightTrust.exe')
+    TrustNoticesDirectory = $noticeRoot
+    DeltaToolsConfig = (Join-Path $deltaRoot 'tools.json')
+    FeedConfig = $feedConfig
+    TrustRoot = $trustedRoot
+    InnoCompiler = $inno
+    VsDevCmd = (& (Join-Path $repo 'installer/windows-toolchain.ps1'))
+}
 & (Join-Path $repo 'installer/build.ps1') @packageArgs
 if (-not $?) { throw 'Installer and release package build failed.' }
 

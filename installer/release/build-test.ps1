@@ -13,7 +13,7 @@ if ($sdkPin.sdk.version -cne '10.0.401' -or $sdkPin.sdk.rollForward -cne 'disabl
 $workflow = Join-Path $repo '.github/workflows/windows-release.yml'
 $tokens = $null
 $parseErrors = $null
-[void][Management.Automation.Language.Parser]::ParseFile($build,[ref]$tokens,[ref]$parseErrors)
+$buildAst = [Management.Automation.Language.Parser]::ParseFile($build,[ref]$tokens,[ref]$parseErrors)
 if ($parseErrors.Count) { throw "build.ps1 PowerShell parse failed: $($parseErrors[0].Message)" }
 
 $text = Get-Content -LiteralPath $workflow -Raw
@@ -54,6 +54,56 @@ $scratch = Join-Path (Join-Path $repo 'local/tmp') ('release-build-test-' + [Gui
 New-Item -ItemType Directory -Force -Path (Split-Path -Parent $scratch) | Out-Null
 New-Item -ItemType Directory -Path $scratch | Out-Null
 try {
+    # Exercise the actual packaging call against the real parameter contract,
+    # without downloading tools or compiling an installer.
+    $packageAssignment = @($buildAst.FindAll({ param($node)
+        $node -is [Management.Automation.Language.AssignmentStatementAst] -and
+        $node.Left -is [Management.Automation.Language.VariableExpressionAst] -and
+        $node.Left.VariablePath.UserPath -ceq 'packageArgs'
+    }, $true))
+    $packageCall = @($buildAst.FindAll({ param($node)
+        $node -is [Management.Automation.Language.CommandAst] -and
+        $node.Extent.Text.Contains("'installer/build.ps1'") -and
+        $node.Extent.Text.Contains('@packageArgs')
+    }, $true))
+    if ($packageAssignment.Count -ne 1 -or $packageCall.Count -ne 1) { throw 'Expected one production installer invocation.' }
+    $packagerAst = [Management.Automation.Language.Parser]::ParseFile((Join-Path $repo 'installer/build.ps1'),[ref]$tokens,[ref]$parseErrors)
+    if ($parseErrors.Count) { throw 'Installer parameter contract did not parse.' }
+    $packageFixture = Join-Path $scratch 'packaging fixture with spaces'
+    New-Item -ItemType Directory -Path (Join-Path $packageFixture 'installer') -Force | Out-Null
+    $stubBody = $packagerAst.ParamBlock.Extent.Text + @'
+
+[pscustomobject]@{ Bound=$PSBoundParameters; Unbound=@($args); Fixture=[bool]$FixtureBuild }
+'@
+    [IO.File]::WriteAllText((Join-Path $packageFixture 'installer/build.ps1'),$stubBody,[Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText((Join-Path $packageFixture 'installer/windows-toolchain.ps1'),"Join-Path `$PSScriptRoot 'fake VS/vcvars.bat'",[Text.UTF8Encoding]::new($false))
+    & {
+        param($fixtureRepo,$assignment,$invocation)
+        $repo = $fixtureRepo
+        $bundle = Join-Path $repo 'bundle with spaces'
+        $version = '1.42.3'
+        $packageOutput = Join-Path $repo 'installer output'
+        $trustOutput = Join-Path $repo 'trust output'
+        $noticeRoot = Join-Path $repo 'trust notices'
+        $deltaRoot = Join-Path $repo 'delta tools'
+        $feedConfig = Join-Path $repo 'feed config.json'
+        $trustedRoot = Join-Path $repo 'bootstrap.root.json'
+        $inno = Join-Path $repo 'Inno Setup/ISCC.exe'
+        $expected = @{
+            BundleDir=$bundle; Version=$version; OutputDir=$packageOutput
+            TrustVerifier=(Join-Path $trustOutput 'DoorlightTrust.exe'); TrustNoticesDirectory=$noticeRoot
+            DeltaToolsConfig=(Join-Path $deltaRoot 'tools.json'); FeedConfig=$feedConfig; TrustRoot=$trustedRoot
+            InnoCompiler=$inno; VsDevCmd=(Join-Path $repo 'installer/fake VS/vcvars.bat')
+        }
+        $bound = & ([scriptblock]::Create($assignment + "`n" + $invocation))
+        if ($bound.Fixture -or $bound.Unbound.Count -ne 0 -or $bound.Bound.Count -ne $expected.Count) {
+            throw 'Production packaging arguments were missing, positional, unexpected or fixture-enabled.'
+        }
+        foreach ($name in $expected.Keys) {
+            if ([string]$bound.Bound[$name] -cne [string]$expected[$name]) { throw "Installer argument was not bound correctly: $name" }
+        }
+    } $packageFixture $packageAssignment[0].Extent.Text $packageCall[0].Extent.Text
+
     $validConfig = Join-Path $scratch 'valid.json'
     $native = [ordered]@{
         daemonSourceTree=('d' * 40)
