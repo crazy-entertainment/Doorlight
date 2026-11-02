@@ -9,6 +9,7 @@ on:
       - 'installer/**'
       - 'tools/windows-native-*.ps1'
       - '.github/workflows/windows-release.yml'
+      - 'global.json'
       - 'LICENSE'
   workflow_dispatch:
   schedule:
@@ -39,7 +40,7 @@ jobs:
       - name: Set up .NET SDK
         uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5
         with:
-          global-json-file: installer/global.json
+          global-json-file: global.json
       - name: Set up Go
         uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:

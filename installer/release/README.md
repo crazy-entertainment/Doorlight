@@ -29,7 +29,8 @@ stable `Doorlight-Setup.exe` download (byte-identical to that version's offline
 installer), the full ZIP update, its manifest, the application source archive
 and the build receipt. The source archive uses a strict allowlist for the
 Windows build surface: `.github/workflows/windows-release.yml`, `apps/`,
-`native/`, `installer/`, `web/`, `services/`, `LICENSE`, `README.md`,
+`native/`, `installer/`, `web/`, `services/`, root `global.json` SDK pin,
+`LICENSE`, `README.md`,
 `.gitignore`, and the four `tools/windows-native-{inputs,sources}*.ps1` scripts.
 It excludes historical private roots such as `docs/`, `design/`, `sybl/`,
 `widget/`, `patches/`, and unrelated legacy tools. Required app, daemon,

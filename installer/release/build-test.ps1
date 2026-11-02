@@ -3,6 +3,13 @@ Set-StrictMode -Version Latest
 
 $repo = (Resolve-Path (Join-Path $PSScriptRoot '../..')).Path
 $build = Join-Path $PSScriptRoot 'build.ps1'
+$rootSdk = Join-Path $repo 'global.json'
+$installerSdk = Join-Path $repo 'installer/global.json'
+$rootSdkHash = (Get-FileHash -LiteralPath $rootSdk -Algorithm SHA256).Hash
+$installerSdkHash = (Get-FileHash -LiteralPath $installerSdk -Algorithm SHA256).Hash
+if ($rootSdkHash -cne $installerSdkHash) { throw 'Root and installer .NET SDK pins must be byte-identical.' }
+$sdkPin = Get-Content -LiteralPath $rootSdk -Raw | ConvertFrom-Json
+if ($sdkPin.sdk.version -cne '10.0.401' -or $sdkPin.sdk.rollForward -cne 'disable') { throw 'Root SDK pin must remain locked to .NET 10.0.401.' }
 $workflow = Join-Path $repo '.github/workflows/windows-release.yml'
 $tokens = $null
 $parseErrors = $null
@@ -39,7 +46,7 @@ if (-not $buildText.Contains("--build-number '0'")) { throw 'Flutter Windows bui
 foreach ($required in @('release-bundle','Copy-ReleaseBundle','Test-InnoCompiler','InnoVersion','/CURRENTUSER','/NOICONS','-WindowStyle Hidden')) {
     if (-not $buildText.Contains($required)) { throw "Build helper is missing the packaging safety check: $required" }
 }
-foreach ($required in @('SourceArchivePathspec','RequiredSourceFiles','Export-ReleaseSourceArchive','Copy-OfflineInstallerAlias','--format=tar.gz','Doorlight-Setup.exe')) {
+foreach ($required in @('SourceArchivePathspec','RequiredSourceFiles','Export-ReleaseSourceArchive','Copy-OfflineInstallerAlias','--format=tar.gz','Doorlight-Setup.exe','global.json')) {
     if (-not $buildText.Contains($required)) { throw "Build helper is missing source archive or stable installer policy: $required" }
 }
 
@@ -99,7 +106,7 @@ try {
         'installer/release/native-provenance.py', 'installer/release/native-notices.py',
         'installer/windows/Doorlight.Setup.csproj', 'web/site/index.html', 'services/wake-relay/package.json',
         'tools/windows-native-inputs.ps1', 'tools/windows-native-inputs-test.ps1',
-        'tools/windows-native-sources.ps1', 'tools/windows-native-sources-test.ps1', 'LICENSE', 'README.md', '.gitignore'
+        'tools/windows-native-sources.ps1', 'tools/windows-native-sources-test.ps1', 'global.json', 'LICENSE', 'README.md', '.gitignore'
     )
     foreach ($relative in $fixturePaths) {
         $path = Join-Path $fixtureRepo $relative
