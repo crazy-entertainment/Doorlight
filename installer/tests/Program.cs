@@ -185,6 +185,84 @@ try
         Bundle(parent, "current", "1.0.0", "old");
         System.IO.File.WriteAllText(Path.Combine(parent, "DoorlightUpdater.exe"), "helper-old");
     }
+    if (OperatingSystem.IsWindows())
+    {
+        foreach (var blockStage in new[] { false, true })
+        {
+            var directory = CaseRoot();
+            Old(directory);
+            var stage = Stage(directory);
+            var locked = blockStage ? stage : Path.Combine(directory, "current");
+            using var held = DirectorySharingFixture.Hold(locked);
+            try { Directory.Move(locked, locked + "-negative-control"); throw new Exception("Directory fixture did not block rename"); }
+            catch (IOException error) when (error.HResult == unchecked((int)0x80070020)) { checks++; }
+            using var blocked = new ManualResetEventSlim();
+            var release = Task.Run(() => { blocked.Wait(TimeSpan.FromSeconds(10)); held.Dispose(); });
+            var points = new List<string>();
+            InstallTransaction transaction;
+            try
+            {
+                transaction = BundleInstall.Apply(directory, stage, "1.2.3", checkpoint: point => {
+                    points.Add(point);
+                    if (point == (blockStage ? "candidate-rename-blocked" : "old-rename-blocked")) blocked.Set();
+                });
+            }
+            finally { blocked.Set(); await release; }
+            Check(points.Count(p => p == "journal") == 1, "Sharing retry restarted the transaction");
+            Check(points.Count(p => p.EndsWith("-blocked", StringComparison.Ordinal)) == 1, "Actual sharing retry was not observed");
+            Check(points.Count(p => p == "old-renamed") == 1 && points.Count(p => p == "candidate-promoted") == 1,
+                "Sharing retry promoted a bundle more than once");
+            BundleInstall.Accept(directory, transaction.Id);
+            Check(PackageStage.ReadVersion(Path.Combine(directory, "current")) == "1.2.3", "Sharing retry did not install candidate");
+            Check(!System.IO.File.Exists(Path.Combine(directory, "install-pending.json")), "Sharing retry left a pending journal");
+        }
+        foreach (var blockStage in new[] { false, true })
+        {
+            var directory = CaseRoot();
+            Old(directory);
+            var stage = Stage(directory);
+            using (var held = DirectorySharingFixture.Hold(blockStage ? stage : Path.Combine(directory, "current")))
+            {
+                var timer = System.Diagnostics.Stopwatch.StartNew();
+                try { BundleInstall.Apply(directory, stage, "1.2.3"); throw new Exception("Permanent sharing lock was ignored"); }
+                catch (IOException error) when (error.HResult == unchecked((int)0x80070020))
+                {
+                    Check(timer.Elapsed >= TimeSpan.FromSeconds(4) && timer.Elapsed < TimeSpan.FromSeconds(30), "Sharing retry was not bounded");
+                    Check(error.Data["BundleMove"] as string == (blockStage ? "candidate-rename-blocked" : "old-rename-blocked"), "Sharing failure lost its operation");
+                }
+                Check(System.IO.File.Exists(Path.Combine(directory, "install-pending.json")) && Directory.Exists(stage), "Blocked move discarded recovery evidence");
+            }
+            var recovered = BundleInstall.Recover(directory);
+            Check(recovered is not null && recovered.Rejected == blockStage, "Blocked move recovery has wrong rejection state");
+            Check(PackageStage.ReadVersion(Path.Combine(directory, "current")) == "1.0.0", "Blocked move did not restore predecessor");
+            Check(System.IO.File.ReadAllText(Path.Combine(directory, "DoorlightUpdater.exe")) == "helper-old", "Blocked move lost predecessor helper");
+            Check(!System.IO.File.Exists(Path.Combine(directory, "install-pending.json")), "Blocked move recovery left its journal");
+        }
+        foreach (var blockPrevious in new[] { false, true })
+        {
+            var directory = CaseRoot();
+            Old(directory);
+            var stage = Stage(directory);
+            var transaction = BundleInstall.Apply(directory, stage, "1.2.3");
+            using var held = DirectorySharingFixture.Hold(Path.Combine(directory, blockPrevious ? transaction.Previous! : "current"));
+            using var blocked = new ManualResetEventSlim();
+            var release = Task.Run(() => { blocked.Wait(TimeSpan.FromSeconds(10)); held.Dispose(); });
+            var points = new List<string>();
+            InstallRecovery? recovered;
+            try
+            {
+                recovered = BundleInstall.Recover(directory, point => {
+                    points.Add(point);
+                    if (point == (blockPrevious ? "previous-restore-blocked" : "candidate-preserve-blocked")) blocked.Set();
+                });
+            }
+            finally { blocked.Set(); await release; }
+            Check(points.Count(p => p.EndsWith("-blocked", StringComparison.Ordinal)) == 1, "Actual recovery sharing retry was not observed");
+            Check(points.Count(p => p == "rollback-journal") == 1 && points.Count(p => p == "previous-restored") == 1, "Recovery sharing retry restarted recovery");
+            Check(recovered?.Rejected == true && PackageStage.ReadVersion(Path.Combine(directory, "current")) == "1.0.0", "Recovery sharing retry lost predecessor");
+            Check(Directory.Exists(stage) && !System.IO.File.Exists(Path.Combine(directory, "install-pending.json")), "Recovery sharing retry lost evidence or journal completion");
+        }
+    }
     foreach (var phase in new[] { "journal", "old-renamed", "candidate-promoted", "helper-replaced" })
     {
         foreach (var initial in new[] { false, true })

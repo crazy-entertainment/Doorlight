@@ -47,9 +47,9 @@ public static class BundleInstall
         if (journal.HadHelper) CopyDurable(helper, Owned(root, BackupName(journal)));
         WriteJournal(root, journal);
         checkpoint?.Invoke("journal");
-        if (journal.Previous is not null) Directory.Move(current, Owned(root, journal.Previous));
+        if (journal.Previous is not null) MoveBundle(current, Owned(root, journal.Previous), "old-rename-blocked", checkpoint);
         checkpoint?.Invoke("old-renamed");
-        Directory.Move(stage, current);
+        MoveBundle(stage, current, "candidate-rename-blocked", checkpoint);
         checkpoint?.Invoke("candidate-promoted");
         ReplaceHelper(root, Path.Combine(current, "_setup", HelperName), journal);
         checkpoint?.Invoke("helper-replaced");
@@ -113,10 +113,10 @@ public static class BundleInstall
                 if (Directory.Exists(current))
                 {
                     if (Directory.Exists(stage)) throw new IOException("Recovery found conflicting candidate directories.");
-                    Directory.Move(current, stage);
+                    MoveBundle(current, stage, "candidate-preserve-blocked", checkpoint);
                     checkpoint?.Invoke("candidate-preserved");
                 }
-                Directory.Move(previous, current);
+                MoveBundle(previous, current, "previous-restore-blocked", checkpoint);
                 checkpoint?.Invoke("previous-restored");
             }
             else if (!Directory.Exists(current) || !Directory.Exists(stage))
@@ -125,7 +125,7 @@ public static class BundleInstall
         else if (Directory.Exists(current))
         {
             if (Directory.Exists(stage)) throw new IOException("Recovery found conflicting initial-install directories.");
-            Directory.Move(current, stage);
+            MoveBundle(current, stage, "candidate-preserve-blocked", checkpoint);
             checkpoint?.Invoke("candidate-preserved");
         }
         if (journal.HadHelper)
@@ -177,9 +177,9 @@ public static class BundleInstall
             if (Directory.Exists(current))
             {
                 if (Directory.Exists(stage)) throw new IOException("Legacy recovery found conflicting candidates.");
-                Directory.Move(current, stage);
+                MoveBundle(current, stage, "legacy-candidate-preserve-blocked");
             }
-            Directory.Move(previous, current);
+            MoveBundle(previous, current, "legacy-previous-restore-blocked");
         }
         else if (!Directory.Exists(current) || !Directory.Exists(stage))
             throw new IOException("Legacy recovery cannot identify the previous bundle. Run the installer again.");
@@ -197,6 +197,28 @@ public static class BundleInstall
             throw new InvalidDataException("Invalid installation recovery record.");
         ValidateVersion(journal.Version);
         return journal;
+    }
+
+    private static void MoveBundle(string source, string destination, string operation,
+        Action<string>? checkpoint = null)
+    {
+        var elapsed = System.Diagnostics.Stopwatch.StartNew();
+        var notified = false;
+        while (true)
+        {
+            PackageStage.RejectLinkedAncestors(source);
+            PackageStage.RejectLinkedAncestors(destination);
+            try { Directory.Move(source, destination); return; }
+            catch (IOException error)
+            {
+                error.Data["BundleMove"] = operation;
+                // A short-lived Windows directory handle can outlive app exit.
+                // Retry this rename only; the durable transaction stays unchanged.
+                if (error.HResult != unchecked((int)0x80070020) || elapsed.Elapsed >= TimeSpan.FromSeconds(5)) throw;
+                if (!notified) { notified = true; checkpoint?.Invoke(operation); }
+                Thread.Sleep(100);
+            }
+        }
     }
 
     private static void ReplaceHelper(string root, string source, Journal journal)

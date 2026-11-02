@@ -133,7 +133,7 @@ internal sealed class SetupSession
     }
 }
 
-internal sealed record SetupFailure(string Type, string Details);
+internal sealed record SetupFailure(string Type, string Details, int HResult, string? Operation);
 internal sealed record EngineWorker(int Schema, int Pid);
 
 [JsonSourceGenerationOptions(PropertyNamingPolicy = JsonKnownNamingPolicy.CamelCase, PropertyNameCaseInsensitive = true)]

@@ -128,7 +128,8 @@ internal sealed class SetupWindow : DoorlightWindow
         {
             try {
                 var details = exception.ToString();
-                session.Write("failure.json", new SetupFailure(exception.GetType().Name, details[..Math.Min(details.Length, 16384)]), WindowsJsonContext.Default.SetupFailure);
+                session.Write("failure.json", new SetupFailure(exception.GetType().Name, details[..Math.Min(details.Length, 16384)],
+                    exception.HResult, exception.Data["BundleMove"] as string), WindowsJsonContext.Default.SetupFailure);
             }
             catch (Exception diagnostic) when (diagnostic is IOException or UnauthorizedAccessException) { /* Recovery must remain available if diagnostics cannot be saved. */ }
             if (options.Install) TryEngineCommand("cancel");
@@ -139,7 +140,7 @@ internal sealed class SetupWindow : DoorlightWindow
                 {
                     using (InstalledApp.Lock(InstalledApp.Root, "setup.lock"))
                     using (InstalledApp.Lock(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Syb-L"), "instance.lock"))
-                        BundleInstall.Recover(InstalledApp.Root);
+                        await Task.Run(() => BundleInstall.Recover(InstalledApp.Root));
                     using var restored = InstalledApp.Start();
                     appRestored = true;
                 }
@@ -210,7 +211,7 @@ internal sealed class SetupWindow : DoorlightWindow
             {
                 using (InstalledApp.Lock(InstalledApp.Root, "setup.lock"))
                 using (InstalledApp.Lock(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Syb-L"), "instance.lock"))
-                    BundleInstall.Recover(InstalledApp.Root);
+                    await Task.Run(() => BundleInstall.Recover(InstalledApp.Root));
             }
             var existing = Path.Combine(InstalledApp.Root, "current");
             var open = false;
@@ -507,8 +508,10 @@ internal sealed class SetupWindow : DoorlightWindow
         Report("applying", "Installing Doorlight…", version);
         using (InstalledApp.Lock(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Syb-L"), "instance.lock"))
         {
-            BundleInstall.Recover(InstalledApp.Root);
-            pending = BundleInstall.Apply(InstalledApp.Root, stage, version, allowRepair);
+            pending = await Task.Run(() => {
+                BundleInstall.Recover(InstalledApp.Root);
+                return BundleInstall.Apply(InstalledApp.Root, stage, version, allowRepair);
+            });
         }
         Report("starting", "Opening Doorlight…", version);
         var readyPath = Path.Combine(session.DirectoryPath, "ready.json");
@@ -549,8 +552,9 @@ internal sealed class SetupWindow : DoorlightWindow
     {
         if (pending is null) return;
         var firstInstall = pending.Previous is null;
+        var transactionId = pending.Id;
         using (InstalledApp.Lock(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Syb-L"), "instance.lock"))
-            BundleInstall.Rollback(InstalledApp.Root, pending.Id);
+            await Task.Run(() => BundleInstall.Rollback(InstalledApp.Root, transactionId));
         pending = null;
         if (firstInstall) { needsInstaller = true; return; }
         using var restored = InstalledApp.Start();
@@ -577,22 +581,31 @@ internal sealed class SetupWindow : DoorlightWindow
 
     private async Task RestoreAndOpen()
     {
-        if (pending is null) return;
+        if (pending is null || running) return;
         if (candidate is not null && !candidate.HasExited) {
             status.Text = "Quit Doorlight from its tray menu, then restore the previous version.";
             return;
         }
+        var transactionId = pending.Id;
+        running = applying = true;
+        action.Enabled = cancel.Enabled = false;
+        visual.Active = true;
         try
         {
             using (InstalledApp.Lock(InstalledApp.Root, "setup.lock"))
             using (InstalledApp.Lock(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Syb-L"), "instance.lock"))
-                BundleInstall.Rollback(InstalledApp.Root, pending.Id);
+                await Task.Run(() => BundleInstall.Rollback(InstalledApp.Root, transactionId));
             pending = null;
             await OpenExisting();
-            Close();
         }
         catch (Exception e) when (e is IOException or InvalidDataException or System.ComponentModel.Win32Exception) {
             status.Text = "Recovery is waiting. Close Doorlight and other installers, then try again.";
+        }
+        finally
+        {
+            running = applying = false;
+            if (!IsDisposed) { action.Enabled = cancel.Enabled = true; visual.Active = false; }
+            if (CloseAfterRun) Close();
         }
     }
 
