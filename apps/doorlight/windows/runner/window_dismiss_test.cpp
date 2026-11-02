@@ -8,21 +8,36 @@
 
 namespace {
 int failures = 0;
+struct FixtureEvent { UINT message; WPARAM wp; LPARAM lp; };
+FixtureEvent preview_events[64]{};
+unsigned preview_event_count = 0;
+bool record_preview = false;
 LRESULT CALLBACK FixtureProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
+  if (record_preview && preview_event_count < 64 &&
+      (message == WM_CLOSE || message == WM_MOVE || message == WM_SIZE ||
+       message == WM_SHOWWINDOW || message == WM_DESTROY || message == WM_SYSCOMMAND))
+    preview_events[preview_event_count++] = {message, wp, lp};
   return DefWindowProcW(hwnd, message, wp, lp);
 }
-DWORD Cloak(HWND window) {
+DWORD Cloak(HWND window, HRESULT* status = nullptr) {
   DWORD cloak = 0xffffffff;
-  DwmGetWindowAttribute(window, DWMWA_CLOAKED, &cloak, sizeof(cloak));
+  const HRESULT result = DwmGetWindowAttribute(window, DWMWA_CLOAKED, &cloak, sizeof(cloak));
+  if (status) *status = result;
   return cloak;
 }
 void Check(bool value, const char* label) {
   if (!value) { std::fprintf(stderr, "%s\n", label); ++failures; }
 }
-RECT Bounds(HWND window) { RECT rect{}; GetWindowRect(window, &rect); return rect; }
-WINDOWPLACEMENT Placement(HWND window) {
+RECT Bounds(HWND window, BOOL* status = nullptr) {
+  RECT rect{};
+  const BOOL result = GetWindowRect(window, &rect);
+  if (status) *status = result;
+  return rect;
+}
+WINDOWPLACEMENT Placement(HWND window, BOOL* status = nullptr) {
   WINDOWPLACEMENT placement{sizeof(placement)};
-  GetWindowPlacement(window, &placement);
+  const BOOL result = GetWindowPlacement(window, &placement);
+  if (status) *status = result;
   return placement;
 }
 void Pump(DWORD duration, const std::function<void()>& observe = {}) {
@@ -37,6 +52,13 @@ void Pump(DWORD duration, const std::function<void()>& observe = {}) {
     }
     Sleep(1);
   } while (GetTickCount64() < end);
+}
+// Wait for lifecycle acknowledgement before changing the fixture's window state.
+bool PumpUntil(const std::function<bool()>& completed, DWORD timeout,
+    const std::function<void()>& observe = {}) {
+  const ULONGLONG end = GetTickCount64() + timeout;
+  while (!completed() && GetTickCount64() < end) Pump(1, observe);
+  return completed();
 }
 }
 
@@ -121,6 +143,14 @@ int main(int argc, char** argv) {
   const RECT original = Bounds(window);
   const auto placement = Placement(window);
   WindowDismissEffect effect;
+  const auto await_completion = [&](const std::function<bool()>& completed,
+      const char* label, const std::function<void()>& observe = {}) {
+    if (PumpUntil(completed, 2000, observe)) return true;
+    Check(false, label);
+    effect.Reset();
+    DestroyWindow(window);
+    return false;
+  };
   const BOOL concealed = TRUE, revealed = FALSE;
   Check(SUCCEEDED(DwmSetWindowAttribute(window, DWMWA_CLOAK, &concealed,
       sizeof(concealed))), "prepare preexisting concealment");
@@ -150,9 +180,8 @@ int main(int argc, char** argv) {
   Check(EqualRect(&original, &during) && EqualRect(&placement.rcNormalPosition,
       &during_placement.rcNormalPosition), "animation never changes real placement");
   bool endpoint_seen = false;
-  const ULONGLONG timeout = GetTickCount64() + 300;
-  while (!completed && GetTickCount64() < timeout) {
-    Pump(1);
+  if (!await_completion([&] { return completed; },
+      "protected minimize completion callback arrives", [&] {
     if (effect.active()) {
       const RECT endpoint = Bounds(overlay);
       if (endpoint.right - endpoint.left == 24 &&
@@ -160,7 +189,7 @@ int main(int argc, char** argv) {
           abs((endpoint.top + endpoint.bottom) / 2 - target.y) <= 1)
         endpoint_seen = true;
     }
-  }
+  })) return EXIT_FAILURE;
   Check(endpoint_seen, "present exact icon endpoint before completing minimize");
   Check(completed && IsIconic(window) && !effect.active(), "timer completes native minimize");
   Check(!(GetWindowLongPtrW(window, GWL_EXSTYLE) & WS_EX_LAYERED), "source style restored after minimize");
@@ -172,9 +201,11 @@ int main(int argc, char** argv) {
   Check(EqualRect(&original, &restored), "taskbar restore retains original bounds");
 
   SetWindowDisplayAffinity(window, WDA_NONE);
+  bool door_completed = false;
   Check(effect.Start(window, width, height, frame, target, DismissStyle::kDoor, [&](bool successful) { Check(successful, "motion completed without rendering failure");
     ShowWindow(window, SW_HIDE);
     effect.Reset();
+    door_completed = true;
   }), "start door exit");
   Pump(60);
   overlay = FindWindowW(L"DoorlightWindowDismiss", nullptr);
@@ -183,7 +214,8 @@ int main(int argc, char** argv) {
   Check(affinity == WDA_NONE, "presentation is stream-visible when source permits capture");
   Check(door_bounds.right - door_bounds.left < width &&
       door_bounds.bottom - door_bounds.top == height, "door narrows around its vertical hinge");
-  Pump(240);
+  if (!await_completion([&] { return door_completed; },
+      "door completion callback arrives")) return EXIT_FAILURE;
   Check(!IsWindowVisible(window) && !effect.active(), "door completes while owner remains hidden");
   GetWindowDisplayAffinity(window, &affinity);
   Check(affinity == WDA_NONE, "source capture preference is unchanged");
@@ -196,7 +228,8 @@ int main(int argc, char** argv) {
     ShowWindow(window, SW_HIDE);
     effect.Reset();
   }), "start warp exit");
-  Pump(300);
+  if (!await_completion([&] { return warp_completions != 0; },
+      "warp completion callback arrives")) return EXIT_FAILURE;
   Check(warp_completions == 1 && !effect.active() && !IsWindowVisible(window),
       "warp completes the intended native action exactly once");
   ShowWindow(window, SW_SHOW);
@@ -247,12 +280,10 @@ int main(int argc, char** argv) {
     Check(grew,
         "incoming grows toward the remembered placement");
     bool live_handoff = false;
-    const auto incoming_deadline = GetTickCount64() + 400;
-    while (!restored_count && GetTickCount64() < incoming_deadline) {
-      Pump(1, [&] {
-        if (effect.active() && Cloak(window) == 0) live_handoff = true;
-      });
-    }
+    if (!await_completion([&] { return restored_count != 0; },
+        "incoming completion callback arrives", [&] {
+      if (effect.active() && Cloak(window) == 0) live_handoff = true;
+    })) return EXIT_FAILURE;
     Check(live_handoff, "incoming blends over live source before retiring proxy");
     Check(restored_count == 1 && IsWindowVisible(window) && !IsIconic(window) &&
         !effect.active() && Cloak(window) == 0,
@@ -293,7 +324,8 @@ int main(int argc, char** argv) {
   const RECT fade_mid = Bounds(overlay);
   Check(effect.active() && !faded && EqualRect(&fade_start, &fade_mid),
       "slow fade retains full geometry and exceeds the old fixed watchdog duration");
-  Pump(500);
+  if (!await_completion([&] { return faded; },
+      "slow fade completion callback arrives")) return EXIT_FAILURE;
   Check(faded && !effect.active() && Cloak(window) == 0, "slow fade completes safely");
   ShowWindow(window, SW_HIDE);
   Check(effect.PrepareRestore(window), "prepare fast fade restore");
@@ -307,24 +339,71 @@ int main(int argc, char** argv) {
   const RECT opening_mid = Bounds(overlay);
   Check(EqualRect(&opening_start, &opening_mid) && !opened,
       "opening fade changes opacity without shrinking or moving");
-  Pump(180);
+  if (!await_completion([&] { return opened; },
+      "opening fade completion callback arrives")) return EXIT_FAILURE;
   Check(opened && !effect.active() && Cloak(window) == 0,
       "fast opening completes independently of slow dismissal");
 
   for (auto style : {DismissStyle::kTray, DismissStyle::kDoor,
                       DismissStyle::kWarp, DismissStyle::kFade, DismissStyle::kFoldRight,
                       DismissStyle::kFoldUp, DismissStyle::kFoldDown}) {
+    record_preview = true;
+    preview_event_count = 0;
+    unsigned preview_callbacks = 0;
+    bool preview_success = false;
     bool preview_completed = false;
-    Check(effect.Start(window, width, height, frame, target, style,
-        [&](bool successful) { Check(successful, "motion completed without rendering failure"); preview_completed = true; effect.Reset(); }, false, 100, true),
-        "start non-destructive outgoing preview");
+    const bool preview_started = effect.Start(window, width, height, frame, target, style,
+        [&](bool successful) { Check(successful, "motion completed without rendering failure");
+          ++preview_callbacks; preview_success = successful; preview_completed = true; effect.Reset();
+        }, false, 100, true);
+    Check(preview_started, "start non-destructive outgoing preview");
+    const auto report_preview = [&](BOOL bounds_ok, const RECT& bounds,
+        HRESULT cloak_status, DWORD cloak, bool active) {
+      RECT current_client{};
+      const BOOL client_ok = GetClientRect(window, &current_client);
+      BOOL placement_ok = FALSE;
+      const auto current_placement = Placement(window, &placement_ok);
+      std::fprintf(stderr, "preview_state style=%d callbacks=%u success=%d completed=%d active=%d stage=%d valid=%d visible=%d iconic=%d cloak_hr=0x%lx cloak=%lu bounds_ok=%d bounds=%ld,%ld,%ld,%ld expected=%ld,%ld,%ld,%ld client_ok=%d client=%ld,%ld placement_ok=%d placement=%u flags=%u events=%u\n",
+          static_cast<int>(style), preview_callbacks, preview_success, preview_completed, active,
+          effect.failure(), IsWindow(window), IsWindowVisible(window), IsIconic(window),
+          static_cast<unsigned long>(cloak_status), cloak, bounds_ok,
+          bounds.left, bounds.top, bounds.right, bounds.bottom,
+          original.left, original.top, original.right, original.bottom,
+          client_ok, current_client.right, current_client.bottom,
+          placement_ok, current_placement.showCmd, current_placement.flags, preview_event_count);
+      for (unsigned i = 0; i < preview_event_count; ++i)
+        std::fprintf(stderr, "preview_event msg=%u wp=%llu lp=%lld\n", preview_events[i].message,
+            static_cast<unsigned long long>(preview_events[i].wp),
+            static_cast<long long>(preview_events[i].lp));
+      std::fflush(stderr);
+    };
+    if (!preview_started) {
+      BOOL bounds_ok = FALSE;
+      const RECT bounds = Bounds(window, &bounds_ok);
+      HRESULT cloak_status = E_FAIL;
+      const DWORD cloak = Cloak(window, &cloak_status);
+      report_preview(bounds_ok, bounds, cloak_status, cloak, effect.active());
+      effect.Reset(); DestroyWindow(window); return EXIT_FAILURE;
+    }
     Pump(130);
     Check(effect.active() && !preview_completed && IsWindowVisible(window) && !IsIconic(window),
         "outgoing preview reverses without hiding or minimizing the source");
-    Pump(200);
-    const RECT after_preview = Bounds(window);
-    Check(preview_completed && !effect.active() && Cloak(window) == 0 &&
-        EqualRect(&original, &after_preview), "preview returns to unchanged live placement");
+    if (!await_completion([&] { return preview_completed; },
+        "preview completion callback arrives")) return EXIT_FAILURE;
+    BOOL bounds_ok = FALSE;
+    const RECT after_preview = Bounds(window, &bounds_ok);
+    const bool active = effect.active();
+    HRESULT cloak_status = E_FAIL;
+    const DWORD cloak = Cloak(window, &cloak_status);
+    const bool preview_restored = preview_completed && !active && bounds_ok &&
+        SUCCEEDED(cloak_status) && cloak == 0 && EqualRect(&original, &after_preview);
+    Check(preview_restored, "preview returns to unchanged live placement");
+    Check(preview_callbacks == 1 && preview_success, "preview completes successfully exactly once");
+    if (!preview_restored) {
+      report_preview(bounds_ok, after_preview, cloak_status, cloak, active);
+      effect.Reset(); DestroyWindow(window); return EXIT_FAILURE;
+    }
+    record_preview = false;
   }
   Check(effect.Start(window, width, height, frame, target, DismissStyle::kFade,
       [](bool) {}, false, 800, true), "start cancellable preview");
@@ -397,25 +476,32 @@ int main(int argc, char** argv) {
         effect.Reset();
       }, false, 100, true), "start preview whose source will disappear");
   DestroyWindow(lost_owner);
-  Pump(100);
+  if (!await_completion([&] { return failure_reported; },
+      "lost source failure callback arrives")) return EXIT_FAILURE;
   Check(failure_reported && !effect.active(), "lost source reports failed preview, never success");
 
+  bool minimize_completed = false;
   ShowWindow(window, SW_SHOWMAXIMIZED);
   GetClientRect(window, &client);
   frame.assign(static_cast<size_t>(client.right) * client.bottom * 4, 255);
   Check(effect.Start(window, client.right, client.bottom, frame, target, DismissStyle::kTray, [&](bool successful) { Check(successful, "motion completed without rendering failure");
     ShowWindow(window, SW_MINIMIZE);
     effect.Reset();
+    minimize_completed = true;
   }), "animate maximized source without changing its layout");
-  Pump(300);
+  if (!await_completion([&] { return minimize_completed; },
+      "maximized minimize completion callback arrives")) return EXIT_FAILURE;
   Check(IsIconic(window), "maximized source minimizes");
   ShowWindow(window, SW_RESTORE);
   Check(IsZoomed(window), "minimized maximized source restores maximized");
+  bool tray_completed = false;
   Check(effect.Start(window, client.right, client.bottom, frame, target, DismissStyle::kDoor, [&](bool successful) { Check(successful, "motion completed without rendering failure");
     ShowWindow(window, SW_HIDE);
     effect.Reset();
+    tray_completed = true;
   }), "close maximized source to tray");
-  Pump(300);
+  if (!await_completion([&] { return tray_completed; },
+      "maximized tray completion callback arrives")) return EXIT_FAILURE;
   ShowWindow(window, SW_SHOW);
   Check(IsZoomed(window), "tray restore retains maximized state");
   effect.Reset();
