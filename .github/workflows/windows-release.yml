@@ -92,7 +92,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $base = Join-Path $env:RUNNER_TEMP ("doorlight-release-{0}-{1}" -f $env:GITHUB_RUN_ID,$env:GITHUB_RUN_ATTEMPT)
+          $base = Join-Path $env:RUNNER_TEMP ("dl-{0}-{1}" -f $env:GITHUB_RUN_ID,$env:GITHUB_RUN_ATTEMPT)
           $tools = Join-Path $base 'tools'
           $candidate = Join-Path $base 'candidate'
           $logs = Join-Path $base 'logs'
@@ -111,7 +111,7 @@ jobs:
         with:
           name: windows-build-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
-            ${{ runner.temp }}/doorlight-release-${{ github.run_id }}-${{ github.run_attempt }}/logs/
+            ${{ runner.temp }}/dl-${{ github.run_id }}-${{ github.run_attempt }}/logs/
             ${{ github.workspace }}/apps/doorlight/test/**/failures/**
           if-no-files-found: ignore
           retention-days: 14
@@ -120,7 +120,7 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: windows-candidate-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/doorlight-release-${{ github.run_id }}-${{ github.run_attempt }}/candidate/
+          path: ${{ runner.temp }}/dl-${{ github.run_id }}-${{ github.run_attempt }}/candidate/
           if-no-files-found: error
           retention-days: 7
 

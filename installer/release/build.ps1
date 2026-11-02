@@ -436,7 +436,7 @@ $feed = [ordered]@{
     packageId='Doorlight'
 }
 [IO.File]::WriteAllText($feedConfig,($feed | ConvertTo-Json -Depth 4),[Text.UTF8Encoding]::new($false))
-$packageOutput = Join-Path $work 'installer-output'
+$packageOutput = Join-Path $toolRootFull 'pkg'
 $packageArgs = @{
     BundleDir = $bundle
     Version = $version
