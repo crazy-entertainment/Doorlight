@@ -1,0 +1,73 @@
+{
+  "schema": 1,
+  "date": "2026-11-02",
+  "scope": "Windows x64 native source reconstruction and application build/test qualification",
+  "nativeInputs": {
+    "daemonSourceTree": "1248cd07a061d551f8b2fc8f62f84f074afd1f84",
+    "archiveUrl": "https://github.com/crazy-entertainment/Doorlight/releases/download/windows-native-1248cd07a061-4ca99786/windows-native-inputs.zip",
+    "archiveSha256": "4ca997867b8abb3f1544802aed1a69f21682f8b72fbe92563b7ed1e53166f2a6",
+    "manifestUrl": "https://github.com/crazy-entertainment/Doorlight/releases/download/windows-native-1248cd07a061-4ca99786/windows-native-inputs.json",
+    "manifestSha256": "3031b201705ee946bc2d92b9822dc12ed4489a3053171657bdda6c3f63f531da",
+    "correspondingSourceUrl": "https://github.com/crazy-entertainment/Doorlight/releases/download/windows-native-1248cd07a061-4ca99786/Doorlight.Native.Source.tar.gz",
+    "correspondingSourceSha256": "7a11b9ebefe15241a7df9e4aab5e1a019dbe81797624df6a6abc8895f52b3321"
+  },
+  "sourceFileCount": 946,
+  "retainedDependencyOriginals": 32,
+  "vendoredGnuTlsGitArchives": 3,
+  "nativeExportFiles": 439,
+  "runtimeDependencyNoticeComponents": 36,
+  "noticeTextFiles": 236,
+  "verification": {
+    "windowsReleaseBuild": true,
+    "nativeCoreAudioGate": true,
+    "windowsCTest": {
+      "passed": 80,
+      "failed": 0,
+      "skipped": 1,
+      "skip": "Real microphone recording requires explicit physical scenario"
+    },
+    "remoteInputStressExecutionsPassed": 200,
+    "correspondingSourceArchiveAllMembersRehashed": true,
+    "freshExportedRootWindowsBuild": true,
+    "maintainedWindowsAppOpened": true,
+    "existingIdentityKeyAndCertificateUnchanged": true
+  },
+  "evidence": [
+    {
+      "name": "contrib-build-offline.log",
+      "sha256": "2202b2badc5b5df54b5c4dae239d67c3380f7aeb462e289506f9a072230dc3b2",
+      "exitCode": 0
+    },
+    {
+      "name": "core-build-offline.log",
+      "sha256": "4868c9d76e56b4835b867577e03b7327783fef7a90a328fcbf9b3f4f3fc13652",
+      "exitCode": 0
+    },
+    {
+      "name": "app-windows-offline-build.log",
+      "sha256": "cf8475967f3e39706c91029212d0667b6abbb1b74d79592887ed7bb8672d5637",
+      "exitCode": 0
+    },
+    {
+      "name": "native-all-build-export-v2.log",
+      "sha256": "3f1daa42ad50e34c936d16a603f6252d1600c56ec74a23860d08cfa2e2d5643e",
+      "exitCode": 0
+    },
+    {
+      "name": "native-full-ctest-export-v2.log",
+      "sha256": "a1f350b16aa6e7b9dc758679f4d2edaec30fd1e77f4b7c0ccc7754fa28ed5c19",
+      "exitCode": 0
+    },
+    {
+      "name": "native-input-stress-export-v2.log",
+      "sha256": "327f637869e528d2bf2d7ac19121ebe6e22f7315b6ecdfe974c8a098d91c4ac1",
+      "exitCode": 0
+    }
+  ],
+  "limits": [
+    "No bitwise reproducibility claim",
+    "No Android or real-peer media acceptance",
+    "No general release or asset-rights clearance asserted",
+    "GitHub-hosted build and installed hosted-feed update are not yet verified"
+  ]
+}

@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <string>
 
 namespace {
@@ -24,13 +25,15 @@ WINDOWPLACEMENT Placement(HWND window) {
   GetWindowPlacement(window, &placement);
   return placement;
 }
-void Pump(DWORD duration) {
+void Pump(DWORD duration, const std::function<void()>& observe = {}) {
   const ULONGLONG end = GetTickCount64() + duration;
   do {
     MSG message{};
     while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
       TranslateMessage(&message);
       DispatchMessageW(&message);
+      if (observe) observe();
+      if (GetTickCount64() >= end) return;
     }
     Sleep(1);
   } while (GetTickCount64() < end);
@@ -233,16 +236,22 @@ int main(int argc, char** argv) {
     const bool vertical = style == DismissStyle::kFoldUp || style == DismissStyle::kFoldDown;
     Check((vertical ? incoming.bottom - incoming.top : incoming.right - incoming.left) <= 24,
         "incoming starts collapsed along its fold axis");
-    Pump(80);
-    const RECT opening = Bounds(overlay);
-    Check(vertical ? opening.bottom - opening.top > incoming.bottom - incoming.top :
-        opening.right - opening.left > incoming.right - incoming.left,
+    bool grew = false;
+    const auto observe_growth = [&] {
+      if (!effect.active()) return;
+      const RECT opening = Bounds(overlay);
+      if (vertical ? opening.bottom - opening.top > incoming.bottom - incoming.top :
+          opening.right - opening.left > incoming.right - incoming.left) grew = true;
+    };
+    Pump(80, observe_growth);
+    Check(grew,
         "incoming grows toward the remembered placement");
     bool live_handoff = false;
     const auto incoming_deadline = GetTickCount64() + 400;
     while (!restored_count && GetTickCount64() < incoming_deadline) {
-      Pump(1);
-      if (effect.active() && Cloak(window) == 0) live_handoff = true;
+      Pump(1, [&] {
+        if (effect.active() && Cloak(window) == 0) live_handoff = true;
+      });
     }
     Check(live_handoff, "incoming blends over live source before retiring proxy");
     Check(restored_count == 1 && IsWindowVisible(window) && !IsIconic(window) &&

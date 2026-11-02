@@ -1021,6 +1021,29 @@ void JamiChannels::HandleMethodCall(
     const flutter::MethodCall<flutter::EncodableValue>& call,
     std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
   const std::string& method = call.method_name();
+  if (method == "prepareUpdateShutdown" || method == "cancelUpdateShutdown" ||
+      method == "commitUpdateShutdown") {
+    std::shared_ptr<flutter::MethodResult<flutter::EncodableValue>> res(std::move(result));
+    auto reply = [this, res](bool accepted) {
+      PostToPlatform([res, accepted] { res->Success(flutter::EncodableValue(accepted)); });
+    };
+    if (method == "prepareUpdateShutdown") {
+      jami_bridge::PrepareUpdateShutdown(ArgString(call, "expectedAccountId", ""), reply);
+    } else if (method == "cancelUpdateShutdown") {
+      jami_bridge::CancelUpdateShutdown(reply);
+    } else {
+      const HWND owner = owner_;
+      jami_bridge::CommitUpdateShutdown([owner] {
+        return owner && ::IsWindow(owner) &&
+            ::PostMessageW(owner, kQuitRequestMessage, 0, 0) != FALSE;
+      }, reply);
+    }
+    return;
+  }
+  if (jami_bridge::UpdateShutdownPending()) {
+    result->Error("update_shutdown_pending", "Doorlight is preparing to restart.");
+    return;
+  }
   if (method == "widgetCompanionStatus") {
     flutter::EncodableMap status;
     for (const auto& entry : {std::pair{"widgetInstalled", sybl::companion::kWidgetFamily},
@@ -2357,6 +2380,9 @@ void JamiChannels::HandleMethodCall(
           ::PostMessageW(owner, WM_SYSCOMMAND, selected, 0);
         result->Success();
       }
+    } else if (command == "quit") {
+      ::PostMessageW(owner_, kQuitRequestMessage, 0, 0);
+      result->Success();
     } else if (command == "close") {
       ::PostMessageW(owner_, WM_CLOSE, 0, 0);
       result->Success();

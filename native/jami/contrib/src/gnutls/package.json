@@ -14,11 +14,15 @@
     ],
     "custom_scripts": {
         "pre_build": [
-            "git init",
-            "git remote add origin https://github.com/ShiftMediaProject/gnutls.git || exit /b 0",
-            "git fetch origin --depth=1 --tags && git reset --hard 3.8.3",
-            "git apply --whitespace=fix ../../src/gnutls/0001-fix-mkdir-permissions-on-Windows.patch",
-            "git submodule update --init --recursive --depth=1 gnulib devel/libtasn1"
+            "if not exist \"gnulib\" mkdir \"gnulib\"",
+            "if not exist \"devel\\libtasn1\\gnulib\" mkdir \"devel\\libtasn1\\gnulib\"",
+            "\"%SystemRoot%\\System32\\tar.exe\" -xf \"%CONTRIB_SRC_DIR%\\gnutls\\source\\gnulib-3639c57a.tar.gz\" -C \"gnulib\"",
+            "\"%SystemRoot%\\System32\\tar.exe\" -xf \"%CONTRIB_SRC_DIR%\\gnutls\\source\\libtasn1-2b7ee166.tar.gz\" -C \"devel\\libtasn1\" --exclude=README",
+            "copy /b /y \"devel\\libtasn1\\README.md\" \"devel\\libtasn1\\README\"",
+            "\"%SystemRoot%\\System32\\tar.exe\" -xf \"%CONTRIB_SRC_DIR%\\gnutls\\source\\gnulib-aa52cadc.tar.gz\" -C \"devel\\libtasn1\\gnulib\" --exclude=etc/license-notices/GPL --exclude=etc/license-notices/LGPL",
+            "copy /b /y \"devel\\libtasn1\\gnulib\\etc\\license-notices\\GPLv3+\" \"devel\\libtasn1\\gnulib\\etc\\license-notices\\GPL\"",
+            "copy /b /y \"devel\\libtasn1\\gnulib\\etc\\license-notices\\LGPLv3+\" \"devel\\libtasn1\\gnulib\\etc\\license-notices\\LGPL\"",
+            "git apply --whitespace=fix ../../src/gnutls/0001-fix-mkdir-permissions-on-Windows.patch"
         ]
     }
 }

@@ -1,0 +1,19 @@
+{
+  "project": "expected-lite",
+  "version": "0.10.0",
+  "commit": "3583e95bad46f5af7d8a826632bc68a6f7281551",
+  "license": "BSL-1.0",
+  "files": [
+    {
+      "path": "expected.hpp",
+      "url": "https://raw.githubusercontent.com/martinmoene/expected-lite/3583e95bad46f5af7d8a826632bc68a6f7281551/include/nonstd/expected.hpp",
+      "sha256": "ad67f55ce3f85b4c3cfaba5b1cea9d5db4f215e9f62f3e8ca261099a364cd8bf"
+    },
+    {
+      "path": "LICENSE.txt",
+      "url": "https://raw.githubusercontent.com/martinmoene/expected-lite/3583e95bad46f5af7d8a826632bc68a6f7281551/LICENSE.txt",
+      "sha256": "c9bff75738922193e67fa726fa225535870d2aa1059f91452c411736284ad566"
+    }
+  ],
+  "reason": "Replace a mutable master download with the exact retained header, verified identical to the upstream v0.10.0 tag."
+}

@@ -23,9 +23,8 @@
     ],
     "custom_scripts": {
         "pre_build": [
-            "wget https://raw.githubusercontent.com/martinmoene/expected-lite/master/include/nonstd/expected.hpp",
-            "md '.\\dev\\nonstd' 2>nul || exit /b 0",
-            "move /Y expected.hpp '.\\dev\\nonstd\\' 2>nul || exit /b 0"
+            "if not exist \"dev\\nonstd\" mkdir \"dev\\nonstd\"",
+            "copy /b /y \"%CONTRIB_SRC_DIR%\\restinio\\expected-lite\\expected.hpp\" \"dev\\nonstd\\expected.hpp\""
         ]
     }
 }

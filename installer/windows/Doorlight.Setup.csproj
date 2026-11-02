@@ -1,0 +1,48 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <PublishAot>true</PublishAot>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <IsAotCompatible>true</IsAotCompatible>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <IlcOptimizationPreference>Size</IlcOptimizationPreference>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>DoorlightUpdater</AssemblyName>
+    <Company>Crazy Entertainment</Company>
+    <Product>Doorlight</Product>
+    <Copyright>Copyright © 2026 Crazy Entertainment</Copyright>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SelfContained>true</SelfContained>
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+    <RuntimeFrameworkVersion>10.0.14</RuntimeFrameworkVersion>
+    <DebugType>none</DebugType>
+    <DebugSymbols>false</DebugSymbols>
+    <ApplicationIcon>../../apps/doorlight/windows/runner/resources/app_icon.ico</ApplicationIcon>
+  </PropertyGroup>
+  <ItemGroup>
+    <DirectPInvoke Include="doorlight_ui" />
+    <NativeLibrary Include="$(DoorlightNativeLibrary)" />
+    <NativeLibrary Include="user32.lib;gdi32.lib;gdiplus.lib;dwmapi.lib;shell32.lib;ole32.lib" />
+    <ProjectReference Include="../core/Doorlight.Setup.Core.csproj" />
+    <EmbeddedResource Include="../../apps/doorlight/assets/fonts/Fraunces-Variable.ttf" LogicalName="Doorlight.Fraunces-Variable.ttf" WithCulture="false" />
+    <EmbeddedResource Include="../../apps/doorlight/assets/fonts/HankenGrotesk-Variable.ttf" LogicalName="Doorlight.HankenGrotesk-Variable.ttf" WithCulture="false" />
+    <EmbeddedResource Include="$(DoorlightPackage)" LogicalName="Doorlight.Package.zip" WithCulture="false" Condition="'$(DoorlightPackage)' != ''" />
+    <EmbeddedResource Include="$(DoorlightManifest)" LogicalName="Doorlight.Package.json" WithCulture="false" Condition="'$(DoorlightManifest)' != ''" />
+    <EmbeddedResource Include="$(DoorlightFeedConfig)" LogicalName="Doorlight.Feed.json" WithCulture="false" Condition="'$(DoorlightFeedConfig)' != ''" />
+    <EmbeddedResource Include="$(DoorlightTrustRoot)" LogicalName="Doorlight.Trust.Root.json" WithCulture="false" Condition="'$(DoorlightTrustRoot)' != ''" />
+    <EmbeddedResource Include="$(DoorlightTrustCompressed)" LogicalName="Doorlight.Trust.exe.br" WithCulture="false" Condition="'$(DoorlightTrustCompressed)' != ''" />
+    <EmbeddedResource Include="$(DoorlightDeltaCompressed)" LogicalName="Doorlight.Delta.exe.br" WithCulture="false" Condition="'$(DoorlightDeltaCompressed)' != ''" />
+  </ItemGroup>
+  <Target Name="RequireNativeUi" BeforeTargets="Publish">
+    <Error Condition="!Exists('$(DoorlightNativeLibrary)')" Text="Build installer/native-ui and supply DoorlightNativeLibrary for the shared setup presentation." />
+  </Target>
+  <Target Name="RequireTrustPair" BeforeTargets="Publish">
+    <Error Condition="('$(DoorlightFeedConfig)' == '') != ('$(DoorlightTrustRoot)' == '')" Text="Feed configuration and its public trust root must be supplied together, or both omitted for an unconfigured local build." />
+    <Error Condition="'$(DoorlightFeedConfig)' != '' and !Exists('$(DoorlightTrustCompressed)')" Text="A configured feed requires its pinned compressed trust verifier." />
+  </Target>
+  <Target Name="VerifyNeutralResources" AfterTargets="CoreCompile" BeforeTargets="IlcCompile" Condition="'$(DesignTimeBuild)' != 'true'">
+    <Exec Command="pwsh -NoProfile -File &quot;$(MSBuildProjectDirectory)/../verify-resources.ps1&quot; -AssemblyPath &quot;@(IntermediateAssembly)&quot; -RequiredResources &quot;@(EmbeddedResource->'%(LogicalName)', '|')&quot;" />
+  </Target>
+</Project>

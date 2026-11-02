@@ -584,6 +584,17 @@ class JamiClient {
   Future<void> windowCommand(String command) =>
       _core.invokeMethod('windowCommand', {'command': command});
 
+  Future<bool> prepareUpdateShutdown(String expectedAccountId) async =>
+      await _core.invokeMethod<bool>('prepareUpdateShutdown', {
+        'expectedAccountId': expectedAccountId,
+      }) ==
+      true;
+  Future<bool> cancelUpdateShutdown() async =>
+      await _core.invokeMethod<bool>('cancelUpdateShutdown') == true;
+
+  Future<bool> commitUpdateShutdown() async =>
+      await _core.invokeMethod<bool>('commitUpdateShutdown') == true;
+
   Future<void> setWindowEdgeSpacing(
     String spacing, {
     required bool reposition,

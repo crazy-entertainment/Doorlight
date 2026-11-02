@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType><TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable><ImplicitUsings>enable</ImplicitUsings>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors><IsAotCompatible>true</IsAotCompatible>
+    <EnableTrimAnalyzer>true</EnableTrimAnalyzer><DefineConstants>DOORLIGHT_FEED_FIXTURE</DefineConstants>
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../core/*.cs" LinkBase="Core" />
+    <Compile Include="../windows/DistributionRuntime.cs" Link="DistributionRuntime.cs" />
+    <EmbeddedResource Include="$(FixtureVerifierCompressed)" LogicalName="Doorlight.Trust.exe.br" />
+  </ItemGroup>
+  <Target Name="RequireFixture" BeforeTargets="BeforeBuild">
+    <Error Condition="!Exists('$(FixtureVerifierCompressed)')" Text="Supply FixtureVerifierCompressed from build.ps1; never use this test project for distribution." />
+  </Target>
+</Project>

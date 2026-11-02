@@ -27,7 +27,15 @@ namespace WidgetSampleCS
         readonly DispatcherTimer age = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(500) };
         double width, height;
         string lastSubmission, lastCompose;
-        public ChatWidget() { WidgetTheme.Attach(this); InitializeComponent(); }
+        public ChatWidget() { WidgetTheme.Attach(this); InitializeComponent();
+            AddHandler(PointerPressedEvent, new PointerEventHandler((s, e) =>
+                OverlaySync.ReportUpdateState(this, drafts.Busy, true)), true);
+            Composer.TextChanged += (s, e) => {
+                if (token.Length > 0 && !drafts.For(token).Pending && !drafts.For(token).Unknown)
+                    drafts.For(token).Text = Composer.Text;
+                OverlaySync.ReportUpdateState(this, drafts.Busy);
+            };
+        }
         protected override void OnNavigatedTo(NavigationEventArgs e) {
             widget=(XboxGameBarWidget)e.Parameter; element=new Element("chat",widget,Root);
             changed=()=>element.Ui(Render); settingsChanged=k=>element.Ui(Render);
@@ -36,7 +44,7 @@ namespace WidgetSampleCS
             widget.GameBarDisplayModeChanged+=(s,a)=>element.Ui(Render);
             widget.VisibleChanged+=(s,a)=>element.Ui(()=>Surface(widget.Visible ? (bool?)null : false));
             age.Tick+=(s,a)=>{Surface();if(widget.GameBarDisplayMode!=XboxGameBarDisplayMode.Foreground)Render();};age.Start();
-            Unloaded+=(s,a)=>{Surface(false);age.Stop();OverlaySync.Changed-=changed;Cfg.Changed-=settingsChanged;Link.Received-=input;};Render();
+            Unloaded+=(s,a)=>{Surface(false);age.Stop();OverlaySync.Changed-=changed;Cfg.Changed-=settingsChanged;Link.Received-=input;OverlaySync.ForgetUpdateState(this);};Render();
         }
         JsonObject Chat => OverlaySync.State?.GetNamedObject("chat");
         void Surface(bool? visible = null) {
@@ -99,6 +107,7 @@ namespace WidgetSampleCS
             var color=WidgetTheme.Color(WidgetTheme.Current.Background);color.A=(byte)(Cfg.Get("chat.bgOpacity",0.0)*255);Root.Background=new SolidColorBrush(color);
             double requestedWidth=Cfg.Get("chat.width",400.0),requestedHeight=Cfg.Get("chat.height",300.0);
             if(width!=requestedWidth||height!=requestedHeight){width=requestedWidth;height=requestedHeight;_=widget.TryResizeWindowAsync(new Windows.Foundation.Size(width,height));}
+            OverlaySync.ReportUpdateState(this, drafts.Busy);
         }
         void ReconcileInput() {
             var chatSubmission=Chat?.GetNamedObject("submission",new JsonObject());
@@ -156,7 +165,7 @@ namespace WidgetSampleCS
         async void Enable_Click(object sender,RoutedEventArgs e) { if(OverlaySync.Request("chat.enable",new JsonObject()))await Launcher.LaunchUriAsync(new Uri("doorlight://open")); }
         void Latest_Click(object sender,RoutedEventArgs e)=>OverlaySync.Request("chat.latest",OverlaySync.Args("token",token,"conversation",selected));
         void Older_Click(object sender,RoutedEventArgs e)=>OverlaySync.Request("chat.history",OverlaySync.Args("token",token,"conversation",selected));
-        void Composer_KeyDown(object sender,KeyRoutedEventArgs e) {if(e.Key==VirtualKey.Enter){SendNow();e.Handled=true;}}
+        void Composer_KeyDown(object sender,KeyRoutedEventArgs e) {OverlaySync.ReportUpdateState(this, drafts.Busy, true);if(e.Key==VirtualKey.Enter){SendNow();e.Handled=true;}}
         void SendButton_Click(object sender,RoutedEventArgs e)=>SendNow();
     }
 }

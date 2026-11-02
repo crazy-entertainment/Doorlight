@@ -75,6 +75,7 @@ namespace WidgetSampleCS
                 if(session.State==null) {
                     if(!AppearanceProtocol.IsValue(field,value))return false;
                     Cfg.Set("helper."+field,value);
+                    OverlaySync.ReportUserActivity();
                     message=LocalMessage;
                     Changed?.Invoke();
                     return true;
@@ -82,6 +83,7 @@ namespace WidgetSampleCS
                 if (writer == null || (frame = session.Request(field, value)) == null) return false;
                 id = session.Pending; pipe = connection; message = "Saving in Doorlight…";
             }
+            OverlaySync.ReportUserActivity();
             Changed?.Invoke();
             _ = Task.Run(async () => { await Task.Delay(8000); lock (gate) { if (connection == pipe && session.Pending == id) pipe.Dispose(); } });
             _ = Task.Run(async () => {

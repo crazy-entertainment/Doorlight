@@ -27,6 +27,8 @@ import 'ui/onboarding_surface.dart';
 import 'ui/playful_door.dart';
 import 'ui/notice.dart';
 import 'ui/notification_bell.dart';
+import 'ui/update_button.dart';
+import 'state/windows_update.dart';
 import 'ui/sonar_warp.dart';
 import 'ui/sybl_ui.dart';
 import 'ui/windows_chrome.dart';
@@ -120,6 +122,12 @@ class _SyblAppState extends State<SyblApp> {
   final _sonar = GlobalKey<SonarWarpState>();
   AppearanceBridge? _appearanceBridge;
   OverlayBridge? _overlayBridge;
+  WindowsUpdate? _update;
+
+  bool _updateKey(KeyEvent event) {
+    _update?.activity();
+    return false;
+  }
 
   @override
   void initState() {
@@ -128,12 +136,27 @@ class _SyblAppState extends State<SyblApp> {
     unawaited(_syncWindowAppearance());
     widget.state.init();
     if (defaultTargetPlatform == TargetPlatform.windows) {
+      _update = WindowsUpdate(
+        canRestart: () => widget.state.canRestartForUpdate,
+        reserveRestart: widget.state.reserveUpdateRestart,
+        restartStillSafe: () => widget.state.updateRestartStillSafe,
+        releaseRestart: widget.state.cancelUpdateRestart,
+        prepareNative: () => widget.state.jami.prepareUpdateShutdown(
+          widget.state.accountId ?? '',
+        ),
+        cancelNative: widget.state.jami.cancelUpdateShutdown,
+        commitNative: widget.state.jami.commitUpdateShutdown,
+        identity: () => widget.state.jamiId,
+        motion: () => widget.state.chatMotionEnabled,
+      )..start();
+      HardwareKeyboard.instance.addHandler(_updateKey);
       _appearanceBridge = AppearanceBridge(
         widget.state,
         canEdit: () => _appLock?.locked == false,
       )..start();
       _overlayBridge = OverlayBridge(
         widget.state,
+        onUserActivity: () => _update?.activity(),
         canEdit: () => _appLock?.locked == false,
       )..start();
     }
@@ -149,6 +172,8 @@ class _SyblAppState extends State<SyblApp> {
 
   @override
   void dispose() {
+    HardwareKeyboard.instance.removeHandler(_updateKey);
+    _update?.dispose();
     _appearanceBridge?.dispose();
     _overlayBridge?.dispose();
     unawaited(_soundSubscription?.cancel());
@@ -174,6 +199,18 @@ class _SyblAppState extends State<SyblApp> {
 
   /// Surface a failed-call note (set in AppState) as a brief snackbar, then clear it.
   void _onState() {
+    final startup = widget.state;
+    unawaited(
+      _update?.reportStartup(
+        ready:
+            startup.screen != Screen.loading &&
+            startup.bootError == null &&
+            !startup.pendingIdentityRecovery &&
+            !startup.resetDoorlightPending &&
+            !startup.resetDoorlightRestartRequired,
+        identity: startup.jamiId,
+      ),
+    );
     var rebuild = false;
     final captureGateVisible = widget.state.captureGateVisible;
     if (captureGateVisible != _captureGateWasVisible) {
@@ -387,47 +424,59 @@ class _SyblAppState extends State<SyblApp> {
                     ),
                   ),
                 };
-          return ThemeReveal(
-            key: ValueKey(state.accountId),
-            enabled:
-                state.chatMotionEnabled &&
-                state.screen == Screen.home &&
-                !state.captureGateVisible &&
-                _appLock?.locked != true,
-            child: MediaQuery(
-              data: MediaQuery.of(
-                context,
-              ).copyWith(disableAnimations: !state.chatMotionEnabled),
-              child: Theme.of(context).platform == TargetPlatform.windows
-                  ? WindowsChrome(
-                      jami: state.jami,
-                      dismissAnimationsEnabled:
-                          state.chatMotionEnabled &&
-                          !state.captureGateVisible &&
-                          _appLock?.locked != true,
-                      openAnimation: state.appSettings.windowOpenAnimation,
-                      minimizeAnimation:
-                          state.appSettings.windowMinimizeAnimation,
-                      closeAnimation: state.appSettings.windowCloseAnimation,
-                      openDurationMs: state.appSettings.windowOpenDurationMs,
-                      minimizeDurationMs:
-                          state.appSettings.windowMinimizeDurationMs,
-                      closeDurationMs: state.appSettings.windowCloseDurationMs,
-                      rememberDefaultWindowPosition:
-                          state.appSettings.rememberDefaultWindowPosition,
-                      windowEdgeSpacing: state.appSettings.windowEdgeSpacing,
-                      renderControls: false,
-                      onboarding:
-                          state.screen != Screen.home &&
-                          !state.captureGateVisible &&
-                          _appLock?.locked != true,
-                      compactContentAvailable:
-                          state.screen == Screen.home &&
-                          !state.captureGateVisible &&
-                          _appLock?.locked != true,
-                      child: protectedSurface,
-                    )
-                  : protectedSurface,
+          return Listener(
+            onPointerDown: (_) => _update?.activity(),
+            onPointerSignal: (_) => _update?.activity(),
+            onPointerMove: (_) => _update?.activity(),
+            child: ThemeReveal(
+              key: ValueKey(state.accountId),
+              enabled:
+                  state.chatMotionEnabled &&
+                  state.screen == Screen.home &&
+                  !state.captureGateVisible &&
+                  _appLock?.locked != true,
+              child: MediaQuery(
+                data: MediaQuery.of(
+                  context,
+                ).copyWith(disableAnimations: !state.chatMotionEnabled),
+                child: Theme.of(context).platform == TargetPlatform.windows
+                    ? WindowsChrome(
+                        jami: state.jami,
+                        dismissAnimationsEnabled:
+                            state.chatMotionEnabled &&
+                            !state.captureGateVisible &&
+                            _appLock?.locked != true,
+                        openAnimation: state.appSettings.windowOpenAnimation,
+                        minimizeAnimation:
+                            state.appSettings.windowMinimizeAnimation,
+                        closeAnimation: state.appSettings.windowCloseAnimation,
+                        openDurationMs: state.appSettings.windowOpenDurationMs,
+                        minimizeDurationMs:
+                            state.appSettings.windowMinimizeDurationMs,
+                        closeDurationMs:
+                            state.appSettings.windowCloseDurationMs,
+                        rememberDefaultWindowPosition:
+                            state.appSettings.rememberDefaultWindowPosition,
+                        windowEdgeSpacing: state.appSettings.windowEdgeSpacing,
+                        renderControls: false,
+                        onboarding:
+                            state.screen != Screen.home &&
+                            !state.captureGateVisible &&
+                            _appLock?.locked != true,
+                        compactContentAvailable:
+                            state.screen == Screen.home &&
+                            !state.captureGateVisible &&
+                            _appLock?.locked != true,
+                        child: AbsorbPointer(
+                          absorbing: state.updateRestartPending,
+                          child: ExcludeFocus(
+                            excluding: state.updateRestartPending,
+                            child: protectedSurface,
+                          ),
+                        ),
+                      )
+                    : protectedSurface,
+              ),
             ),
           );
         },
@@ -439,7 +488,17 @@ class _SyblAppState extends State<SyblApp> {
           onboarding: state.screen != Screen.home,
           compactContentAvailable: state.screen == Screen.home,
           leading: state.screen == Screen.home
-              ? NotificationBell(state: state)
+              ? Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    if (_update case final update?)
+                      UpdateButton(
+                        update: update,
+                        canRestart: state.canRestartForUpdate,
+                      ),
+                    NotificationBell(state: state),
+                  ],
+                )
               : null,
           child: AnimatedSwitcher(
             duration: SyblMotion.duration(

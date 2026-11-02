@@ -41,14 +41,17 @@ class MeasuredWindow : public Win32Window {
  public:
   bool measure = false;
   std::vector<double> updates;
+  std::vector<double> frames;
  protected:
   LRESULT MessageHandler(HWND window, UINT message, WPARAM wparam,
                          LPARAM lparam) noexcept override {
-    if (measure && message == WM_WINDOWPOSCHANGED) {
+    if (measure && (message == WM_WINDOWPOSCHANGED ||
+                   message == kWindowPresentationFrameMessage)) {
       LARGE_INTEGER now{}, frequency{};
       QueryPerformanceCounter(&now);
       QueryPerformanceFrequency(&frequency);
-      updates.push_back(1000.0 * static_cast<double>(now.QuadPart) /
+      auto& samples = message == WM_WINDOWPOSCHANGED ? updates : frames;
+      samples.push_back(1000.0 * static_cast<double>(now.QuadPart) /
           static_cast<double>(frequency.QuadPart));
     }
     return Win32Window::MessageHandler(window, message, wparam, lparam);
@@ -320,13 +323,20 @@ int main() {
     SetWindowPos(handle, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     RECT before{}, begun{}, midway{}, retargeted{}, finished{};
     GetWindowRect(handle, &before);
+    animated.measure = true;
+    LARGE_INTEGER motion_started{}, motion_sampled{}, clock_frequency{};
+    QueryPerformanceFrequency(&clock_frequency);
+    QueryPerformanceCounter(&motion_started);
     Check(SendMessageW(handle, kWindowPresentationMessage, 1, 1), "animated compact accepted");
     GetWindowRect(handle, &begun);
     Check(EqualRect(&before, &begun), "animation starts without jumping");
     Check(SendMessageW(handle, kWindowPresentationStateMessage, 0, 0) == (1 | 4),
         "animated compact reports target layout and active animation");
     PumpFor(70);
+    QueryPerformanceCounter(&motion_sampled);
     GetWindowRect(handle, &midway);
+    animated.measure = false;
+    const auto sampled_state = SendMessageW(handle, kWindowPresentationStateMessage, 0, 0);
     Check(!EqualRect(&midway, &before), "timer moves and resizes the window");
     Check(SendMessageW(handle, kWindowPresentationMessage, 0, 1), "midflight reversal accepted");
     GetWindowRect(handle, &retargeted);
@@ -338,6 +348,17 @@ int main() {
     Check(EqualRect(&before, &finished), "reversal retains original normal placement");
     Check(SendMessageW(handle, kWindowPresentationStateMessage, 0, 0) == 2,
         "settled expansion clears active animation bit");
+    // Log after reversal so output latency cannot affect its timing assertions.
+    const double started_ms = 1000.0 * motion_started.QuadPart / clock_frequency.QuadPart;
+    std::printf("initial presentation: elapsed=%.2f ms, frames=%zu, "
+        "first dispatch=%.2f ms, geometry updates=%zu, state=%lld\n",
+        1000.0 * (motion_sampled.QuadPart - motion_started.QuadPart) / clock_frequency.QuadPart,
+        animated.frames.size(),
+        animated.frames.empty() ? -1 : animated.frames.front() - started_ms,
+        animated.updates.size(),
+        static_cast<long long>(sampled_state));
+    animated.frames.clear();
+    animated.updates.clear();
     Check((GetWindowLongPtrW(handle, GWL_EXSTYLE) & WS_EX_TOPMOST) != 0, "animation preserves pinning");
     MONITORINFOEXW monitor{};
     monitor.cbSize = sizeof(monitor);

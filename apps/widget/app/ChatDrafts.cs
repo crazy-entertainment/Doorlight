@@ -13,6 +13,13 @@ namespace WidgetSampleCS
         }
         readonly Dictionary<string,Draft> drafts = new Dictionary<string,Draft>();
         readonly Dictionary<string,string> bindings = new Dictionary<string,string>();
+        public bool Busy {
+            get {
+                foreach (var draft in drafts.Values)
+                    if (draft.Pending || draft.Unknown || !string.IsNullOrEmpty(draft.Text)) return true;
+                return false;
+            }
+        }
         public void Bind(string owner, string draftKey) {
             if (!string.IsNullOrEmpty(owner) && !string.IsNullOrEmpty(draftKey))
                 bindings[owner] = draftKey;

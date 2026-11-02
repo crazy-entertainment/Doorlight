@@ -98,15 +98,15 @@ set(SYBL_JAMI_CORE_LIBRARY "${JAMI_DAEMON}/build/lib/jami-core.lib")
 # This pins the existing input identity. An override must name a recorded build;
 # matching this hash alone does not establish its dependency/source provenance.
 set(SYBL_JAMI_CORE_SHA256
-  "f00d3a49554954eeb5ce488fef89aec8e36d84ab631dbdadd57e189cfe392084"
+  "0627fc0bb451a2512af9149bf36975b7e881488b7b60ad15b65fe7aa5ac3bb97"
   CACHE STRING "Recorded SHA-256 of the selected Windows daemon archive")
 set(SYBL_OPENSSL_SSL_DLL "${JAMI_CONTRIB}/build/openssl/libssl-3-x64.dll")
 set(SYBL_OPENSSL_CRYPTO_DLL "${JAMI_CONTRIB}/build/openssl/libcrypto-3-x64.dll")
 set(SYBL_OPENSSL_SSL_SHA256
-  "34dcc2b412ffb61a7c53da5a007af662c2e1d05afb2cce7239516bea5d6c6a00"
+  "3439682725f47df19c93b5e449642812ae9f9135468137e03d8966bad7c9d0f8"
   CACHE STRING "Recorded SHA-256 of the selected Windows OpenSSL SSL DLL")
 set(SYBL_OPENSSL_CRYPTO_SHA256
-  "1178a48f308349803e6cba11c5b99addd0d780780071d0730655cb6e0719dee6"
+  "7766156d8f8270e5156025db483b7306e8ba248e3e43ea5f2f8457656fd7e5fe"
   CACHE STRING "Recorded SHA-256 of the selected Windows OpenSSL Crypto DLL")
 include("${CMAKE_CURRENT_SOURCE_DIR}/check_native_input.cmake")
 add_custom_target(check_jami_core
@@ -127,6 +127,7 @@ function(sybl_test name)
 endfunction()
 
 sybl_test(nearby_radio_mailbox_test "nearby_radio_mailbox_test.cpp")
+sybl_test(update_shutdown_test "update_shutdown_test.cpp")
 sybl_test(widget_companion_test "widget_companion_test.cpp")
 sybl_test(appearance_pipe_test "appearance_pipe_test.cpp" "appearance_pipe.cpp")
 target_compile_definitions(appearance_pipe_test PRIVATE NOMINMAX UNICODE _UNICODE)

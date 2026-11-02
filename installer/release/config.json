@@ -1,0 +1,18 @@
+{
+  "schema": 1,
+  "repository": "crazy-entertainment/Doorlight",
+  "channel": "stable",
+  "feedTag": "update-feed",
+  "deliveryEnabled": false,
+  "nativeInputs": {
+    "daemonSourceTree": "1248cd07a061d551f8b2fc8f62f84f074afd1f84",
+    "archiveUrl": "https://github.com/crazy-entertainment/Doorlight/releases/download/windows-native-1248cd07a061-4ca99786/windows-native-inputs.zip",
+    "archiveSha256": "4ca997867b8abb3f1544802aed1a69f21682f8b72fbe92563b7ed1e53166f2a6",
+    "manifestUrl": "https://github.com/crazy-entertainment/Doorlight/releases/download/windows-native-1248cd07a061-4ca99786/windows-native-inputs.json",
+    "manifestSha256": "3031b201705ee946bc2d92b9822dc12ed4489a3053171657bdda6c3f63f531da",
+    "correspondingSourceUrl": "https://github.com/crazy-entertainment/Doorlight/releases/download/windows-native-1248cd07a061-4ca99786/Doorlight.Native.Source.tar.gz",
+    "correspondingSourceSha256": "7a11b9ebefe15241a7df9e4aab5e1a019dbe81797624df6a6abc8895f52b3321"
+  },
+  "rootSha256": "9dbfaa0597a9102bd989b7b57fb3967c2cee835a2994b9521fe069b3158a3353",
+  "qualification": null
+}

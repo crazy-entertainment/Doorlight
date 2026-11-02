@@ -18,6 +18,35 @@ namespace WidgetSampleCS
         static string pending, pendingCommand;
         static TaskCompletionSource<JsonObject> completion;
         static bool started;
+        static bool? updatePresenceSupported;
+        static readonly Dictionary<object, bool> updateBusy = new Dictionary<object, bool>();
+        static bool updateActivity;
+        internal static void ReportUserActivity() { lock (gate) updateActivity = true; }
+        internal static void ReportUpdateState(object owner, bool busy, bool activity = false) {
+            lock (gate) { updateBusy[owner] = busy; updateActivity |= activity; }
+        }
+        internal static void ForgetUpdateState(object owner) { lock (gate) updateBusy.Remove(owner); }
+        static async Task ReportUpdatePresence() {
+            if (!Writable) return;
+            bool? supported;
+            string epoch;
+            lock (gate) { supported = updatePresenceSupported; epoch = state?.GetNamedString("epoch"); }
+            if (supported == null) {
+                var result = await RequestAsync("update.capabilities", new JsonObject());
+                if (result != null) lock (gate) {
+                    if (state?.GetNamedString("epoch") == epoch)
+                        updatePresenceSupported = result.GetNamedBoolean("ok", false)
+                            ? result.GetNamedObject("result", new JsonObject()).GetNamedBoolean("desktopIdleGuard", false)
+                            : result.GetNamedString("error", "") == "invalid" ? (bool?)false : null;
+                }
+                return;
+            }
+            if (supported != true) return;
+            bool busy, activity;
+            lock (gate) { busy = updateBusy.Values.Any(value => value); activity = updateActivity; updateActivity = false; }
+            var receipt = await RequestAsync("update.presence", Args("busy", busy, "activity", activity));
+            if (receipt == null || !receipt.GetNamedBoolean("ok", false)) lock (gate) updateActivity |= activity;
+        }
         static JsonObject state;
         static string uiSignature;
         public static event Action Changed;
@@ -65,6 +94,7 @@ namespace WidgetSampleCS
         }
         public static void Start() {
             lock (gate) { if (started) return; started = true; }
+            _ = Task.Run(async () => { while (true) { await Task.Delay(1000); try { await ReportUpdatePresence(); } catch { /* Retry on the next live connection. */ } } });
             _ = Task.Run(async () => {
                 while (true) {
                     NamedPipeClientStream owner = null;
@@ -84,6 +114,7 @@ namespace WidgetSampleCS
                     } catch (Exception ex) { Error = null; if(!(ex is TimeoutException)&&!(ex is IOException)&&!(ex is ObjectDisposedException))Log.Write("overlay connection: " + ex.GetType().Name); }
                     finally {
                         lock (gate) { if (pipe == owner) { pipe = null; writer = null; state = null; pending = null; pendingCommand = null; completion?.TrySetResult(null); completion = null; } }
+                        lock (gate) updatePresenceSupported = null;
                         owner?.Dispose(); OverlaySettings.Rollback(); Changed?.Invoke();
                     }
                     await Task.Delay(2000);
@@ -120,7 +151,9 @@ namespace WidgetSampleCS
                     // the command, while the newest authoritative snapshot wins.
                     if(state!=null&&state.GetNamedNumber("revision")>revision)next=state;
                     message["snapshot"]=next;
-                    settingsCompletion = pendingCommand?.StartsWith("settings.") == true; pending = null; pendingCommand = null; finished=completion; completion = null; Error = resultOk ? null : "Couldn’t save the change. Try again.";
+                    bool updateStatus = pendingCommand?.StartsWith("update.") == true;
+                    settingsCompletion = pendingCommand?.StartsWith("settings.") == true; pending = null; pendingCommand = null; finished=completion; completion = null;
+                    if (!updateStatus) Error = resultOk ? null : "Couldn’t save the change. Try again.";
                 }else if(state!=null&&state.GetNamedNumber("revision")>revision){
                     return;
                 }

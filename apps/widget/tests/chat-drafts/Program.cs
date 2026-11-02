@@ -47,6 +47,15 @@ static class Program {
         Check(!drafts.ReconcileReceipt("fast-receipt","fast-operation","committed","fast text"),"A terminal snapshot before local Begin cannot invent its draft");
         drafts.Begin("fast-receipt","fast text","fast-operation");
         Check(drafts.ReconcileReceipt("fast-receipt","fast-operation","committed","fast text")&&drafts.For("fast-receipt").Text==""&&!drafts.For("fast-receipt").Pending,"The same terminal snapshot must settle after the local draft is bound");
-        Console.WriteLine("26 scoped draft/receipt/admission/reconnect checks passed");
+        var idle = new ChatDrafts();
+        Check(!idle.Busy,"Empty drafts must allow idle servicing");
+        idle.For("a").Text="unsent";
+        Check(idle.Busy,"Unsent text must defer servicing");
+        idle.For("a").Text="";
+        idle.Begin("a","sending","operation");idle.Interrupt();
+        Check(idle.Busy,"Unknown sends must defer servicing");
+        idle.Complete("a","sending","operation","committed");
+        Check(!idle.Busy,"Matching committed receipt releases servicing guard");
+        Console.WriteLine("30 scoped draft/receipt/admission/reconnect/update checks passed");
     }
 }

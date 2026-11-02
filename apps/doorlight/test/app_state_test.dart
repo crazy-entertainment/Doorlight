@@ -46,7 +46,24 @@ class FakeJami extends JamiClient {
   // Most state fixtures exercise the portable preferences adapter. Android
   // canonical-write integration fixtures opt into the real channel boundary.
   @override
-  bool get usesNativeAppSettingsStore => false;
+  bool get usesNativeAppSettingsStore => nativeAppSettingsStore;
+  bool nativeAppSettingsStore = false;
+  Completer<void>? pendingAppSettingsSave;
+  Completer<void>? appSettingsSaveStarted;
+
+  @override
+  Future<void> saveAppSettingsDocument(String document) async {
+    if (!nativeAppSettingsStore) {
+      return super.saveAppSettingsDocument(document);
+    }
+    appSettingsSaveStarted?.complete();
+    await pendingAppSettingsSave?.future;
+    await (await SharedPreferences.getInstance()).setString(
+      'appSettings',
+      document,
+    );
+  }
+
   final _events = StreamController<JamiEvent>.broadcast(sync: true);
   final calls = <String>[];
   final Map<String, JamiFriend> daemonFriends = {};
@@ -6841,6 +6858,56 @@ void main() {
       await Future<void>.delayed(const Duration(milliseconds: 2100));
       await pumpEventQueue(times: 5);
       expect(loads(), before + 2);
+    });
+
+    test('update restart waits for a pending app settings save', () async {
+      await boot({'displayName': 'Me'});
+      expect(state.canRestartForUpdate, isTrue);
+      jami
+        ..nativeAppSettingsStore = true
+        ..appSettingsSaveStarted = Completer<void>()
+        ..pendingAppSettingsSave = Completer<void>();
+
+      final save = state.setChatMotionEnabled(false);
+      await jami.appSettingsSaveStarted!.future;
+      expect(state.settingsBusy, isTrue);
+      expect(state.canRestartForUpdate, isFalse);
+      expect(state.reserveUpdateRestart(), isFalse);
+      expect(state.updateRestartPending, isFalse);
+      await pumpEventQueue();
+      expect(state.canRestartForUpdate, isFalse);
+
+      jami.pendingAppSettingsSave!.complete();
+      expect(await save, isTrue);
+      expect(state.chatMotionEnabled, isFalse);
+      expect(state.settingsBusy, isFalse);
+      expect(state.canRestartForUpdate, isTrue);
+      expect(state.reserveUpdateRestart(), isTrue);
+      expect(state.updateRestartStillSafe, isTrue);
+      state.cancelUpdateRestart();
+    });
+
+    test('pending settings save invalidates update restart safety', () async {
+      await boot({'displayName': 'Me'});
+      expect(state.reserveUpdateRestart(), isTrue);
+      expect(state.updateRestartStillSafe, isTrue);
+      jami
+        ..nativeAppSettingsStore = true
+        ..appSettingsSaveStarted = Completer<void>()
+        ..pendingAppSettingsSave = Completer<void>();
+
+      final save = state.setChatMotionEnabled(false);
+      await jami.appSettingsSaveStarted!.future;
+      expect(state.settingsBusy, isTrue);
+      expect(state.updateRestartPending, isTrue);
+      expect(state.updateRestartStillSafe, isFalse);
+      state.cancelUpdateRestart();
+      expect(state.canRestartForUpdate, isFalse);
+
+      jami.pendingAppSettingsSave!.complete();
+      expect(await save, isTrue);
+      expect(state.settingsBusy, isFalse);
+      expect(state.canRestartForUpdate, isTrue);
     });
 
     test(

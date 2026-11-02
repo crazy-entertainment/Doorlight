@@ -15,6 +15,7 @@ namespace WidgetSampleCS {
     static class Cfg {public static string[] Changed;public static void Refresh(params string[] keys){Changed=keys;}public static void Set(string key,object value)=>OverlaySettings.Values[key]=value;public static void ApplyAppearance(AppearanceValues value,bool force){}}
     static class Log {public static void Write(string value){}}
     static class OverlaySync {
+        internal static void ReportUserActivity() { }
         public static JsonObject State;public static bool Writable=true;public static string Error;public static int Calls;public static JsonObject LastArgs;public static event Action Changed;
         public static Task<JsonObject> PendingCompletion=>Task.FromResult<JsonObject>(null);
         public static IJsonValue Scalar(object value)=>value as IJsonValue??new JsonValue(value);

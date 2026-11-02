@@ -303,6 +303,8 @@ final class ComposerDraftStore {
   final int maximumDrafts;
   final Map<ComposerDraftKey, ComposerDraftSession> _drafts = {};
 
+  bool get hasUnfinishedDrafts => _drafts.values.any((draft) => !draft.isEmpty);
+
   /// Timeline actions can address only the draft currently mounted for this
   /// exact conversation and topic. They cannot activate an old navigation visit.
   bool selectReply(ComposerDraftKey key, String daemonId) {

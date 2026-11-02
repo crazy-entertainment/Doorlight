@@ -72,6 +72,14 @@ void Start();
 // to call when Start() was never called. Does NOT re-arm Start().
 void Stop();
 
+// Update preparation closes core-channel admission synchronously, then drains
+// preceding worker commands and reserves an idle native account revision.
+// False prepare/commit requires cancellation before normal commands resume.
+bool UpdateShutdownPending();
+void PrepareUpdateShutdown(const std::string& expectedAccountId, std::function<void(bool)> done);
+void CancelUpdateShutdown(std::function<void(bool)> done);
+void CommitUpdateShutdown(std::function<bool()> postQuit, std::function<void(bool)> done);
+
 void LoadSendJournal(std::function<void(bool, std::optional<std::string>)> done);
 void SaveSendJournal(const std::string& source, std::function<void(bool)> done);
 void DiscardUnissuedStage(const std::string& path, std::function<void(bool)> done);

@@ -15,6 +15,7 @@ final class OverlayBridge {
     OverlayDocumentStore? store,
     MethodChannel? channel,
     this.canEdit,
+    this.onUserActivity,
     String? epoch,
     DateTime Function()? now,
   }) : settings = store == null
@@ -34,11 +35,15 @@ final class OverlayBridge {
   final OverlaySettings settings;
   final MethodChannel _channel;
   final bool Function()? canEdit;
+  final void Function()? onUserActivity;
   final String epoch;
   final DateTime Function() _now;
   bool _disposed = false;
   bool _pending = false;
+  bool _syncingUpdateBusy = false;
   bool _connected = false;
+  bool _widgetReportedBusy = true;
+  DateTime? _widgetPresenceUntil;
   int _connectionLease = 0;
   int _revision = 0;
   int _publishGeneration = 0;
@@ -90,6 +95,7 @@ final class OverlayBridge {
     _clock?.cancel();
     _retry?.cancel();
     state.removeListener(_onStateChanged);
+    state.setWidgetUpdateBusy(false);
     settings.removeListener(refresh);
     _channel.setMethodCallHandler(null);
     unawaited(_channel.invokeMethod<void>('cancel').catchError((Object _) {}));
@@ -98,6 +104,7 @@ final class OverlayBridge {
   }
 
   void _onStateChanged() {
+    if (_syncingUpdateBusy) return;
     _privateProjection = null;
     refresh();
   }
@@ -239,6 +246,7 @@ final class OverlayBridge {
   void refresh() {
     if (_disposed || !state.appearanceBridgeReady) return;
     final current = snapshot;
+    _syncUpdateBusy();
     final withoutRevision = {...current, 'revision': 0};
     final encoded = jsonEncode(withoutRevision);
     if (_lastPublished == encoded) return;
@@ -258,6 +266,27 @@ final class OverlayBridge {
         _scheduleRetry();
       }
     });
+  }
+
+  void _syncUpdateBusy() {
+    _syncingUpdateBusy = true;
+    try {
+      state.setWidgetUpdateBusy(
+        !_disposed &&
+            (_pending ||
+                (_connected &&
+                    (_widgetReportedBusy ||
+                        _widgetPresenceUntil == null ||
+                        !_now().isBefore(_widgetPresenceUntil!))) ||
+                _compose['active'] == true ||
+                (_compose['text'] is String &&
+                    (_compose['text'] as String).isNotEmpty &&
+                    _submission['status'] != 'committed') ||
+                const {'pending', 'unknown'}.contains(_submission['status'])),
+      );
+    } finally {
+      _syncingUpdateBusy = false;
+    }
   }
 
   void _scheduleRetry() {
@@ -324,6 +353,7 @@ final class OverlayBridge {
 
   Future<void> tick() async {
     if (!_disposed) await _configure();
+    if (!_disposed) _syncUpdateBusy();
     if (_disposed ||
         !state.appearanceBridgeReady ||
         !state.settingsControlsEnabled ||
@@ -357,6 +387,10 @@ final class OverlayBridge {
       final replaced = _connected && event['lease'] > _connectionLease;
       _connectionLease = event['lease'];
       _connected = event['connected'] == true;
+      if (!_connected || replaced || _widgetPresenceUntil == null) {
+        _widgetReportedBusy = true;
+        _widgetPresenceUntil = null;
+      }
       _lastConfig = null;
       if (!_connected || replaced) {
         _input = {};
@@ -366,8 +400,10 @@ final class OverlayBridge {
         _surfaceOwner = '';
         _surfaceUntil = null;
         state.retireWidgetOverlaySession();
+        _syncUpdateBusy();
       }
       await _configure();
+      _syncUpdateBusy();
       return;
     }
     if (event['lease'] != _connectionLease) return;
@@ -397,6 +433,7 @@ final class OverlayBridge {
       return;
     }
     if (type == 'compose') {
+      if (event['text'] is! String) return;
       _compose = {
         'owner': event['owner'],
         'text': event['text'],
@@ -404,6 +441,11 @@ final class OverlayBridge {
       };
     } else if (type == 'cancel') {
       _compose = {'owner': event['owner'], 'text': '', 'active': false};
+    }
+    if (const {'compose', 'cancel'}.contains(type) ||
+        type == 'submit' && event['text'] is String) {
+      onUserActivity?.call();
+      _syncUpdateBusy();
     }
     if (type == 'hotkey') {
       final action = event['action'];
@@ -413,9 +455,11 @@ final class OverlayBridge {
           await _timer(parts[2] == 'toggle' ? 'toggle' : parts[2], {
             'id': parts[1],
           });
+          onUserActivity?.call();
         } else if (parts.length == 2 &&
             settings.values['timer.activeId'] is String) {
           await _timer(parts[1], {'id': settings.values['timer.activeId']});
+          onUserActivity?.call();
         }
       } else if (action == 'cross.toggle') {
         final next = Map<String, Object>.from(settings.values);
@@ -424,6 +468,7 @@ final class OverlayBridge {
         final key = 'crossPresets.$active.visible';
         next[key] = next[key] == false;
         await settings.replace(next, expectedRevision: settings.revision);
+        onUserActivity?.call();
       }
     } else if (type == 'capture' &&
         event['action'] is String &&
@@ -432,6 +477,7 @@ final class OverlayBridge {
       final next = Map<String, Object>.from(settings.values);
       next['hotkey.${event['action']}'] = event['text'] as String;
       await settings.replace(next, expectedRevision: settings.revision);
+      onUserActivity?.call();
     } else if (type == 'submit' && event['text'] is String) {
       final chat = snapshot['chat'] as Map;
       final operation = List.generate(
@@ -563,9 +609,28 @@ final class OverlayBridge {
             : response(error: 'invalid');
       }
       _pending = true;
+      _syncUpdateBusy();
       Map<String, Object?> result;
       try {
-        if (command == 'chat.surface') {
+        if (command == 'update.capabilities') {
+          if (args.isNotEmpty) throw StateError('invalid');
+          result = {
+            'protocol': 1,
+            'desktopIdleGuard': true,
+            'presenceLeaseSeconds': 3,
+          };
+        } else if (command == 'update.presence') {
+          if (!_connected ||
+              args.length != 2 ||
+              args['busy'] is! bool ||
+              args['activity'] is! bool) {
+            throw StateError('invalid');
+          }
+          _widgetReportedBusy = args['busy'] as bool;
+          _widgetPresenceUntil = _now().add(const Duration(seconds: 3));
+          if (args['activity'] == true) onUserActivity?.call();
+          result = {};
+        } else if (command == 'chat.surface') {
           final chat = snapshot['chat'] as Map;
           if (args.length != 2 ||
               args['visible'] is! bool ||
@@ -622,6 +687,12 @@ final class OverlayBridge {
           throw StateError('invalid');
         }
         result = Map<String, Object?>.from(result)..remove('snapshot');
+        if (command != 'chat.surface' &&
+            command != 'settings.import' &&
+            command != 'update.presence' &&
+            command != 'update.capabilities') {
+          onUserActivity?.call();
+        }
         _completed[id!] = (command: command, args: fingerprint, result: result);
         if (_completed.length > 128) _completed.remove(_completed.keys.first);
       } finally {

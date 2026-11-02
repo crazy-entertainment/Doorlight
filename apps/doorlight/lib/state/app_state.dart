@@ -9,6 +9,7 @@ import 'dart:io'
 import 'dart:ui' show ViewFocusEvent, ViewFocusState;
 
 import 'package:flutter/foundation.dart';
+import 'package:crypto/crypto.dart' show sha256;
 import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart'; // ChangeNotifier + WidgetsBindingObserver (app foreground → presence probe)
 import 'package:shared_preferences/shared_preferences.dart';
@@ -2133,6 +2134,67 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       _profileMutationBusy ||
       _changingAppearOffline ||
       _changingConnectionProfile;
+
+  bool _updateRestartPending = false;
+  bool _widgetUpdateBusy = false;
+  bool get widgetUpdateBusy => _widgetUpdateBusy;
+
+  /// Updated only by the authenticated desktop overlay bridge; grants no authority.
+  void setWidgetUpdateBusy(bool busy) {
+    if (_widgetUpdateBusy == busy || _disposed) return;
+    _widgetUpdateBusy = busy;
+    notifyListeners();
+  }
+
+  bool get updateRestartPending => _updateRestartPending;
+  bool get canRestartForUpdate => !_updateRestartPending && _updateRestartIdle;
+  bool get updateRestartStillSafe =>
+      _updateRestartPending && _updateRestartIdle;
+
+  bool reserveUpdateRestart() {
+    if (!canRestartForUpdate) return false;
+    _updateRestartPending = true;
+    notifyListeners();
+    return true;
+  }
+
+  void cancelUpdateRestart() {
+    if (!_updateRestartPending) return;
+    _updateRestartPending = false;
+    notifyListeners();
+  }
+
+  bool get _updateRestartIdle =>
+      !_disposed &&
+      screen == Screen.home &&
+      !captureGateVisible &&
+      !_restoringIdentity &&
+      !_identityMutationBusy &&
+      !backingUp &&
+      !resettingDoorlight &&
+      !devicePairingPending &&
+      !overlaySettings.busy &&
+      !_widgetUpdateBusy &&
+      !_widgetSendBusy &&
+      !_widgetChatConsentPending &&
+      !_widgetSendResults.values.any(
+        (result) => const {
+          ComposerSendStatus.pending,
+          ComposerSendStatus.unknown,
+        }.contains(result.status),
+      ) &&
+      !_captureBusy &&
+      _initializationInFlight == null &&
+      _bootInFlight == null &&
+      call == null &&
+      groupCall == null &&
+      _groupJoinOperation == null &&
+      !placing &&
+      _pendingIncomingCalls.isEmpty &&
+      _unresolvedOutgoingCallIds.isEmpty &&
+      !sendingFile &&
+      !transfers.values.any((transfer) => !transfer.done) &&
+      !composerDrafts.hasUnfinishedDrafts;
   String registration = 'UNREGISTERED';
   bool get registered => registration == 'REGISTERED';
   WindowCaptureProtectionStatus _windowCaptureProtection =
@@ -3656,6 +3718,19 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
   int _widgetFriendsRevision = -1;
   final Map<String, WidgetChatConversation> _widgetChatConversations = {};
   final Map<ConversationScope, String> _widgetDraftKeys = {};
+  // Non-authorizing local draft binding survives desktop restart. Every command
+  // still requires the independently generated current session token.
+  String _widgetDraftKey(ConversationScope scope) =>
+      _widgetDraftKeys.putIfAbsent(
+        scope,
+        () => sha256
+            .convert(
+              utf8.encode(
+                jsonEncode(['doorlight-widget-draft-v1', jamiId, scope.toMap()]),
+              ),
+            )
+            .toString(),
+      );
   final Map<ConversationScope, SendJournalRecord> _widgetSendResults = {};
   (String?, int)? _widgetDraftAccountOwner;
   String? _widgetSelectedChatToken;
@@ -3880,7 +3955,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
         scope: latest.scope,
         label: latest.label,
         kind: latest.kind,
-        draftKey: _widgetDraftKeys.putIfAbsent(latest.scope, createWidgetToken),
+        draftKey: _widgetDraftKey(latest.scope),
       );
     }
     for (final item in current) {
@@ -3893,7 +3968,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
         scope: item.scope,
         label: item.label,
         kind: item.kind,
-        draftKey: _widgetDraftKeys.putIfAbsent(item.scope, createWidgetToken),
+        draftKey: _widgetDraftKey(item.scope),
       );
     }
     final selected = _widgetSelectedChatToken;

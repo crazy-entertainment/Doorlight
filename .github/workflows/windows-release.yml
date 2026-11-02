@@ -1,0 +1,227 @@
+name: Windows build and release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'apps/**'
+      - 'native/**'
+      - 'installer/**'
+      - 'tools/windows-native-*.ps1'
+      - '.github/workflows/windows-release.yml'
+      - 'LICENSE'
+  workflow_dispatch:
+  schedule:
+    - cron: '17 8 * * 1'
+
+concurrency:
+  group: windows-delivery
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    if: github.event_name != 'schedule' && github.ref == 'refs/heads/main'
+    runs-on: windows-2022
+    outputs:
+      build_ready: ${{ steps.release-config.outputs.build_ready }}
+      delivery_enabled: ${{ steps.release-config.outputs.delivery_enabled }}
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout exact release commit
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set up .NET SDK
+        uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5
+        with:
+          global-json-file: installer/global.json
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: '1.27.3'
+          cache: false
+      - name: Read release gate
+        id: release-config
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $config = Get-Content installer/release/config.json -Raw | ConvertFrom-Json
+          if ($config.schema -ne 1 -or $config.repository -cne 'crazy-entertainment/Doorlight' -or $config.deliveryEnabled -isnot [bool]) {
+            throw 'Release configuration is invalid.'
+          }
+          $missing = @()
+          foreach ($name in @('archiveUrl','archiveSha256','manifestUrl','manifestSha256','correspondingSourceUrl','correspondingSourceSha256')) {
+            if ([string]::IsNullOrWhiteSpace([string]$config.nativeInputs.$name)) { $missing += "nativeInputs.$name" }
+          }
+          if ([string]::IsNullOrWhiteSpace([string]$config.rootSha256)) { $missing += 'rootSha256' }
+          if (-not (Test-Path installer/release/bootstrap.root.json -PathType Leaf)) { $missing += 'bootstrap.root.json' }
+          if ($missing.Count) {
+            "build_ready=false" >> $env:GITHUB_OUTPUT
+            "delivery_enabled=false" >> $env:GITHUB_OUTPUT
+            "Windows hosted build not ready; missing configured release inputs: $($missing -join ', '). No candidate binaries were uploaded." >> $env:GITHUB_STEP_SUMMARY
+            Write-Host "Hosted build not ready; missing configured release inputs: $($missing -join ', ')."
+            return
+          }
+          & .\installer\release\build.ps1 -Mode ValidateConfig -ToolRoot (Join-Path $env:RUNNER_TEMP 'unused-tools') -OutputDirectory (Join-Path $env:RUNNER_TEMP 'unused-output') -Commit $env:GITHUB_SHA -RunNumber $env:GITHUB_RUN_NUMBER -RunAttempt $env:GITHUB_RUN_ATTEMPT
+          if (-not $?) { throw 'Base Windows build input validation failed.' }
+          "build_ready=true" >> $env:GITHUB_OUTPUT
+          if ($config.deliveryEnabled) {
+            & .\installer\release\build.ps1 -Mode ValidateConfig -RequireDeliveryQualification -ToolRoot (Join-Path $env:RUNNER_TEMP 'unused-tools') -OutputDirectory (Join-Path $env:RUNNER_TEMP 'unused-output') -Commit $env:GITHUB_SHA -RunNumber $env:GITHUB_RUN_NUMBER -RunAttempt $env:GITHUB_RUN_ATTEMPT
+            if (-not $?) { throw 'Release qualification validation failed.' }
+            "delivery_enabled=true" >> $env:GITHUB_OUTPUT
+            "Windows delivery is enabled and its qualification metadata validated." >> $env:GITHUB_STEP_SUMMARY
+          } else {
+            "delivery_enabled=false" >> $env:GITHUB_OUTPUT
+            "Windows hosted qualification build is ready; public candidate upload and publication remain disabled." >> $env:GITHUB_STEP_SUMMARY
+          }
+      - name: Run synthetic release-tool checks
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          .\installer\release\build-test.ps1
+          python -m unittest discover -s installer/release -p test_publish.py
+          if ($LASTEXITCODE -ne 0) { throw 'Release transport tests failed.' }
+      - name: Build and verify the Windows bundle
+        if: steps.release-config.outputs.build_ready == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $base = Join-Path $env:RUNNER_TEMP ("doorlight-release-{0}-{1}" -f $env:GITHUB_RUN_ID,$env:GITHUB_RUN_ATTEMPT)
+          $tools = Join-Path $base 'tools'
+          $candidate = Join-Path $base 'candidate'
+          $logs = Join-Path $base 'logs'
+          New-Item -ItemType Directory -Force -Path $logs | Out-Null
+          $log = Join-Path $logs 'windows-build.log'
+          try {
+            & .\installer\release\build.ps1 -Mode Build -ToolRoot $tools -OutputDirectory $candidate -Commit $env:GITHUB_SHA -RunNumber $env:GITHUB_RUN_NUMBER -RunAttempt $env:GITHUB_RUN_ATTEMPT *>&1 | Tee-Object -FilePath $log
+            if ($LASTEXITCODE -ne 0) { throw 'Windows candidate build failed.' }
+          } catch {
+            ($_ | Out-String) | Out-File -LiteralPath $log -Append -Encoding utf8
+            throw
+          }
+      - name: Preserve build diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: windows-build-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/doorlight-release-${{ github.run_id }}-${{ github.run_attempt }}/logs/
+          if-no-files-found: ignore
+          retention-days: 14
+      - name: Upload qualified Windows candidate
+        if: success() && steps.release-config.outputs.delivery_enabled == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: windows-candidate-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/doorlight-release-${{ github.run_id }}-${{ github.run_attempt }}/candidate/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    if: github.event_name != 'schedule' && github.ref == 'refs/heads/main' && needs.build.outputs.build_ready == 'true' && needs.build.outputs.delivery_enabled == 'true'
+    needs: build
+    runs-on: windows-2022
+    environment: windows-release
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout exact release commit
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: '1.27.3'
+          cache: false
+      - name: Download qualified candidate
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: windows-candidate-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/doorlight-candidate
+      - name: Build the publisher
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:GOTOOLCHAIN = 'local'
+          go -C installer/trust test -mod=readonly ./publisher
+          if ($LASTEXITCODE -ne 0) { throw 'Publisher tests failed.' }
+          go -C installer/trust vet -mod=readonly ./publisher
+          if ($LASTEXITCODE -ne 0) { throw 'Publisher vet failed.' }
+          $publisher = Join-Path $env:RUNNER_TEMP 'DoorlightPublish.exe'
+          go -C installer/trust build -mod=readonly -trimpath -buildvcs=false -o $publisher ./publisher
+          if ($LASTEXITCODE -ne 0) { throw 'Publisher build failed.' }
+      - name: Publish the verified release candidate
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          DOORLIGHT_TUF_TARGETS_KEY: ${{ secrets.DOORLIGHT_TUF_TARGETS_KEY }}
+          DOORLIGHT_TUF_SNAPSHOT_KEY: ${{ secrets.DOORLIGHT_TUF_SNAPSHOT_KEY }}
+          DOORLIGHT_TUF_TIMESTAMP_KEY: ${{ secrets.DOORLIGHT_TUF_TIMESTAMP_KEY }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $scratch = Join-Path $env:RUNNER_TEMP ("doorlight-publish-{0}-{1}" -f $env:GITHUB_RUN_ID,$env:GITHUB_RUN_ATTEMPT)
+          & python installer/release/publish.py --config installer/release/config.json --root installer/release/bootstrap.root.json --publisher (Join-Path $env:RUNNER_TEMP 'DoorlightPublish.exe') --candidate (Join-Path $env:RUNNER_TEMP 'doorlight-candidate') --repository crazy-entertainment/Doorlight --commit $env:GITHUB_SHA --run-number $env:GITHUB_RUN_NUMBER --attempt $env:GITHUB_RUN_ATTEMPT --scratch $scratch
+          if ($LASTEXITCODE -ne 0) { throw 'Release publication failed closed.' }
+
+  refresh:
+    if: github.event_name == 'schedule' && github.ref == 'refs/heads/main'
+    runs-on: windows-2022
+    environment: windows-release
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout current release workflow
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: '1.27.3'
+          cache: false
+      - name: Skip refresh while delivery is disabled
+        id: delivery
+        shell: pwsh
+        run: |
+          $config = Get-Content installer/release/config.json -Raw | ConvertFrom-Json
+          if ($config.deliveryEnabled -ne $true) {
+            Write-Host 'Feed refresh is inactive: release configuration has deliveryEnabled=false.'
+            "enabled=false" >> $env:GITHUB_OUTPUT
+          } else {
+            & .\installer\release\build.ps1 -Mode ValidateConfig -RequireDeliveryQualification -ToolRoot (Join-Path $env:RUNNER_TEMP 'unused-tools') -OutputDirectory (Join-Path $env:RUNNER_TEMP 'unused-output') -Commit $env:GITHUB_SHA -RunNumber $env:GITHUB_RUN_NUMBER -RunAttempt $env:GITHUB_RUN_ATTEMPT
+            if (-not $?) { throw 'Scheduled refresh qualification validation failed.' }
+            "enabled=true" >> $env:GITHUB_OUTPUT
+          }
+      - name: Build the publisher
+        if: steps.delivery.outputs.enabled == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:GOTOOLCHAIN = 'local'
+          go -C installer/trust test -mod=readonly ./publisher
+          if ($LASTEXITCODE -ne 0) { throw 'Publisher tests failed.' }
+          go -C installer/trust vet -mod=readonly ./publisher
+          if ($LASTEXITCODE -ne 0) { throw 'Publisher vet failed.' }
+          $publisher = Join-Path $env:RUNNER_TEMP 'DoorlightPublish.exe'
+          go -C installer/trust build -mod=readonly -trimpath -buildvcs=false -o $publisher ./publisher
+          if ($LASTEXITCODE -ne 0) { throw 'Publisher build failed.' }
+      - name: Refresh the TUF feed
+        if: steps.delivery.outputs.enabled == 'true'
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          DOORLIGHT_TUF_TARGETS_KEY: ${{ secrets.DOORLIGHT_TUF_TARGETS_KEY }}
+          DOORLIGHT_TUF_SNAPSHOT_KEY: ${{ secrets.DOORLIGHT_TUF_SNAPSHOT_KEY }}
+          DOORLIGHT_TUF_TIMESTAMP_KEY: ${{ secrets.DOORLIGHT_TUF_TIMESTAMP_KEY }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $scratch = Join-Path $env:RUNNER_TEMP ("doorlight-refresh-{0}-{1}" -f $env:GITHUB_RUN_ID,$env:GITHUB_RUN_ATTEMPT)
+          & python installer/release/publish.py --config installer/release/config.json --root installer/release/bootstrap.root.json --publisher (Join-Path $env:RUNNER_TEMP 'DoorlightPublish.exe') --repository crazy-entertainment/Doorlight --commit $env:GITHUB_SHA --run-number $env:GITHUB_RUN_NUMBER --attempt $env:GITHUB_RUN_ATTEMPT --scratch $scratch --refresh
+          if ($LASTEXITCODE -ne 0) { throw 'Scheduled feed refresh failed closed.' }

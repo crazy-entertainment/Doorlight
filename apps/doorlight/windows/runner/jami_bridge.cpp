@@ -20,6 +20,7 @@
 #endif
 
 #include "jami_bridge.h"
+#include "update_shutdown.h"
 #include "control_message_admission.h"
 #include "archive_path_policy.h"
 #include "archive_protection.h"
@@ -180,6 +181,12 @@ std::deque<std::string> g_recentTerminalOrder;   // guarded; insertion order for
 std::atomic<bool> g_micMuted{false};  // desired mute of the active call's local audio sender
 std::string g_reservedCallPeer;       // guarded; owns the one global slot before and after CURRENT
 bool g_identityActivationPending = false;  // guarded; pending restore reserves privacy before Dart settings writes
+sybl::update::ShutdownReservation g_updateShutdown;  // g_mutex
+// Unlike g_xfers (which also contains historical files and incoming offers),
+// these are actual native transfer lifetimes, recorded before the worker hop.
+using ActiveTransferKey = std::tuple<std::string, std::string, std::string, std::string>;
+std::set<ActiveTransferKey> g_updateActiveTransfers;  // account, conversation, file, attempt; g_mutex
+std::set<std::pair<std::string, std::string>> g_updateDeviceRevocations;  // g_mutex
 uint64_t g_networkPreparedRevision = 0; // guarded; first activation follows network policy
 
 // Native Jami swarm conference state. The conference is the media authority;
@@ -2522,6 +2529,20 @@ std::optional<int64_t> ParseNonNegativeInt64(const std::string& value) {
 void OnDataTransferEvent(const std::string& acc, const std::string& conversationId,
                          const std::string& interactionId, const std::string& fileId, int code,
                          const std::string& attemptId = {}) {
+  {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (code >= 3) {
+      const ActiveTransferKey key{acc, conversationId, fileId, attemptId};
+      if (code == 3 || code == 4 || code == 5) {
+        if (acc == g_accountId) {
+          g_updateActiveTransfers.insert(key);
+          g_updateShutdown.Interrupt();
+        }
+      } else {
+        g_updateActiveTransfers.erase(key);
+      }
+    }
+  }
   // CREATED/INVALID use fileId as the original source path, not a real transfer id. Consume only an exact path
   // created by this process. Only CREATED acknowledges an independent seed;
   // INVALID after a commit must retain the source for repairing that transfer.
@@ -4090,6 +4111,10 @@ void BootDaemon() {
         libjami::exportable_callback<libjami::ConfigurationSignal::DeviceRevocationEnded>(
             [](const std::string& accountId, const std::string& deviceId, int status) {
               try {
+                {
+                  std::lock_guard<std::mutex> lock(g_mutex);
+                  g_updateDeviceRevocations.erase({accountId, deviceId});
+                }
                 g_deviceRevocations.Ended(accountId, deviceId, status, GetTickCount64());
               } catch (...) { Log("device revocation callback failed"); }
             }),
@@ -4265,7 +4290,7 @@ void BootDaemon() {
                 {
                    std::lock_guard<std::mutex> lock(g_mutex);
                    const std::string& bare = authenticated.accountId;
-                   if (g_identityActivationPending || !g_activeGroupConferenceId.empty() ||
+                   if (g_updateShutdown.reserved() || g_identityActivationPending || !g_activeGroupConferenceId.empty() ||
                        !g_pendingGroupConferenceId.empty()) {
                      g_rejectedCallIds.insert(callId);
                      suppress = true;
@@ -4336,6 +4361,18 @@ void BootDaemon() {
                 std::lock_guard<std::mutex> dispatch(g_callSignalMutex);
                 if (!IsActiveAccount(accountId)) return;
                 const bool terminal = IsTerminalCallState(state);
+                bool updateRejected = false;
+                {
+                  std::lock_guard<std::mutex> lock(g_mutex);
+                  // StateChange can precede IncomingCall. Neither path may
+                  // adopt a new call after the update owns the idle slot.
+                  updateRejected = g_updateShutdown.reserved() && !terminal;
+                  if (updateRejected) g_rejectedCallIds.insert(callId);
+                }
+                if (updateRejected) {
+                  Post([accountId, callId]() { try { libjami::hangUp(accountId, callId); } catch (...) {} });
+                  return;
+                }
                 uint64_t callAccountRevision = 0;
                 {
                   std::lock_guard<std::mutex> lock(g_mutex);
@@ -5160,6 +5197,111 @@ void BootDaemon() {
 
 }  // namespace
 
+namespace {
+
+// Worker only, with g_mutex held. Queries below run on the same worker as
+// identity changes; their native callbacks cannot bypass the protected maps.
+bool UpdateNativeIdleLocked() {
+  return g_running && g_daemonReady.load() && !g_accountId.empty() &&
+      !g_resetDoorlightPending && !g_identityActivationPending &&
+      !g_pendingRestore && !g_pendingRestoreBlocked && !g_pendingRestoreOwner &&
+      !g_archiveRecoveryBlocked &&
+      MediaSlotIdleLocked() && g_groupReservationId.empty() &&
+      !g_groupPlacementStarted && g_groupCallLegs.empty() &&
+      g_incomingOffers.empty() && g_currentWinnerCallId.empty() &&
+      !g_sourceTransition && !g_recordingOwner &&
+      (!g_pairing || g_pairing->flow->snapshot().terminal) &&
+      g_receiveAttempts.empty() && g_reservedReceivePaths.empty() &&
+      g_outgoingStagingPaths.empty() && g_ownedMessages.empty() && g_ownedFiles.empty() &&
+      g_updateActiveTransfers.empty() && g_updateDeviceRevocations.empty() &&
+      g_tasks.empty();
+}
+
+// Query without either admission mutex: daemon callbacks may need those locks.
+// The final owner/revision/idle check and reservation serialize with call signals.
+bool UpdateDaemonCallsIdle(const std::string& account) {
+  return !account.empty() && libjami::getCallList(account).empty() &&
+      libjami::getConferenceList(account).empty();
+}
+
+}  // namespace
+
+bool UpdateShutdownPending() {
+  std::lock_guard<std::mutex> lock(g_mutex);
+  return g_updateShutdown.pending();
+}
+
+void PrepareUpdateShutdown(const std::string& expectedAccountId, std::function<void(bool)> done) {
+  bool began = false;
+  uint64_t attempt = 0;
+  try {
+    {
+      std::lock_guard<std::mutex> lock(g_mutex);
+      began = g_running && g_daemonReady.load() && expectedAccountId == g_accountId &&
+          g_updateShutdown.Begin(expectedAccountId, g_accountRevision);
+      if (began) attempt = g_updateShutdown.attempt();
+    }
+    if (!began) { if (done) done(false); return; }
+    // Closing platform admission above and posting a FIFO barrier preserves
+    // all earlier commands, including their ordinary success/failure replies.
+    Post([expectedAccountId, attempt, done] {
+      bool ready = false;
+      try {
+        bool current;
+        { std::lock_guard<std::mutex> lock(g_mutex); current = g_updateShutdown.current(attempt); }
+        const bool callsIdle = current && UpdateDaemonCallsIdle(expectedAccountId);
+        std::lock_guard<std::mutex> dispatch(g_callSignalMutex);
+        std::lock_guard<std::mutex> lock(g_mutex);
+        ready = g_updateShutdown.Reserve(attempt, g_accountId, g_accountRevision,
+            callsIdle && UpdateNativeIdleLocked());
+        if (!ready) g_updateShutdown.Cancel(attempt);
+      } catch (...) {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_updateShutdown.Cancel(attempt);
+      }
+      try { if (done) done(ready); } catch (...) {}
+    });
+  } catch (...) {
+    if (began) {
+      std::lock_guard<std::mutex> lock(g_mutex);
+      g_updateShutdown.Cancel(attempt);
+    }
+    try { if (done) done(false); } catch (...) {}
+  }
+}
+
+void CancelUpdateShutdown(std::function<void(bool)> done) {
+  bool cancelled;
+  {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    cancelled = g_updateShutdown.Cancel();
+  }
+  try { if (done) done(cancelled); } catch (...) {}
+}
+
+void CommitUpdateShutdown(std::function<bool()> postQuit, std::function<void(bool)> done) {
+  try {
+    uint64_t attempt;
+    { std::lock_guard<std::mutex> lock(g_mutex); attempt = g_updateShutdown.attempt(); }
+    Post([postQuit, done, attempt] {
+      bool committed = false;
+      try {
+        std::string account;
+        {
+          std::lock_guard<std::mutex> lock(g_mutex);
+          if (g_updateShutdown.current(attempt) && g_updateShutdown.reserved()) account = g_accountId;
+        }
+        const bool callsIdle = UpdateDaemonCallsIdle(account);
+        std::lock_guard<std::mutex> dispatch(g_callSignalMutex);
+        std::lock_guard<std::mutex> lock(g_mutex);
+        committed = g_updateShutdown.Commit(attempt, g_accountId, g_accountRevision,
+            callsIdle && UpdateNativeIdleLocked(), postQuit);
+      } catch (...) {}
+      try { if (done) done(committed); } catch (...) {}
+    });
+  } catch (...) { try { if (done) done(false); } catch (...) {} }
+}
+
 void RetryBoot() noexcept {
   try {
     bool needsStart = false;
@@ -5941,6 +6083,12 @@ void RevokeKnownDevice(const std::string& accountId, const std::string& deviceId
               sybl::archive::IsValidArchiveSecret(secret) &&
               sybl::known_device::CanRevoke(deviceId, current_id, known)) {
             g_deviceRevocations.Invoke(ticket, GetTickCount64(), [&] {
+              {
+                std::lock_guard<std::mutex> lock(g_mutex);
+                g_updateDeviceRevocations.insert({accountId, deviceId});
+              }
+              // A false return can still mean the request was scheduled.
+              // Only DeviceRevocationEnded clears this native lifetime.
               return libjami::revokeDevice(accountId, deviceId, "password", secret);
             });
           } else {

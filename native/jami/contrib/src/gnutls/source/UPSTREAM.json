@@ -1,0 +1,37 @@
+{
+  "schema": 1,
+  "purpose": "Exact initialized GnuTLS submodule source inputs for offline Windows reconstruction",
+  "gnutlsCommit": "23b07fd47ccf09b09f7d4fc2164a12411676b45f",
+  "archives": [
+    {
+      "path": "gnulib-3639c57a.tar.gz",
+      "destination": "gnulib",
+      "upstream": "https://gitlab.com/libidn/gnulib-mirror.git",
+      "commit": "3639c57a970191e0bf7a9789bd1341786d0255a1",
+      "tree": "2ca225316a90a5c700fdc27ff9df43c8faab73e0",
+      "bytes": 7397877,
+      "sha256": "d7d07f3e59d207a560f31ebdd7b8d66400e25e963b32f92914240439026c7c43",
+      "format": "git archive --format=tar.gz of exact commit; submodules retained separately"
+    },
+    {
+      "path": "libtasn1-2b7ee166.tar.gz",
+      "destination": "devel/libtasn1",
+      "upstream": "https://gitlab.com/gnutls/libtasn1.git",
+      "commit": "2b7ee166f031bea63c5e7badcedc69f1cea69c89",
+      "tree": "464fe15bab132216ea2110b680cd6011073d5ed5",
+      "bytes": 834340,
+      "sha256": "7496a55741bb1c77e57702b1c2d6757d67bdff74c6d4716163e1bc30b46422dc",
+      "format": "git archive --format=tar.gz of exact commit; submodules retained separately"
+    },
+    {
+      "path": "gnulib-aa52cadc.tar.gz",
+      "destination": "devel/libtasn1/gnulib",
+      "upstream": "https://gitlab.com/libidn/gnulib-mirror.git",
+      "commit": "aa52cadc36fb1af0509dc3a4bce4ce73197ece68",
+      "tree": "4d3a97563e53fd6df7794b5d737650878d9cfac4",
+      "bytes": 7731192,
+      "sha256": "69d6667a5fcc8b2d13d50081762c50608ba53c62dcee8ccbbd1018a792cd531d",
+      "format": "git archive --format=tar.gz of exact commit; submodules retained separately"
+    }
+  ]
+}
