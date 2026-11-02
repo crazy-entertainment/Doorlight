@@ -97,7 +97,16 @@ std::optional<std::wstring> FullPath(const std::filesystem::path& path) {
       path.c_str(), static_cast<DWORD>(buffer.size()), buffer.data(), nullptr);
   if (written == 0 || written >= static_cast<DWORD>(buffer.size()))
     return std::nullopt;
-  return std::wstring(buffer.data(), written);
+  // Expand 8.3 aliases without resolving reparse points. Handle validation
+  // below still requires the final path to match this selected path.
+  const DWORD long_required = GetLongPathNameW(buffer.data(), nullptr, 0);
+  if (long_required == 0) return std::nullopt;
+  std::vector<wchar_t> long_buffer(static_cast<std::size_t>(long_required) + 1);
+  const DWORD long_written = GetLongPathNameW(
+      buffer.data(), long_buffer.data(), static_cast<DWORD>(long_buffer.size()));
+  if (long_written == 0 || long_written >= static_cast<DWORD>(long_buffer.size()))
+    return std::nullopt;
+  return std::wstring(long_buffer.data(), long_written);
 }
 
 std::optional<std::wstring> FinalPath(HANDLE file) {

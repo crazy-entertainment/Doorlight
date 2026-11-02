@@ -13,14 +13,17 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <iostream>
 #include <string>
 
 namespace {
 
 std::filesystem::path UniqueRoot() {
   wchar_t temporary[MAX_PATH]{};
-  assert(GetTempPathW(MAX_PATH, temporary) > 0);
-  return std::filesystem::path(temporary) /
+  const DWORD length = GetTempPathW(MAX_PATH, temporary);
+  assert(length > 0 && length < MAX_PATH);
+  // The fixture owns a canonical root; production alias acceptance is tested below.
+  return std::filesystem::canonical(temporary) /
          (L"sybl-picked-file-staging-" +
           std::to_wstring(GetCurrentProcessId()));
 }
@@ -71,6 +74,29 @@ int main() {
   assert(first->filename() == source.filename());
   assert(*first != source);
   assert(Read(*first) == "safe");
+
+  // A short-name spelling is the same file, not a reparse redirect.
+  const auto long_source = outside / L"selected long file name.bin";
+  Write(long_source, "alias");
+  wchar_t short_source[32768]{};
+  wchar_t short_staging[32768]{};
+  const DWORD source_length = GetShortPathNameW(long_source.c_str(), short_source, 32768);
+  const DWORD staging_length = GetShortPathNameW(staging.c_str(), short_staging, 32768);
+  assert(source_length > 0 && source_length < 32768);
+  assert(staging_length > 0 && staging_length < 32768);
+  if (std::filesystem::path(short_source) != long_source &&
+      std::filesystem::path(short_staging) != staging) {
+    const auto aliased = Stage(short_source, short_staging, 5);
+    assert(aliased);
+    assert(aliased->filename() == std::filesystem::path(short_source).filename());
+    assert(Read(*aliased) == "alias");
+    assert(IsOwned(*aliased, short_staging));
+    assert(Discard(*aliased, short_staging));
+    assert(Read(long_source) == "alias");
+    std::cout << "Short-path source/staging/ownership regression exercised\n";
+  } else {
+    std::cout << "Short-path regression unavailable: filesystem has no distinct 8.3 aliases\n";
+  }
 
   // The returned path is a stable snapshot, not the mutable selected path.
   Write(source, "changed");

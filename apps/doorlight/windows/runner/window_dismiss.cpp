@@ -322,14 +322,30 @@ bool WindowDismissEffect::Start(HWND owner, int width, int height,
   if (!previous_ || previous_ == HGDI_ERROR) { Reset(); return false; }
   // The presentation has the same capture policy as its source. Applying and
   // confirming it before first show also keeps protected frames out of streams.
-  overlay_ = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE |
+  overlay_ = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE |
       WS_EX_TRANSPARENT | static_cast<DWORD>(GetWindowLongPtrW(owner, GWL_EXSTYLE) & WS_EX_TOPMOST),
       kEffectClass, L"", WS_POPUP, origin.x, origin.y, width, height,
       nullptr, nullptr, wc.hInstance, this);
   DWORD affinity = 0;
   failure_ = 7;
   if (!overlay_ || !SetWindowDisplayAffinity(overlay_, source_affinity) ||
+      !GetWindowDisplayAffinity(overlay_, &affinity) || affinity != source_affinity) {
+    Reset(); return false;
+  }
+  // Set protection before layering, then confirm it again on the final style.
+  // Some compositors reject affinity on a window created already layered.
+  SetLastError(ERROR_SUCCESS);
+  const LONG_PTR extended_style = GetWindowLongPtrW(overlay_, GWL_EXSTYLE);
+  if (!extended_style && GetLastError() != ERROR_SUCCESS) { Reset(); return false; }
+  SetLastError(ERROR_SUCCESS);
+  if (!SetWindowLongPtrW(overlay_, GWL_EXSTYLE, extended_style | WS_EX_LAYERED) &&
+      GetLastError() != ERROR_SUCCESS) { Reset(); return false; }
+  if (GetWindowLongPtrW(overlay_, GWL_EXSTYLE) != (extended_style | WS_EX_LAYERED) ||
+      !SetWindowPos(overlay_, nullptr, 0, 0, 0, 0,
+          SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED) ||
+      !SetWindowDisplayAffinity(overlay_, source_affinity) ||
       !GetWindowDisplayAffinity(overlay_, &affinity) || affinity != source_affinity ||
+      IsWindowVisible(overlay_) ||
       !Paint(restoring ? 1 : 0, restoring ? 0 : 255)) { Reset(); return false; }
   // Create the timer before hiding the real surface: a failed
   // allocation must leave the ordinary window untouched for immediate fallback.
