@@ -355,7 +355,9 @@ def publish(args):
         require(not app_release or app_release.get("target_commitish") == args.commit,
                 "Version tag belongs to another source revision.")
         if not app_release:
-            body = (f"Doorlight Windows {receipt['version']}\n\nBuilt from {args.commit}.\n\n"
+            body = (f"Doorlight Windows {receipt['version']}\n\n"
+                    "Unsigned Windows test build. Signing and broader release qualification are pending.\n\n"
+                    f"Built from {args.commit}.\n\n"
                     "Application source: Doorlight.Source.tar.gz in this release.\n"
                     "Native corresponding source: " + config["nativeInputs"]["correspondingSourceUrl"]
                     + "\n\nThe Game Bar widget is serviced separately.")

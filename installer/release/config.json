@@ -3,7 +3,7 @@
   "repository": "crazy-entertainment/Doorlight",
   "channel": "stable",
   "feedTag": "update-feed",
-  "deliveryEnabled": false,
+  "deliveryEnabled": true,
   "nativeInputs": {
     "daemonSourceTree": "1248cd07a061d551f8b2fc8f62f84f074afd1f84",
     "archiveUrl": "https://github.com/crazy-entertainment/Doorlight/releases/download/windows-native-1248cd07a061-4ca99786/windows-native-inputs.zip",
@@ -14,5 +14,19 @@
     "correspondingSourceSha256": "7a11b9ebefe15241a7df9e4aab5e1a019dbe81797624df6a6abc8895f52b3321"
   },
   "rootSha256": "9dbfaa0597a9102bd989b7b57fb3967c2cee835a2994b9521fe069b3158a3353",
-  "qualification": null
+  "qualification": {
+    "reviewer": "Codex automated build review; owner-authorized unsigned Windows testing",
+    "date": "2026-11-02",
+    "evidenceUrl": "https://github.com/crazy-entertainment/Doorlight/actions/runs/41465291514",
+    "sourceCommit": "d5c9be3e4a7bdc97a59d24f372d35421471f28b3",
+    "nativeInputsSha256": "4ca997867b8abb3f1544802aed1a69f21682f8b72fbe92563b7ed1e53166f2a6",
+    "correspondingSourceSha256": "7a11b9ebefe15241a7df9e4aab5e1a019dbe81797624df6a6abc8895f52b3321",
+    "scope": "Unsigned Windows x64 test delivery for the owner and his brother; not general release acceptance.",
+    "remainingAcceptance": [
+      "Public signed-feed installation, startup acceptance and identity continuity must be verified after first publication.",
+      "Real interruption/recovery and clean brother-PC installation remain separate acceptance tests.",
+      "Authenticode signing, Android/physical-peer qualification and general distribution acceptance are not established.",
+      "Intermittent local native window-presentation failures remain under investigation."
+    ]
+  }
 }

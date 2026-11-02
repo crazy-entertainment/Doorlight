@@ -30,8 +30,10 @@ installer), the full ZIP update, its manifest, the application source archive
 and the build receipt. The source archive uses a strict allowlist for the
 Windows build surface: `.github/workflows/windows-release.yml`, `apps/`,
 `native/`, `installer/`, `web/`, `services/`, root `global.json` SDK pin,
-`LICENSE`, `README.md`,
-`.gitignore`, and the four `tools/windows-native-{inputs,sources}*.ps1` scripts.
+`LICENSE`, `README.md`, `.gitignore`, `.gitattributes`, and the four
+`tools/windows-native-{inputs,sources}*.ps1` scripts. The Go verifier's LF source
+bytes are preserved across Windows checkouts and exported archives so its pinned
+binary hash stays reproducible.
 It excludes historical private roots such as `docs/`, `design/`, `sybl/`,
 `widget/`, `patches/`, and unrelated legacy tools. Required app, daemon,
 installer and native-input source paths are checked before export. The release
@@ -60,46 +62,52 @@ check Actions status before depending on unattended long-term maintenance.
 Root rotation is not implemented; qualify it before changing keys or approaching
 the five-year root expiry. See [publisher contracts](../trust/publisher/README.md).
 
-## Activation and current limits
+## Test delivery and qualification
 
-`config.json` intentionally has `deliveryEnabled: false`. No public binary
-candidate is uploaded and no feed is published while it is disabled. Setting a
-flag does not establish release qualification.
+`config.json` enables owner-authorized unsigned Windows test delivery for the
+owner and his brother. It records the successful
+[GitHub-hosted qualification build](https://github.com/crazy-entertainment/Doorlight/actions/runs/41465291514)
+and matching native/source digests. This is not general release acceptance.
+Setting a flag alone does not establish release qualification. When delivery is
+disabled, no public binary candidate is uploaded and no feed is published.
 
-Before activation:
+Publication and installed qualification proceed in this order:
 
 1. Export the exact native input layout with `tools/windows-native-inputs.ps1`
    and qualify its dependency provenance, corresponding source and notices.
    Publish the reviewed archive, sidecar and corresponding source at immutable
    HTTPS URLs; record their SHA-256 values in `config.json`. Byte transport
    checks do not establish reconstruction or licensing.
-2. Complete the relevant [Compliance](../../docs/COMPLIANCE.md) and
-   [Acceptance](../../docs/ACCEPTANCE.md) requirements. Record the actual
-   reviewer/date/evidence URL and native/source digests in `qualification`.
-   Production Authenticode signing remains separate from TUF signatures.
-3. Verify an actual GitHub-hosted build and hosted signed-feed update, including
-   interruption/recovery and profile continuity. Local and synthetic tests do
-   not substitute for that installed-artifact evidence.
-4. Enable delivery in the reviewed configuration. The next approved `main` push
-   can publish after its checks pass. Install the resulting updater-enabled
-   build once on each existing test PC; old unconfigured builds cannot discover
-   a trust root that they never contained.
+2. Review the project's private compliance and acceptance requirements for the
+   intended scope. The owner authorized unsigned Windows testing on his and his brother's PCs;
+   this does not establish general distribution acceptance. Production
+   Authenticode signing remains separate from TUF signatures.
+3. Verify an actual GitHub-hosted build while publication is disabled. Record
+   the actual reviewer/date/evidence URL and matching native/source digests in
+   `qualification`, with the test scope and remaining acceptance gaps explicit.
+4. Enable the reviewed test delivery configuration. The next `main` push can
+   publish after its checks pass. A real hosted-feed installation requires this
+   first publication; do not claim that result before testing it.
+5. Verify an installed update through the public signed feed, including
+   interruption/recovery and profile continuity, before calling the updater
+   qualified. Local and synthetic tests do not substitute for installed-artifact
+   evidence. Each test PC needs the updater-enabled installer once; old
+   unconfigured builds cannot discover a trust root they never contained.
 
-Existing global/main commit-message approval still applies. A normal source
-push cannot bypass failed build or publication gates. A client checks within a
-minute of startup and periodically thereafter; publication is not an immediate
-forced restart on every PC.
+A source push cannot bypass failed build or publication gates. A client checks
+within a minute of startup and periodically thereafter; publication is not an
+immediate forced restart on every PC.
 
 The bootstrap root and three encrypted online environment secrets have been
 provisioned. Their local recovery coverage is verified. GitHub secret metadata
-readback confirms the expected names and main-only environment; actual workflow
-decryption/signing is not yet established. The qualified native inputs, complete
-corresponding source and notices are hosted in the immutable
+readback confirms the expected names and main-only environment; successful build
+qualification alone does not prove workflow signing or installed updates.
+The qualified native inputs, complete corresponding source and notices are hosted in the immutable
 [native-input release](https://github.com/crazy-entertainment/Doorlight/releases/tag/windows-native-1248cd07a061-4ca99786).
 [Native qualification](native-qualification.json) records the final exported-root
 Windows build, 80 passing CTests (one microphone skip), 200 remote-input stress
-runs and unchanged installed identity key/certificate. The first GitHub-hosted
-build and installed hosted-feed update remain unverified; delivery stays disabled.
+runs and unchanged installed identity key/certificate. Installed hosted-feed
+updates and general distribution require their separate acceptance evidence.
 
 ## Local checks
 
