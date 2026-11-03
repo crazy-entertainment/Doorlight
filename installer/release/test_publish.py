@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 spec = importlib.util.spec_from_file_location("publish", Path(__file__).with_name("publish.py"))
 p = importlib.util.module_from_spec(spec)
@@ -75,6 +76,54 @@ class PublicationTests(unittest.TestCase):
                               "sha256": p.digest(self.directory / name)} for name in paths]}
         (self.directory / "build-receipt.json").write_text(json.dumps(receipt))
         return receipt
+
+    def readback(self, responses):
+        expected = self.directory / "expected.json"
+        expected.write_bytes(b"new signed timestamp")
+        self.readback_clock = 0
+        self.readback_calls = []
+
+        def sleep(seconds):
+            self.readback_clock += seconds
+
+        def fetch(url, path, maximum=2 << 20, timeout=60):
+            self.readback_calls.append((url, path, timeout))
+            self.assertFalse(path.exists(), "Readback reused a previous download path")
+            value = next(responses)
+            if isinstance(value, Exception):
+                raise value
+            with path.open("xb") as output:
+                output.write(value)
+
+        with mock.patch.object(p, "download", side_effect=fetch), \
+                mock.patch.object(p.time, "monotonic", side_effect=lambda: self.readback_clock), \
+                mock.patch.object(p.time, "sleep", side_effect=sleep):
+            p.verify_public_timestamp("https://example.invalid/timestamp.json", expected, self.directory)
+
+    def test_public_timestamp_waits_for_same_canonical_url(self):
+        self.readback(iter([b"old signed timestamp", b"old signed timestamp", b"new signed timestamp"]))
+        self.assertEqual(self.readback_clock, 10)
+        self.assertEqual({url for url, _, _ in self.readback_calls}, {"https://example.invalid/timestamp.json"})
+        self.assertEqual(len({path for _, path, _ in self.readback_calls}), 3)
+
+    def test_public_timestamp_mismatch_stays_a_bounded_failure(self):
+        with self.assertRaisesRegex(ValueError, "did not match"):
+            self.readback(iter([b"wrong timestamp"] * 100))
+        self.assertGreaterEqual(self.readback_clock, 300)
+        self.assertLessEqual(len(self.readback_calls), 100)
+        self.assertTrue(all(0 < timeout <= 60 for _, _, timeout in self.readback_calls))
+
+    def test_public_timestamp_tolerates_replacement_not_found(self):
+        missing = p.HTTPError("https://example.invalid/timestamp.json", 404, "replacing", {}, None)
+        self.readback(iter([missing, b"new signed timestamp"]))
+        self.assertEqual(self.readback_clock, 5)
+
+    def test_public_timestamp_other_http_failure_is_not_hidden(self):
+        denied = p.HTTPError("https://example.invalid/timestamp.json", 403, "denied", {}, None)
+        with self.assertRaises(p.HTTPError):
+            self.readback(iter([denied]))
+        self.assertEqual(len(self.readback_calls), 1)
+        self.assertEqual(self.readback_clock, 0)
 
     def test_disabled_configuration_blocks_without_provider_access(self):
         config = self.directory / "config.json"

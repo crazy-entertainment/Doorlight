@@ -13,6 +13,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from urllib.error import HTTPError
 from urllib.parse import quote, urlparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
@@ -191,9 +192,9 @@ class GitHub:
                             {"draft": False, "make_latest": "true" if latest else "false"})
 
 
-def download(url, path, maximum=2 << 20):
+def download(url, path, maximum=2 << 20, timeout=60):
     require(https(url), "Unsafe public download URL.")
-    with urlopen(Request(url, headers={"User-Agent": "Doorlight-release"}), timeout=60) as response:
+    with urlopen(Request(url, headers={"User-Agent": "Doorlight-release"}), timeout=timeout) as response:
         require(https(response.url), "Unsafe public download redirect.")
         with path.open("xb") as output:
             total = 0
@@ -207,6 +208,29 @@ def asset_matches(asset, path):
     # GitHub's authenticated asset digest avoids downloading multi-GB packages.
     return (asset.get("state") == "uploaded" and asset.get("size") == path.stat().st_size
             and asset.get("digest") == "sha256:" + digest(path))
+
+
+def verify_public_timestamp(url, expected, scratch):
+    # The canonical release URL can briefly retain its previous asset redirect.
+    # Wait for that same URL; a cache-busting URL would not verify client access.
+    expected_digest = digest(expected)
+    deadline = time.monotonic() + 300
+    attempt = 0
+    while True:
+        remaining = deadline - time.monotonic()
+        require(remaining > 0, "Public timestamp readback did not match within the propagation budget.")
+        attempt += 1
+        hosted = scratch / f"hosted-timestamp-{attempt}.json"
+        try:
+            download(url, hosted, timeout=min(60, remaining))
+            if digest(hosted) == expected_digest:
+                return
+        except HTTPError as error:
+            if error.code != 404:
+                raise
+        if attempt == 1:
+            print("Waiting for the canonical public timestamp to propagate.", flush=True)
+        time.sleep(min(5, max(0, deadline - time.monotonic())))
 
 
 def immutable_upload(github, release, path, assets):
@@ -379,9 +403,8 @@ def publish(args):
     if feed.get("draft"):
         github.public(feed)
     # Read the public head back without a token; do not equate an API upload with client reachability.
-    hosted = scratch / "hosted-timestamp.json"
-    download(f"https://github.com/{REPOSITORY}/releases/download/{config['feedTag']}/timestamp.json", hosted)
-    require(digest(hosted) == digest(scratch / "feed" / "timestamp.json"), "Public timestamp readback did not match.")
+    verify_public_timestamp(f"https://github.com/{REPOSITORY}/releases/download/{config['feedTag']}/timestamp.json",
+                            scratch / "feed" / "timestamp.json", scratch)
     print("Signed update feed published and public timestamp verified.")
 
 

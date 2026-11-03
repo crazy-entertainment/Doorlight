@@ -171,7 +171,7 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $scratch = Join-Path $env:RUNNER_TEMP ("doorlight-publish-{0}-{1}" -f $env:GITHUB_RUN_ID,$env:GITHUB_RUN_ATTEMPT)
           & python installer/release/publish.py --config installer/release/config.json --root installer/release/bootstrap.root.json --publisher (Join-Path $env:RUNNER_TEMP 'DoorlightPublish.exe') --candidate (Join-Path $env:RUNNER_TEMP 'doorlight-candidate') --repository crazy-entertainment/Doorlight --commit $env:GITHUB_SHA --run-number $env:GITHUB_RUN_NUMBER --attempt $env:GITHUB_RUN_ATTEMPT --scratch $scratch
-          if ($LASTEXITCODE -ne 0) { throw 'Release publication failed closed.' }
+          if ($LASTEXITCODE -ne 0) { throw 'Release publication failed. Inspect the hosted release and feed before retrying.' }
 
   refresh:
     if: github.event_name == 'schedule' && github.ref == 'refs/heads/main'

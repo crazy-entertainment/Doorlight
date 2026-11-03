@@ -53,6 +53,10 @@ clients can briefly see a missing timestamp and retry. A failed promotion
 attempts to restore the old head. Never overwrite immutable assets to repair a
 failure. A subsequent attempt reserves metadata versions above any already
 uploaded orphan generation, so failed publication cannot reuse those names.
+After promotion, the publisher checks the canonical public timestamp URL for up
+to five minutes while cached redirects converge. It never substitutes a
+cache-busting URL. A failed final readback does not undo uploaded artifacts or
+the promoted feed; inspect the hosted state before attempting recovery.
 
 A weekly job refreshes signatures without rebuilding or releasing the app.
 Timestamp validity is 14 days, snapshot 30 days and targets 90 days, bounded by
